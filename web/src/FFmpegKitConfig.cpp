@@ -1898,13 +1898,15 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
                "font configuration file for writing.\n");
         return;
     }
-    fwrite(fontConfiguration.c_str(), sizeof(char), fontConfiguration.size(),
-           fontConfigurationStream);
-    if (ferror(fontConfigurationStream)) {
+    const size_t written =
+        fwrite(fontConfiguration.c_str(), sizeof(char), fontConfiguration.size(), fontConfigurationStream);
+    const bool writeFailed = written != fontConfiguration.size() || ferror(fontConfigurationStream);
+
+    if (fclose(fontConfigurationStream) != 0 || writeFailed) {
         printf("Failed to set font directory. Error received while saving "
                "font configuration.\n");
+        return;
     }
-    fclose(fontConfigurationStream);
 
     printf("Saved new temporary font configuration with %d font name "
            "mappings.\n",

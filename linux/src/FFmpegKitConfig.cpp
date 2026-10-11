@@ -1888,15 +1888,21 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
 
     std::ofstream fontConfigurationStream(fontConfigurationFile,
                                           std::ios::out | std::ios::trunc);
-    if (fontConfigurationStream) {
-        fontConfigurationStream << fontConfiguration;
-    }
-    if (fontConfigurationStream.bad()) {
+    if (!fontConfigurationStream) {
         std::cout << "Failed to set font directory. Error received while "
-                     "saving font configuration: "
-                  << fontConfigurationStream.rdbuf() << "." << std::endl;
+                     "opening font configuration file for writing."
+                  << std::endl;
+        return;
     }
+    fontConfigurationStream << fontConfiguration;
+
     fontConfigurationStream.close();
+    if (fontConfigurationStream.fail()) {
+        std::cout << "Failed to set font directory. Error received while "
+                     "saving font configuration."
+                  << std::endl;
+        return;
+    }
 
     std::cout << "Saved new temporary font configuration with "
               << validFontNameMappingCount << " font name mappings."
