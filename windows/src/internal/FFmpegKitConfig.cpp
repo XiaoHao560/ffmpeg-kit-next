@@ -55,6 +55,18 @@ extern "C" {
 #include <iostream>
 #include <mutex>
 
+// INCLUDED LAST SO ITS MACROS DO NOT REACH THE HEADERS ABOVE. NOMINMAX KEEPS
+// THE min/max MACROS FROM BREAKING std::min AND std::max
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shlobj.h>
+// INITGUID MAKES knownfolders.h DEFINE THE FOLDERID GUIDS IN THIS UNIT. LINKING
+// THEM FROM THE STATIC libuuid.a MAKES LIBTOOL REFUSE TO BUILD THE DLL
+#include <initguid.h>
+#include <knownfolders.h>
+
 extern "C" {
 void set_report_callback(void (*callback)(int, float, float, int64_t, double,
                                           double, double));
@@ -363,6 +375,85 @@ static bool fs_create_dir(const std::string &s) {
         }
     }
     return true;
+}
+
+static bool fs_is_ascii(const std::wstring &path) {
+    for (const wchar_t c : path) {
+        if (c > 0x7F) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Returns an ASCII spelling of an existing path, or an empty string. fontconfig
+ * on Windows only handles ASCII paths reliably.
+ */
+static std::string fs_to_ascii_path(std::wstring path) {
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    if (path.empty()) {
+        return "";
+    }
+
+    if (!fs_is_ascii(path)) {
+        DWORD length = GetShortPathNameW(path.c_str(), NULL, 0);
+        if (length == 0) {
+            return "";
+        }
+        std::wstring shortPath(length, L'\0');
+        length = GetShortPathNameW(path.c_str(), &shortPath[0], length);
+        if (length == 0 || length >= shortPath.size()) {
+            return "";
+        }
+        shortPath.resize(length);
+
+        // 8.3 NAMES CAN BE DISABLED PER VOLUME, IN WHICH CASE THE LONG NAME
+        // COMES BACK UNCHANGED
+        if (!fs_is_ascii(shortPath)) {
+            return "";
+        }
+        path = shortPath;
+    }
+
+    std::string asciiPath;
+    asciiPath.reserve(path.size());
+    for (const wchar_t c : path) {
+        asciiPath.push_back(static_cast<char>(c));
+    }
+    return asciiPath;
+}
+
+/**
+ * Returns the per-user local application data directory, falling back to the
+ * user's temp directory. The path is ASCII, using its 8.3 short name when the
+ * long name is not ASCII, because fontconfig opens files with the narrow ANSI
+ * CRT functions and parses fonts.conf as UTF-8. Returns an empty string when
+ * neither directory has an ASCII spelling.
+ */
+static std::string fs_local_cache_directory() {
+    PWSTR localAppData = NULL;
+    const HRESULT result = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, NULL, &localAppData);
+    std::wstring localAppDataPath;
+    if (SUCCEEDED(result) && localAppData != NULL) {
+        localAppDataPath = localAppData;
+    }
+    // THE BUFFER MUST BE FREED EVEN WHEN THE CALL FAILS
+    CoTaskMemFree(localAppData);
+
+    std::string directory = fs_to_ascii_path(localAppDataPath);
+    if (!directory.empty()) {
+        return directory;
+    }
+
+    wchar_t tempPath[MAX_PATH + 1];
+    const DWORD length = GetTempPathW(MAX_PATH + 1, tempPath);
+    if (length == 0 || length > MAX_PATH) {
+        return "";
+    }
+    return fs_to_ascii_path(std::wstring(tempPath, length));
 }
 
 /** Removes expired entries without destroying sessions while locked. */
@@ -1771,23 +1862,20 @@ void ffmpegkit::internal::FFmpegKitConfig::setFontDirectoryList(
     const std::map<std::string, std::string> &fontNameMapping) {
     int validFontNameMappingCount = 0;
 
-    const char *parentDirectory = std::getenv("HOME");
-    if (parentDirectory == NULL) {
-        parentDirectory = std::getenv("TMPDIR");
-        if (parentDirectory == NULL) {
-            parentDirectory = ".";
-        }
+    const std::string parentDirectory = fs_local_cache_directory();
+    if (parentDirectory.empty()) {
+        std::cout << "Failed to set font directory. Local application data "
+                     "and temp directories have no ASCII path."
+                  << std::endl;
+        return;
     }
 
-    std::string cacheDir = std::string(parentDirectory) + "/.cache";
-    std::string ffmpegKitDir = cacheDir + "/ffmpegkit";
-    auto tempConfigurationDirectory = ffmpegKitDir + "/fontconfig";
-    auto fontConfigurationFile =
-        std::string(tempConfigurationDirectory) + "/fonts.conf";
-    auto fontConfigurationCacheDirectory = tempConfigurationDirectory + "/cache";
+    std::string ffmpegKitDir = parentDirectory + "\\ffmpegkit";
+    auto tempConfigurationDirectory = ffmpegKitDir + "\\fontconfig";
+    auto fontConfigurationFile = tempConfigurationDirectory + "\\fonts.conf";
+    auto fontConfigurationCacheDirectory = tempConfigurationDirectory + "\\cache";
 
-    if (!fs_create_dir(cacheDir) || !fs_create_dir(ffmpegKitDir) ||
-        !fs_create_dir(tempConfigurationDirectory) ||
+    if (!fs_create_dir(ffmpegKitDir) || !fs_create_dir(tempConfigurationDirectory) ||
         !fs_create_dir(fontConfigurationCacheDirectory)) {
         return;
     }
@@ -1844,15 +1932,21 @@ void ffmpegkit::internal::FFmpegKitConfig::setFontDirectoryList(
 
     std::ofstream fontConfigurationStream(fontConfigurationFile,
                                           std::ios::out | std::ios::trunc);
-    if (fontConfigurationStream) {
-        fontConfigurationStream << fontConfiguration;
-    }
-    if (fontConfigurationStream.bad()) {
+    if (!fontConfigurationStream) {
         std::cout << "Failed to set font directory. Error received while "
-                     "saving font configuration: "
-                  << fontConfigurationStream.rdbuf() << "." << std::endl;
+                     "opening font configuration file for writing."
+                  << std::endl;
+        return;
     }
+    fontConfigurationStream << fontConfiguration;
+
     fontConfigurationStream.close();
+    if (fontConfigurationStream.fail()) {
+        std::cout << "Failed to set font directory. Error received while "
+                     "saving font configuration."
+                  << std::endl;
+        return;
+    }
 
     std::cout << "Saved new temporary font configuration with "
               << validFontNameMappingCount << " font name mappings."

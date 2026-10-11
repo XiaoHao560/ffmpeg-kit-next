@@ -56,7 +56,10 @@ AC_ARG_ENABLE([static-mingw-runtime],
 # Windows system libraries needed to build the shared library:
 #   - winpthread provides the pthread API used by the C++ layer
 #   - bcrypt provides the CNG primitives used for secure random data
-WINDOWS_LIBS="-lbcrypt"
+#   - shell32 and ole32 provide SHGetKnownFolderPath and CoTaskMemFree, used to
+#     place the fontconfig directory. uuid is not linked: it is a static
+#     archive, which makes libtool build a static library only
+WINDOWS_LIBS="-lbcrypt -lshell32 -lole32"
 
 if test "x$enable_static_mingw_runtime" = "xyes"; then
 
