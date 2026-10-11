@@ -40,11 +40,11 @@ endif
 FFMPEG_INCLUDES := $(MY_LOCAL_PATH)/../../prebuilt/$(MY_BUILD_DIR)/ffmpeg/include
 LOCAL_PATH := $(MY_LOCAL_PATH)/../ffmpeg-kit-next-android-lib/src/main/cpp
 
-# 16 kb page size support for arm64-v8a and x86_64
+# 16 KB load segment and RELRO alignment for arm64-v8a and x86_64
 ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
-    MY_LDFLAGS := -Wl,-z,max-page-size=16384
+    MY_LDFLAGS := -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
 else ifeq ($(TARGET_ARCH_ABI),x86_64)
-    MY_LDFLAGS := -Wl,-z,max-page-size=16384
+    MY_LDFLAGS := -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
 endif
 
 include $(CLEAR_VARS)
