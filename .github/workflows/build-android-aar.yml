@@ -1,0 +1,200 @@
+name: Build FFmpegKit Android AAR (Full-GPL)
+
+on:
+  push:
+    tags: ['*']
+  pull_request:
+    branches: [build-android]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '指定用于构建的标签名（如 v9.0.0），留空则使用触发时的 ref'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  ANDROID_PLATFORM_VERSION: '34'
+  ANDROID_BUILD_TOOLS_VERSION: '35.0.0'
+  ANDROID_NDK_VERSION: '27.3.13750724'
+  ANDROID_CMAKE_VERSION: '3.22.1'
+
+jobs:
+  build-android-aar:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /opt/microsoft /usr/local/lib/node_modules /opt/hostedtoolcache
+          sudo apt-get clean
+          docker system prune -af 2>/dev/null || true
+          df -h
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config gettext autopoint \
+            cmake bison meson ninja-build nasm yasm gperf ragel texinfo autogen \
+            groff gtk-doc-tools libtasn1-6-dev tcl doxygen \
+            gcc g++ make patch file findutils gawk rsync \
+            python3 perl ruby curl wget git zip unzip xz-utils tar gzip sed grep diffutils \
+            bash which
+
+      - name: Set up Android SDK and NDK
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDK_MANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes 2>/dev/null | "${SDK_MANAGER}" --licenses >/dev/null || true
+          "${SDK_MANAGER}" --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_PLATFORM_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${ANDROID_CMAKE_VERSION}"
+          {
+            echo "ANDROID_SDK_ROOT=${SDK_ROOT}"
+            echo "ANDROID_HOME=${SDK_ROOT}"
+            echo "ANDROID_NDK_ROOT=${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build AAR (arm64-v8a + arm-v7a)
+        run: |
+          ./android.sh \
+            --disable-x86 \
+            --disable-x86-64 \
+            --disable-arm-v7a \
+            --enable-lib-all \
+            --enable-gpl \
+            --disable-lib-gnutls
+
+      - name: Verify built native libraries
+        run: |
+          echo "=== Checking AAR contents (native libraries) ==="
+          unzip -l android/ffmpeg-kit-next-android-lib/build/outputs/aar/ffmpeg-kit-next-release.aar | grep "jni/" || echo "No native libraries found in AAR"
+          echo "=== Checking prebuilt directories ==="
+          find prebuilt -maxdepth 1 -type d | sort
+
+      - name: Collect artifacts (only Maven repository)
+        run: |
+          mkdir -p artifacts
+          # 查找 bundle-android-aar-*-maven 目录
+          for dir in prebuilt/bundle-android-aar-*-maven; do
+            if [ -d "$dir" ]; then
+              echo "Copying from $dir"
+              cp -r "$dir"/* artifacts/
+              break
+            fi
+          done
+          echo "=== Collected artifacts ==="
+          find artifacts -type f
+          echo "=== Maven repository structure ==="
+          tree artifacts/ 2>/dev/null || find artifacts -type d | sort
+
+      - name: Package Maven repository
+        run: |
+          cd artifacts
+          if [ -d "com" ]; then
+            zip -r ../ffmpeg-kit-next-maven.zip com/
+          else
+            # 如果 com/ 不存在，则打包所有内容（备用）
+            zip -r ../ffmpeg-kit-next-maven.zip .
+          fi
+          cd ..
+          ls -lh ffmpeg-kit-next-maven.zip
+          echo "=== Zip contents ==="
+          unzip -l ffmpeg-kit-next-maven.zip | head -30
+
+      - name: Upload AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-kit-next-android-full-gpl
+          path: ffmpeg-kit-next-maven.zip
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build.log
+          retention-days: 7
+
+  release:
+    needs: build-android-aar
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-kit-next-android-full-gpl
+
+      - name: List downloaded files
+        run: |
+          echo "=== Downloaded files ==="
+          ls -lh
+          file ffmpeg-kit-next-maven.zip
+
+      - name: Set release variables
+        id: vars
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="${{ inputs.tag_name }}"
+          else
+            TAG_NAME="${{ github.ref_name }}"
+          fi
+          echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          COMMIT_SHA=$(git rev-parse "$TAG_NAME^{commit}")
+          echo "target_commitish=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.release_tag }}
+          target_commitish: ${{ steps.vars.outputs.target_commitish }}
+          name: ${{ steps.vars.outputs.release_tag }}
+          files: ffmpeg-kit-next-maven.zip
+          body: |
+            - **Tag:** `${{ steps.vars.outputs.release_tag }}`
+            - **Architectures:** `arm64-v8a`, `arm-v7a` (with NEON)
+
+            1. 下载 `ffmpeg-kit-next-maven.zip`
+            2. 解压到项目目录，得到 `com/` 文件夹
+            3. 在 `build.gradle` 中添加：
+            ```groovy
+            repositories {
+                maven { url uri('file:///' + rootDir.absolutePath + '/libs') }
+                mavenCentral()
+            }
+            dependencies {
+                implementation 'com.arthenica:ffmpeg-kit-next:8.1.0'
+            }
+            ```
+
+            ⚠️ **GPL v3.0 Licensed**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
