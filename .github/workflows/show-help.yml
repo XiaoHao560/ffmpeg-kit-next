@@ -1,0 +1,44 @@
+name: Show FFmpegKit Build Options
+
+on:
+#  push:
+#    branches: [build-android]
+  workflow_dispatch:
+
+jobs:
+  show-help:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Setup Nix binary cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: List available profiles
+        run: |
+          ./nix-android.sh --list-profiles
+
+      - name: Show Android build help
+        run: |
+          ./nix-android.sh -p android-r27d -- --help
+
+      - name: Save help output to artifact
+        run: |
+          mkdir -p docs
+          ./nix-android.sh -p android-r27d -- --help > docs/build-options.txt 2>&1 || true
+          cat docs/build-options.txt
+
+      - name: Upload help output
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-kit-build-options
+          path: docs/build-options.txt
+          retention-days: 7
