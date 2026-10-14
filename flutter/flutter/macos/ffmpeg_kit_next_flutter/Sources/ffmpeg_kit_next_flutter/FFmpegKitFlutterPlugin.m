@@ -20,6 +20,11 @@
 #import "FFmpegKitFlutterPlugin.h"
 
 #import <ffmpegkit/FFmpegKitConfig.h>
+#import <ffmpegkit/FFmpegKit.h>
+#import <ffmpegkit/FFprobeKit.h>
+#import <ffmpegkit/ArchDetect.h>
+#import <ffmpegkit/Packages.h>
+#import <ffmpegkit/MediaInformationJsonParser.h>
 #import <ffmpegkit/FFmpegKitInputBuffer.h>
 #import <ffmpegkit/FFmpegKitOutputBuffer.h>
 #import <ffmpegkit/FFmpegKitStreamInput.h>
@@ -73,57 +78,111 @@ static NSString *const ARGUMENT_FFPROBE_JSON_OUTPUT = @"ffprobeJsonOutput";
 
 extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
 
-@implementation FFmpegKitFlutterPlugin {
-  FlutterEventSink _eventSink;
-  BOOL logsEnabled;
-  BOOL statisticsEnabled;
-  dispatch_queue_t asyncDispatchQueue;
+#import "plugin_state.h"
+#import <errno.h>
+#import <fcntl.h>
 
-  // "ffkit" protocol object registries, keyed by the generated protocol url.
-  // The native objects are stateful and must be retained between the create
-  // call and the subsequent read/write/close calls.
-  NSMutableDictionary *shutdownSessions;
-  BOOL retainShutdownSessions;
-  NSMutableDictionary* inputBufferRegistry;
-  NSMutableDictionary* outputBufferRegistry;
-  NSMutableDictionary* streamInputRegistry;
-  NSMutableDictionary* streamOutputRegistry;
+// Native registry removal wakes blocked stream operations without racing the
+// facade's ordinary BOOL close flags. Facades close only after workers drain.
+@interface FFmpegKitConfig (FlutterStreamTeardown)
++ (void)unregisterFFmpegKitStream:(long)streamId;
+@end
+static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterFFmpegKitStream:[[url substringFromIndex:[@"ffkitstream:" length]] longLongValue]]; }
+
+@implementation FFmpegKitFlutterPlugin {
+    PluginState *pluginState;
+    BOOL detached;
+    BOOL logsEnabled;
+    BOOL statisticsEnabled;
+    dispatch_queue_t asyncDispatchQueue;
+
+    // "ffkit" protocol object registries, keyed by the generated protocol url.
+    // The native objects are stateful and must be retained between the create
+    // call and the subsequent read/write/close calls.
+    NSMutableDictionary *shutdownSessions;
+    BOOL retainShutdownSessions;
+    NSMutableDictionary *inputBufferRegistry;
+    NSMutableDictionary *outputBufferRegistry;
+    NSMutableDictionary *streamInputRegistry;
+    NSMutableDictionary *streamOutputRegistry;
 }
 
 - (instancetype)init {
   self = [super init];
   if (self) {
-    logsEnabled = false;
-    statisticsEnabled = false;
-    asyncDispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+      pluginState = [PluginState new];
+      logsEnabled = false;
+      statisticsEnabled = false;
+      asyncDispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
 
-    shutdownSessions = [[NSMutableDictionary alloc] init];
-    inputBufferRegistry = [[NSMutableDictionary alloc] init];
-    outputBufferRegistry = [[NSMutableDictionary alloc] init];
-    streamInputRegistry = [[NSMutableDictionary alloc] init];
-    streamOutputRegistry = [[NSMutableDictionary alloc] init];
+      shutdownSessions = [[NSMutableDictionary alloc] init];
+      inputBufferRegistry = [[NSMutableDictionary alloc] init];
+      outputBufferRegistry = [[NSMutableDictionary alloc] init];
+      streamInputRegistry = [[NSMutableDictionary alloc] init];
+      streamOutputRegistry = [[NSMutableDictionary alloc] init];
 
-    [self registerSessionDeleteListener];
+      [self registerSessionDeleteListener];
 
-    NSLog(@"FFmpegKitFlutterPlugin %p created.\n", self);
+      NSLog(@"FFmpegKitFlutterPlugin %p created.\n", self);
   }
 
   return self;
 }
 
++ (void)detachFromEngine:(NSObject<FlutterPluginRegistry> *)engine {
+    NSAssert([NSThread isMainThread], @"Flutter engine teardown must run on the main thread.");
+    id instance = [engine valuePublishedByPlugin:NSStringFromClass(self)];
+    if ([instance isKindOfClass:self])
+        [instance detachFromEngine];
+}
+
+- (void)detachFromEngineForRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
+    [self detachFromEngine];
+}
+
+- (void)detachFromEngine {
+    if (detached)
+        return;
+    detached = YES;
+    NSArray *streams = [streamInputRegistry.allValues arrayByAddingObjectsFromArray:streamOutputRegistry.allValues];
+    [pluginState beginShutdownAfterDraining:^{
+      for (id stream in streams) {
+          @try {
+              [stream close];
+          } @catch (NSException *exception) { /* Continue closing other streams. */
+          }
+      }
+    }];
+    [self unregisterSessionDeleteListener];
+    for (id resource in inputBufferRegistry.allValues)
+        [resource close];
+    for (id resource in outputBufferRegistry.allValues)
+        [resource close];
+    for (NSString *url in streamInputRegistry)
+        UnregisterPluginStream(url);
+    for (NSString *url in streamOutputRegistry)
+        UnregisterPluginStream(url);
+    [inputBufferRegistry removeAllObjects];
+    [outputBufferRegistry removeAllObjects];
+    [streamInputRegistry removeAllObjects];
+    [streamOutputRegistry removeAllObjects];
+}
+
 - (void)dealloc {
-  [self unregisterSessionDeleteListener];
+    // Fallback cleanup when delegates are eventually released. Pending Flutter
+    // replies can retain an engine, so hosts call the public hook before shutdown.
+    [self detachFromEngine];
 }
 
 - (FlutterError *)onListenWithArguments:(id)arguments eventSink:(FlutterEventSink)eventSink {
-  _eventSink = eventSink;
-  NSLog(@"FFmpegKitFlutterPlugin %p started listening to events on %p.\n", self, eventSink);
-  return nil;
+    [pluginState setEventSink:eventSink];
+    NSLog(@"FFmpegKitFlutterPlugin %p started listening to events on %p.\n", self, eventSink);
+    return nil;
 }
 
 - (FlutterError *)onCancelWithArguments:(id)arguments {
-  _eventSink = nil;
-  return nil;
+    [pluginState setEventSink:nil];
+    return nil;
 }
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
@@ -131,19 +190,17 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
 
   FlutterMethodChannel* methodChannel = [FlutterMethodChannel methodChannelWithName:METHOD_CHANNEL binaryMessenger:[registrar messenger]];
   [registrar addMethodCallDelegate:instance channel:methodChannel];
+  // The public teardown hook resolves this instance through the engine registry.
+  [registrar publish:instance];
 
   FlutterEventChannel* eventChannel = [FlutterEventChannel eventChannelWithName:EVENT_CHANNEL binaryMessenger:[registrar messenger]];
   [eventChannel setStreamHandler:instance];
 }
 
 - (void)emitSession:(id<Session>)session {
-  NSDictionary *dictionary = [FFmpegKitFlutterPlugin toSessionDictionary:session];
-  dispatch_async(dispatch_get_main_queue(), ^() {
-    FlutterEventSink sink = self->_eventSink;
-    if (sink != nil) {
-      sink([FFmpegKitFlutterPlugin toStringDictionary:EVENT_COMPLETE_CALLBACK_EVENT withDictionary:dictionary]);
-    }
-  });
+    [pluginState finishAsyncSession:[session getSessionId]];
+    NSDictionary *dictionary = [FFmpegKitFlutterPlugin toSessionDictionary:session];
+    [pluginState emit:[FFmpegKitFlutterPlugin toStringDictionary:EVENT_COMPLETE_CALLBACK_EVENT withDictionary:dictionary]];
 }
 
 - (void)emitLog:(Log*)log {
@@ -151,12 +208,7 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
     return;
   }
   NSDictionary *dictionary = [FFmpegKitFlutterPlugin toLogDictionary:log];
-  dispatch_async(dispatch_get_main_queue(), ^() {
-    FlutterEventSink sink = self->_eventSink;
-    if (sink != nil) {
-      sink([FFmpegKitFlutterPlugin toStringDictionary:EVENT_LOG_CALLBACK_EVENT withDictionary:dictionary]);
-    }
-  });
+  [pluginState emit:[FFmpegKitFlutterPlugin toStringDictionary:EVENT_LOG_CALLBACK_EVENT withDictionary:dictionary]];
 }
 
 - (void)emitStatistics:(Statistics*)statistics {
@@ -164,22 +216,12 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
     return;
   }
   NSDictionary *dictionary = [FFmpegKitFlutterPlugin toStatisticsDictionary:statistics];
-  dispatch_async(dispatch_get_main_queue(), ^() {
-    FlutterEventSink sink = self->_eventSink;
-    if (sink != nil) {
-      sink([FFmpegKitFlutterPlugin toStringDictionary:EVENT_STATISTICS_CALLBACK_EVENT withDictionary:dictionary]);
-    }
-  });
+  [pluginState emit:[FFmpegKitFlutterPlugin toStringDictionary:EVENT_STATISTICS_CALLBACK_EVENT withDictionary:dictionary]];
 }
 
 - (void)emitSessionDeleted:(long)sessionId {
   NSDictionary *dictionary = @{KEY_SESSION_ID: [NSNumber numberWithLong:sessionId]};
-  dispatch_async(dispatch_get_main_queue(), ^() {
-    FlutterEventSink sink = self->_eventSink;
-    if (sink != nil) {
-      sink([FFmpegKitFlutterPlugin toStringDictionary:EVENT_SESSION_DELETED_CALLBACK_EVENT withDictionary:dictionary]);
-    }
-  });
+  [pluginState emit:[FFmpegKitFlutterPlugin toStringDictionary:EVENT_SESSION_DELETED_CALLBACK_EVENT withDictionary:dictionary]];
 }
 
 - (void)sessionDeleted:(long)sessionId {
@@ -203,34 +245,46 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
 }
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
-  NSNumber* sessionId = call.arguments[ARGUMENT_SESSION_ID];
-  NSNumber* waitTimeout = call.arguments[ARGUMENT_WAIT_TIMEOUT];
-  NSArray* arguments = call.arguments[ARGUMENT_ARGUMENTS];
-  NSString* ffprobeJsonOutput = call.arguments[ARGUMENT_FFPROBE_JSON_OUTPUT];
+    result = [pluginState registerReply:result];
+    if (result == nil)
+        return;
+    NSNumber *sessionId = call.arguments[ARGUMENT_SESSION_ID];
+    NSNumber *waitTimeout = call.arguments[ARGUMENT_WAIT_TIMEOUT];
+    NSArray *arguments = call.arguments[ARGUMENT_ARGUMENTS];
+    NSString *ffprobeJsonOutput = call.arguments[ARGUMENT_FFPROBE_JSON_OUTPUT];
 
-  if ([@"shutdown" isEqualToString:call.method]) {
-      if (![waitTimeout isKindOfClass:[NSNumber class]]) {
-          result([FlutterError errorWithCode:@"INVALID_ARGUMENTS" message:@"waitTimeout is required." details:nil]);
-          return;
-      }
-      retainShutdownSessions = YES;
-      for (id<Session> session in [FFmpegKitConfig getSessions]) {
-          shutdownSessions[@([session getSessionId])] = session;
-      }
-      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        BOOL finished = [FFmpegKitConfig shutdownWithTimeout:[waitTimeout intValue]];
-        dispatch_async(dispatch_get_main_queue(), ^{
-          result(@(finished));
+    if ([@"shutdown" isEqualToString:call.method]) {
+        if (![waitTimeout isKindOfClass:[NSNumber class]]) {
+            result([FlutterError errorWithCode:@"INVALID_ARGUMENTS" message:@"waitTimeout is required." details:nil]);
+            return;
+        }
+        retainShutdownSessions = YES;
+        for (id<Session> session in [FFmpegKitConfig getSessions]) {
+            shutdownSessions[@([session getSessionId])] = session;
+        }
+        PluginState *state = pluginState;
+        PluginWork *work = [state queueWork:nil];
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+          if (![state startWork:work]) {
+              [state finishWork:work];
+              return;
+          }
+          @try {
+              result(@([FFmpegKitConfig shutdownWithTimeout:[waitTimeout intValue]]));
+          } @catch (NSException *exception) {
+              result([FlutterError errorWithCode:@"SHUTDOWN_FAILED" message:exception.reason details:nil]);
+          } @finally {
+              [state finishWork:work];
+          }
         });
-      });
-  } else if ([@"isShutdown" isEqualToString:call.method]) {
-      result(@([FFmpegKitConfig isShutdown]));
-  } else if ([@"abstractSessionGetEndTime" isEqualToString:call.method]) {
-      if (sessionId != nil) {
-          [self abstractSessionGetEndTime:sessionId result:result];
-      } else {
-          result([FlutterError errorWithCode:@"INVALID_SESSION" message:@"Invalid session id." details:nil]);
-      }
+    } else if ([@"isShutdown" isEqualToString:call.method]) {
+        result(@([FFmpegKitConfig isShutdown]));
+    } else if ([@"abstractSessionGetEndTime" isEqualToString:call.method]) {
+        if (sessionId != nil) {
+            [self abstractSessionGetEndTime:sessionId result:result];
+        } else {
+            result([FlutterError errorWithCode:@"INVALID_SESSION" message:@"Invalid session id." details:nil]);
+        }
   } else if ([@"abstractSessionGetDuration" isEqualToString:call.method]) {
       if (sessionId != nil) {
           [self abstractSessionGetDuration:sessionId result:result];
@@ -985,16 +1039,40 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
   }
 }
 
+- (void)queueExecution:(id<Session>)session result:(FlutterResult)result execute:(void (^)(void))execute {
+    PluginState *state = pluginState;
+    PluginWork *work = [state queueWork:^{
+      [session cancel];
+    }];
+    if (work == nil) {
+        result([FlutterError errorWithCode:@"PLUGIN_SHUTDOWN" message:@"The plugin is detached." details:nil]);
+        return;
+    }
+    dispatch_async(asyncDispatchQueue, ^{
+      @try {
+          if ([state startWork:work]) {
+              execute();
+              result(nil);
+          }
+      } @catch (NSException *exception) {
+          result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+      } @finally {
+          [state finishWork:work];
+      }
+    });
+}
+
 - (void)ffmpegSessionExecute:(NSNumber*)sessionId result:(FlutterResult)result {
     AbstractSession *session = [self findSession:sessionId];
     if (session == nil) {
         result([FlutterError errorWithCode:@"SESSION_NOT_FOUND" message:@"Session not found." details:nil]);
     } else {
         if ([session isFFmpeg]) {
-            dispatch_async(asyncDispatchQueue, ^{
-              [FFmpegKitConfig ffmpegExecute:(FFmpegSession *)session];
-              result(nil);
-            });
+            [self queueExecution:session
+                          result:result
+                         execute:^{
+                           [FFmpegKitConfig ffmpegExecute:(FFmpegSession *)session];
+                         }];
         } else {
             result([FlutterError errorWithCode:@"NOT_FFMPEG_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1007,10 +1085,11 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
         result([FlutterError errorWithCode:@"SESSION_NOT_FOUND" message:@"Session not found." details:nil]);
     } else {
         if ([session isFFprobe]) {
-            dispatch_async(asyncDispatchQueue, ^{
-              [FFmpegKitConfig ffprobeExecute:(FFprobeSession *)session];
-              result(nil);
-            });
+            [self queueExecution:session
+                          result:result
+                         execute:^{
+                           [FFmpegKitConfig ffprobeExecute:(FFprobeSession *)session];
+                         }];
         } else {
             result([FlutterError errorWithCode:@"NOT_FFPROBE_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1029,10 +1108,11 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
             } else {
                 timeout = AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
             }
-            dispatch_async(asyncDispatchQueue, ^{
-              [FFmpegKitConfig getMediaInformationExecute:(MediaInformationSession *)session withTimeout:timeout];
-              result(nil);
-            });
+            [self queueExecution:session
+                          result:result
+                         execute:^{
+                           [FFmpegKitConfig getMediaInformationExecute:(MediaInformationSession *)session withTimeout:timeout];
+                         }];
         } else {
             result([FlutterError errorWithCode:@"NOT_MEDIA_INFORMATION_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1045,8 +1125,20 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
         result([FlutterError errorWithCode:@"SESSION_NOT_FOUND" message:@"Session not found." details:nil]);
     } else {
         if ([session isFFmpeg]) {
-            [FFmpegKitConfig asyncFFmpegExecute:(FFmpegSession *)session];
-            result(nil);
+            PluginState *state = pluginState;
+            BOOL tracked = [state trackAsyncSession:session];
+            if (!tracked) {
+                result([FlutterError errorWithCode:@"PLUGIN_SHUTDOWN" message:@"The plugin is detached." details:nil]);
+                return;
+            }
+            @try {
+                [FFmpegKitConfig asyncFFmpegExecute:(FFmpegSession *)session];
+                [state pruneAsyncSessions];
+                result(nil);
+            } @catch (NSException *exception) {
+                [state finishAsyncSession:[session getSessionId]];
+                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+            }
         } else {
             result([FlutterError errorWithCode:@"NOT_FFMPEG_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1059,8 +1151,20 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
         result([FlutterError errorWithCode:@"SESSION_NOT_FOUND" message:@"Session not found." details:nil]);
     } else {
         if ([session isFFprobe]) {
-            [FFmpegKitConfig asyncFFprobeExecute:(FFprobeSession *)session];
-            result(nil);
+            PluginState *state = pluginState;
+            BOOL tracked = [state trackAsyncSession:session];
+            if (!tracked) {
+                result([FlutterError errorWithCode:@"PLUGIN_SHUTDOWN" message:@"The plugin is detached." details:nil]);
+                return;
+            }
+            @try {
+                [FFmpegKitConfig asyncFFprobeExecute:(FFprobeSession *)session];
+                [state pruneAsyncSessions];
+                result(nil);
+            } @catch (NSException *exception) {
+                [state finishAsyncSession:[session getSessionId]];
+                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+            }
         } else {
             result([FlutterError errorWithCode:@"NOT_FFPROBE_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1079,8 +1183,20 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
             } else {
                 timeout = AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
             }
-            [FFmpegKitConfig asyncGetMediaInformationExecute:(MediaInformationSession *)session withTimeout:timeout];
-            result(nil);
+            PluginState *state = pluginState;
+            BOOL tracked = [state trackAsyncSession:session];
+            if (!tracked) {
+                result([FlutterError errorWithCode:@"PLUGIN_SHUTDOWN" message:@"The plugin is detached." details:nil]);
+                return;
+            }
+            @try {
+                [FFmpegKitConfig asyncGetMediaInformationExecute:(MediaInformationSession *)session withTimeout:timeout];
+                [state pruneAsyncSessions];
+                result(nil);
+            } @catch (NSException *exception) {
+                [state finishAsyncSession:[session getSessionId]];
+                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+            }
         } else {
             result([FlutterError errorWithCode:@"NOT_MEDIA_INFORMATION_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
         }
@@ -1197,56 +1313,69 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
 }
 
 - (void)writeToPipe:(NSString*)inputPath pipe:(NSString*)namedPipePath result:(FlutterResult)result {
-  dispatch_async(asyncDispatchQueue, ^{
-
-    NSLog(@"Starting copy %@ to pipe %@ operation.\n", inputPath, namedPipePath);
-
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForReadingAtPath: inputPath];
-    if (fileHandle == nil) {
-      NSLog(@"Failed to open file %@.\n", inputPath);
-      result([FlutterError errorWithCode:@"COPY_FAILED" message:[NSString stringWithFormat:@"Failed to open file %@.", inputPath] details:nil]);
-      return;
-    }
-
-    NSFileHandle *pipeHandle = [NSFileHandle fileHandleForWritingAtPath: namedPipePath];
-    if (pipeHandle == nil) {
-      NSLog(@"Failed to open pipe %@.\n", namedPipePath);
-      result([FlutterError errorWithCode:@"COPY_FAILED" message:[NSString stringWithFormat:@"Failed to open pipe %@.", namedPipePath] details:nil]);
-      [fileHandle closeFile];
-      return;
-    }
-
-    int BUFFER_SIZE = 4096;
-    unsigned long readBytes = 0;
-    unsigned long totalBytes = 0;
-    double startTime = CACurrentMediaTime();
-
-    @try {
-      [fileHandle seekToFileOffset: 0];
-
-      do {
-        NSData *data = [fileHandle readDataOfLength:BUFFER_SIZE];
-        readBytes = [data length];
-        if (readBytes > 0) {
-          totalBytes += readBytes;
-          [pipeHandle writeData:data];
-        }
-      } while (readBytes > 0);
-
-      double endTime = CACurrentMediaTime();
-
-      NSLog(@"Copying %@ to pipe %@ operation completed successfully. %lu bytes copied in %f seconds.\n", inputPath, namedPipePath, totalBytes, (endTime - startTime)/1000);
-
-      result(0);
-
-    } @catch (NSException *e) {
-      NSLog(@"Copy failed %@.\n", [e reason]);
-      result([FlutterError errorWithCode:@"COPY_FAILED" message:[NSString stringWithFormat:@"Copy %@ to %@ failed with error %@.", inputPath, namedPipePath, [e reason]] details:nil]);
-    } @finally {
-      [fileHandle closeFile];
-      [pipeHandle closeFile];
-    }
-  });
+    PluginState *state = pluginState;
+    PluginWork *work = [state queueWork:nil];
+    dispatch_async(asyncDispatchQueue, ^{
+      if (![state startWork:work]) {
+          [state finishWork:work];
+          return;
+      }
+      int input = -1;
+      int output = -1;
+      @try {
+          // A FIFO open/write must not prevent engine teardown when its peer has
+          // disappeared. Nonblocking I/O lets this worker observe its own state.
+          input = open(inputPath.fileSystemRepresentation, O_RDONLY | O_NONBLOCK);
+          if (input < 0) {
+              result([FlutterError errorWithCode:@"COPY_FAILED" message:@"Failed to open input file." details:nil]);
+              return;
+          }
+          while (![state isStopping]) {
+              output = open(namedPipePath.fileSystemRepresentation, O_WRONLY | O_NONBLOCK);
+              if (output >= 0)
+                  break;
+              if (errno != ENXIO && errno != EINTR) {
+                  result([FlutterError errorWithCode:@"COPY_FAILED" message:@"Failed to open output pipe." details:nil]);
+                  return;
+              }
+              [NSThread sleepForTimeInterval:0.01];
+          }
+          char buffer[4096];
+          while (![state isStopping] && output >= 0) {
+              ssize_t count = read(input, buffer, sizeof(buffer));
+              if (count == 0) {
+                  result(nil);
+                  return;
+              }
+              if (count < 0) {
+                  if (errno == EINTR || errno == EAGAIN) {
+                      [NSThread sleepForTimeInterval:0.01];
+                      continue;
+                  }
+                  result([FlutterError errorWithCode:@"COPY_FAILED" message:@"Failed to read input file." details:nil]);
+                  return;
+              }
+              ssize_t offset = 0;
+              while (offset < count && ![state isStopping]) {
+                  ssize_t written = write(output, buffer + offset, (size_t)(count - offset));
+                  if (written > 0)
+                      offset += written;
+                  else if (written < 0 && (errno == EINTR || errno == EAGAIN))
+                      [NSThread sleepForTimeInterval:0.01];
+                  else {
+                      result([FlutterError errorWithCode:@"COPY_FAILED" message:@"Failed to write output pipe." details:nil]);
+                      return;
+                  }
+              }
+          }
+      } @finally {
+          if (input >= 0)
+              close(input);
+          if (output >= 0)
+              close(output);
+          [state finishWork:work];
+      }
+    });
 }
 
 - (void)selectDocument:(FlutterResult)result {
@@ -1537,17 +1666,22 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
     result([FlutterError errorWithCode:@"NOT_FOUND" message:@"Stream input not found." details:nil]);
     return;
   }
+  PluginState *state = pluginState;
+  PluginWork *work = [state queueWork:^{
+    UnregisterPluginStream(url);
+  }];
   dispatch_async(asyncDispatchQueue, ^{
+    if (![state startWork:work]) {
+        [state finishWork:work];
+        return;
+    }
     @try {
-        int written;
-        if (timeoutMs != nil) {
-            written = [streamInput write:data.data timeout:[timeoutMs intValue]];
-        } else {
-            written = [streamInput write:data.data];
-        }
+        int written = timeoutMs != nil ? [streamInput write:data.data timeout:[timeoutMs intValue]] : [streamInput write:data.data];
         result([NSNumber numberWithInt:written]);
     } @catch (NSException *exception) {
         result([FlutterError errorWithCode:@"STREAM_INPUT_WRITE_FAILED" message:exception.reason details:nil]);
+    } @finally {
+        [state finishWork:work];
     }
   });
 }
@@ -1587,17 +1721,22 @@ extern int const AbstractSessionDefaultTimeoutForAsynchronousMessagesInTransmit;
     result([FlutterError errorWithCode:@"NOT_FOUND" message:@"Stream output not found." details:nil]);
     return;
   }
+  PluginState *state = pluginState;
+  PluginWork *work = [state queueWork:^{
+    UnregisterPluginStream(url);
+  }];
   dispatch_async(asyncDispatchQueue, ^{
-    NSData* data;
-    if (timeoutMs != nil) {
-      data = [streamOutput read:[maxBytes intValue] timeout:[timeoutMs intValue]];
-    } else {
-      data = [streamOutput read:[maxBytes intValue]];
+    if (![state startWork:work]) {
+        [state finishWork:work];
+        return;
     }
-    if (data != nil) {
-      result([FlutterStandardTypedData typedDataWithBytes:data]);
-    } else {
-      result(nil);
+    @try {
+        NSData *data = timeoutMs != nil ? [streamOutput read:[maxBytes intValue] timeout:[timeoutMs intValue]] : [streamOutput read:[maxBytes intValue]];
+        result(data != nil ? [FlutterStandardTypedData typedDataWithBytes:data] : nil);
+    } @catch (NSException *exception) {
+        result([FlutterError errorWithCode:@"STREAM_OUTPUT_READ_FAILED" message:exception.reason details:nil]);
+    } @finally {
+        [state finishWork:work];
     }
   });
 }

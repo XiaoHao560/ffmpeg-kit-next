@@ -22,8 +22,15 @@
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <list>
@@ -33,6 +40,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "plugin_state.h"
 
 #include <AbstractSession.h>
 #include <ArchDetect.h>
@@ -96,6 +105,53 @@ static const char* EVENT_COMPLETE_CALLBACK_EVENT =
 static const char* EVENT_SESSION_DELETED_CALLBACK_EVENT =
     "FFmpegKitSessionDeletedCallbackEvent";
 
+class PendingResponse;
+struct PluginData {
+    std::shared_ptr<ffmpeg_kit_linux::PluginState> executions = std::make_shared<ffmpeg_kit_linux::PluginState>();
+    GWeakRef plugin;
+    // Platform-thread owned. Workers retain their response independently.
+    std::vector<std::shared_ptr<PendingResponse>> pending;
+    std::mutex async_mutex;
+    std::map<long, std::shared_ptr<ffmpegkit::Session>> async_sessions;
+    void FinishAsync(long id) {
+        std::lock_guard<std::mutex> lock(async_mutex);
+        async_sessions.erase(id);
+    }
+    void PruneAsyncLocked() {
+        for (auto item = async_sessions.begin(); item != async_sessions.end();) {
+            const auto status = item->second->getState();
+            if (status == ffmpegkit::SessionStateCompleted || status == ffmpegkit::SessionStateFailed)
+                item = async_sessions.erase(item);
+            else
+                ++item;
+        }
+    }
+    bool TrackAsync(const std::shared_ptr<ffmpegkit::Session> &session) {
+        std::lock_guard<std::mutex> lock(async_mutex);
+        if (executions->IsStopping())
+            return false;
+        PruneAsyncLocked();
+        async_sessions[session->getSessionId()] = session;
+        return true;
+    }
+    void CancelAsync() {
+        std::map<long, std::shared_ptr<ffmpegkit::Session>> owned;
+        {
+            std::lock_guard<std::mutex> lock(async_mutex);
+            PruneAsyncLocked();
+            owned.swap(async_sessions);
+        }
+        for (const auto &item : owned) {
+            try {
+                item.second->cancel();
+            } catch (...) {
+            }
+        }
+    }
+    PluginData() { g_weak_ref_init(&plugin, nullptr); }
+    ~PluginData() { g_weak_ref_clear(&plugin); }
+};
+
 struct _FfmpegKitNextFlutterPlugin {
   GObject parent_instance;
   FlEventChannel* event_channel;
@@ -116,6 +172,7 @@ struct _FfmpegKitNextFlutterPlugin {
   std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput>>*
       stream_outputs;
   std::shared_ptr<ffmpegkit::SessionDeleteListener>* delete_listener;
+  std::shared_ptr<PluginData> *state;
 };
 
 G_DEFINE_TYPE(FfmpegKitNextFlutterPlugin, ffmpeg_kit_next_flutter_plugin,
@@ -450,94 +507,157 @@ static std::shared_ptr<ffmpegkit::Session> get_session(FfmpegKitNextFlutterPlugi
 // ---------------------------------------------------------------------------
 
 struct EmitData {
-  FfmpegKitNextFlutterPlugin* self;
-  FlValue* event;
+    std::weak_ptr<PluginData> state;
+    FlValue *event;
+    int kind; // 0: session; 1: log; 2: statistics.
 };
 
-// VERIFY(linux): fl_event_channel_send must be invoked on the platform thread,
-// hence the g_idle_add hop from the native FFmpeg worker threads.
+// Delivery uses a weak plugin reference and checks admission again on the
+// platform thread. A queued event cannot keep a detached plugin alive.
 static gboolean emit_on_main(gpointer user_data) {
-  EmitData* d = static_cast<EmitData*>(user_data);
-  if (d->self->listening) {
-    fl_event_channel_send(d->self->event_channel, d->event, nullptr, nullptr);
-  }
-  fl_value_unref(d->event);
-  g_object_unref(d->self);
-  delete d;
-  return G_SOURCE_REMOVE;
+    std::unique_ptr<EmitData> data(static_cast<EmitData *>(user_data));
+    auto state = data->state.lock();
+    if (state && !state->executions->IsStopping()) {
+        auto *self = static_cast<FfmpegKitNextFlutterPlugin *>(g_weak_ref_get(&state->plugin));
+        if (self) {
+            if (self->listening && (data->kind != 1 || self->logs_enabled) && (data->kind != 2 || self->statistics_enabled))
+                fl_event_channel_send(self->event_channel, data->event, nullptr, nullptr);
+            g_object_unref(self);
+        }
+    }
+    fl_value_unref(data->event);
+    return G_SOURCE_REMOVE;
 }
 
-static void post_event(FfmpegKitNextFlutterPlugin* self, FlValue* event) {
-  EmitData* d = new EmitData{
-      FFMPEG_KIT_NEXT_FLUTTER_PLUGIN(g_object_ref(self)), event};
-  g_idle_add(emit_on_main, d);
+static void post_event(const std::weak_ptr<PluginData> &weak, FlValue *event, int kind = 0) {
+    auto state = weak.lock();
+    if (!state || state->executions->IsStopping()) {
+        fl_value_unref(event);
+        return;
+    }
+    g_idle_add(emit_on_main, new EmitData{weak, event, kind});
 }
 
-static void emit_log(FfmpegKitNextFlutterPlugin* self,
-                     const std::shared_ptr<ffmpegkit::Log>& log) {
-  if (!self->logs_enabled) return;
-  post_event(self, to_event_map(EVENT_LOG_CALLBACK_EVENT, to_log_map(log)));
+static void post_event(FfmpegKitNextFlutterPlugin *self, FlValue *event) { post_event(*self->state, event); }
+
+static void emit_log(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Log> &log) { post_event(state, to_event_map(EVENT_LOG_CALLBACK_EVENT, to_log_map(log)), 1); }
+
+static void emit_statistics(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Statistics> &statistics) { post_event(state, to_event_map(EVENT_STATISTICS_CALLBACK_EVENT, to_statistics_map(statistics)), 2); }
+
+static void emit_session(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Session> &session) {
+    if (auto current = state.lock())
+        current->FinishAsync(session->getSessionId());
+    post_event(state, to_event_map(EVENT_COMPLETE_CALLBACK_EVENT, to_session_map(session)));
 }
 
-static void emit_statistics(
-    FfmpegKitNextFlutterPlugin* self,
-    const std::shared_ptr<ffmpegkit::Statistics>& statistics) {
-  if (!self->statistics_enabled) return;
-  post_event(self, to_event_map(EVENT_STATISTICS_CALLBACK_EVENT,
-                                to_statistics_map(statistics)));
-}
-
-static void emit_session(FfmpegKitNextFlutterPlugin* self,
-                         const std::shared_ptr<ffmpegkit::Session>& session) {
-  post_event(self,
-             to_event_map(EVENT_COMPLETE_CALLBACK_EVENT, to_session_map(session)));
-}
-
-static void emit_session_deleted(FfmpegKitNextFlutterPlugin* self,
-                                 long session_id) {
-  FlValue* payload = fl_value_new_map();
-  fl_value_set_string_take(payload, KEY_SESSION_ID, fl_value_new_int(session_id));
-  post_event(self,
-             to_event_map(EVENT_SESSION_DELETED_CALLBACK_EVENT, payload));
+static void emit_session_deleted(const std::weak_ptr<PluginData> &state, long session_id) {
+    FlValue *payload = fl_value_new_map();
+    fl_value_set_string_take(payload, KEY_SESSION_ID, fl_value_new_int(session_id));
+    post_event(state, to_event_map(EVENT_SESSION_DELETED_CALLBACK_EVENT, payload));
 }
 
 class LinuxSessionDeleteListener : public ffmpegkit::SessionDeleteListener {
  public:
-  explicit LinuxSessionDeleteListener(FfmpegKitNextFlutterPlugin* plugin)
-      : plugin_(plugin) {}
-  void sessionDeleted(const long sessionId) override {
-    emit_session_deleted(plugin_, sessionId);
-  }
+   explicit LinuxSessionDeleteListener(const std::shared_ptr<PluginData> &state) : state_(state) {}
+   void sessionDeleted(const long sessionId) override { emit_session_deleted(state_, sessionId); }
 
  private:
-  FfmpegKitNextFlutterPlugin* plugin_;
+   std::weak_ptr<PluginData> state_;
 };
+
+static long stream_id(const std::string &url) {
+    const auto colon = url.find(':');
+    return colon == std::string::npos ? 0 : std::strtol(url.c_str() + colon + 1, nullptr, 10);
+}
 
 // ---------------------------------------------------------------------------
 // Deferred (asynchronous) responses
 // ---------------------------------------------------------------------------
 
-struct DeferredResponse {
-  FlMethodCall* call;
-  FlMethodResponse* response;
+class PendingResponse {
+  public:
+    explicit PendingResponse(FlMethodCall *call) : call_(static_cast<FlMethodCall *>(g_object_ref(call))) {}
+    ~PendingResponse() {
+        if (call_)
+            g_object_unref(call_);
+    }
+    // Invoked only on the platform thread, including channel teardown. Workers
+    // enqueue a response; they never call Flutter or release its call object.
+    void Complete(FlMethodResponse *response) {
+        if (call_) {
+            fl_method_call_respond(call_, response, nullptr);
+            g_object_unref(call_);
+            call_ = nullptr;
+        }
+        g_object_unref(response);
+    }
+    bool IsComplete() const { return call_ == nullptr; }
+
+  private:
+    FlMethodCall *call_;
 };
 
-// VERIFY(linux): a method call may only be responded to on the platform thread;
-// worker threads route their response back through this idle hop.
-static gboolean deliver_response(gpointer user_data) {
-  DeferredResponse* d = static_cast<DeferredResponse*>(user_data);
-  fl_method_call_respond(d->call, d->response, nullptr);
-  g_object_unref(d->response);
-  g_object_unref(d->call);
-  delete d;
-  return G_SOURCE_REMOVE;
+struct DeferredResponse {
+    std::shared_ptr<PluginData> state;
+    std::shared_ptr<PendingResponse> pending;
+    FlMethodResponse *response;
+};
+
+static void prune_responses(const std::shared_ptr<PluginData> &state) {
+    auto &pending = state->pending;
+    pending.erase(std::remove_if(pending.begin(), pending.end(), [](const std::shared_ptr<PendingResponse> &response) { return response->IsComplete(); }), pending.end());
 }
 
-// Takes ownership of both refs (the call was g_object_ref'd by the async
-// handler; response is freshly built).
-static void respond_later(FlMethodCall* call, FlMethodResponse* response) {
-  DeferredResponse* d = new DeferredResponse{call, response};
-  g_idle_add(deliver_response, d);
+static gboolean deliver_response(gpointer user_data) {
+    std::unique_ptr<DeferredResponse> data(static_cast<DeferredResponse *>(user_data));
+    data->pending->Complete(data->response);
+    prune_responses(data->state);
+    return G_SOURCE_REMOVE;
+}
+
+static void respond_later(const std::shared_ptr<PluginData> &state, const std::shared_ptr<PendingResponse> &pending, FlMethodResponse *response) { g_idle_add(deliver_response, new DeferredResponse{state, pending, response}); }
+
+static FlMethodResponse *enqueue_call(FfmpegKitNextFlutterPlugin *self, FlMethodCall *call, std::function<FlMethodResponse *()> execute, std::function<void()> cancel = {}) {
+    auto state = *self->state;
+    if (state->executions->IsStopping())
+        return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+    auto pending = std::make_shared<PendingResponse>(call);
+    state->pending.push_back(pending);
+    try {
+        std::thread([state, pending, execute, cancel]() {
+            auto lease = state->executions->TryStart(cancel);
+            if (!lease) {
+                respond_later(state, pending, resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down."));
+                return;
+            }
+            try {
+                respond_later(state, pending, execute());
+            } catch (const std::exception &error) {
+                respond_later(state, pending, resp_error("EXECUTION_FAILED", error.what()));
+            } catch (...) {
+                respond_later(state, pending, resp_error("EXECUTION_FAILED", "Native execution failed."));
+            }
+        }).detach();
+    } catch (const std::exception &error) {
+        pending->Complete(resp_error("EXECUTION_FAILED", error.what()));
+        prune_responses(state);
+    }
+    return nullptr;
+}
+
+template <typename SessionType, typename Submit> static FlMethodResponse *enqueue_async_execution(FfmpegKitNextFlutterPlugin *self, const std::shared_ptr<SessionType> &session, Submit submit) {
+    auto state = *self->state;
+    if (!state->TrackAsync(session))
+        return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+    try {
+        submit();
+        if (ffmpegkit::FFmpegKitConfig::isShutdown() && session->getState() == ffmpegkit::SessionStateFailed)
+            state->FinishAsync(session->getSessionId());
+        return resp_null();
+    } catch (const std::exception &error) {
+        state->FinishAsync(session->getSessionId());
+        return resp_error("EXECUTION_FAILED", error.what());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -549,97 +669,92 @@ static void respond_later(FlMethodCall* call, FlMethodResponse* response) {
 // later via respond_later.
 static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
                                             FlMethodCall* call) {
-  const gchar* m = fl_method_call_get_name(call);
-  FlValue* args = fl_method_call_get_args(call);
+    if ((*self->state)->executions->IsStopping())
+        return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+    const gchar *m = fl_method_call_get_name(call);
+    FlValue *args = fl_method_call_get_args(call);
 
-  // -- Abstract session accessors --------------------------------------------
-  if (g_strcmp0(m, "shutdown") == 0) {
-      gboolean found = FALSE;
-      int64_t wait = get_int_argument(args, "waitTimeout", &found);
-      if (!found || wait < INT32_MIN || wait > INT32_MAX)
-          return resp_error("INVALID_ARGUMENTS", "waitTimeout must be a signed 32-bit integer.");
-      self->retain_shutdown_sessions = TRUE;
-      auto sessions = ffmpegkit::FFmpegKitConfig::getSessions();
-      if (sessions)
-          for (const auto &session : *sessions)
-              (*self->shutdown_sessions)[session->getSessionId()] = session;
-      g_object_ref(call);
-      try {
-          std::thread([call, wait]() {
-              try {
-                  respond_later(call, resp_bool(ffmpegkit::FFmpegKitConfig::shutdown(static_cast<int>(wait))));
-              } catch (const std::exception &error) {
-                  respond_later(call, resp_error("SHUTDOWN_FAILED", error.what()));
-              }
-          }).detach();
-      } catch (const std::exception &error) {
-          g_object_unref(call);
-          return resp_error("SHUTDOWN_FAILED", error.what());
-      }
-      return nullptr;
-  } else if (g_strcmp0(m, "isShutdown") == 0) {
-      return resp_bool(ffmpegkit::FFmpegKitConfig::isShutdown());
-  } else if (g_strcmp0(m, "abstractSessionGetEndTime") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      auto end_time = session->getEndTime();
-      // getEndTime() is epoch (time_since_epoch()==0) until the session ends.
-      if (end_time.time_since_epoch().count() == 0)
-          return resp_null();
-      return resp_int(to_epoch_millis(end_time));
-  } else if (g_strcmp0(m, "abstractSessionGetDuration") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_int(session->getDuration());
-  } else if (g_strcmp0(m, "abstractSessionGetAllLogs") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_take_value(to_log_list_value(session->getAllLogsWithTimeout(resolve_timeout(args))));
-  } else if (g_strcmp0(m, "abstractSessionGetLogs") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_take_value(to_log_list_value(session->getLogs()));
-  } else if (g_strcmp0(m, "abstractSessionGetAllLogsAsString") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_utf8_string(session->getAllLogsAsStringWithTimeout(resolve_timeout(args)));
-  } else if (g_strcmp0(m, "abstractSessionGetState") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_int(static_cast<int>(session->getState()));
-  } else if (g_strcmp0(m, "abstractSessionGetReturnCode") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      auto return_code = session->getReturnCode();
-      if (return_code == nullptr)
-          return resp_null();
-      return resp_int(return_code->getValue());
-  } else if (g_strcmp0(m, "abstractSessionGetFailStackTrace") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_utf8_string(session->getFailStackTrace());
-  } else if (g_strcmp0(m, "thereAreAsynchronousMessagesInTransmit") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      return resp_bool(session->thereAreAsynchronousMessagesInTransmit());
+    // -- Abstract session accessors --------------------------------------------
+    if (g_strcmp0(m, "shutdown") == 0) {
+        gboolean found = FALSE;
+        int64_t wait = get_int_argument(args, "waitTimeout", &found);
+        if (!found || wait < INT32_MIN || wait > INT32_MAX)
+            return resp_error("INVALID_ARGUMENTS", "waitTimeout must be a signed 32-bit integer.");
+        self->retain_shutdown_sessions = TRUE;
+        auto sessions = ffmpegkit::FFmpegKitConfig::getSessions();
+        if (sessions)
+            for (const auto &session : *sessions)
+                (*self->shutdown_sessions)[session->getSessionId()] = session;
+        return enqueue_call(self, call, [wait]() {
+            try {
+                return resp_bool(ffmpegkit::FFmpegKitConfig::shutdown(static_cast<int>(wait)));
+            } catch (const std::exception &error) {
+                return resp_error("SHUTDOWN_FAILED", error.what());
+            }
+        });
+    } else if (g_strcmp0(m, "isShutdown") == 0) {
+        return resp_bool(ffmpegkit::FFmpegKitConfig::isShutdown());
+    } else if (g_strcmp0(m, "abstractSessionGetEndTime") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        auto end_time = session->getEndTime();
+        // getEndTime() is epoch (time_since_epoch()==0) until the session ends.
+        if (end_time.time_since_epoch().count() == 0)
+            return resp_null();
+        return resp_int(to_epoch_millis(end_time));
+    } else if (g_strcmp0(m, "abstractSessionGetDuration") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_int(session->getDuration());
+    } else if (g_strcmp0(m, "abstractSessionGetAllLogs") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_take_value(to_log_list_value(session->getAllLogsWithTimeout(resolve_timeout(args))));
+    } else if (g_strcmp0(m, "abstractSessionGetLogs") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_take_value(to_log_list_value(session->getLogs()));
+    } else if (g_strcmp0(m, "abstractSessionGetAllLogsAsString") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_utf8_string(session->getAllLogsAsStringWithTimeout(resolve_timeout(args)));
+    } else if (g_strcmp0(m, "abstractSessionGetState") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_int(static_cast<int>(session->getState()));
+    } else if (g_strcmp0(m, "abstractSessionGetReturnCode") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        auto return_code = session->getReturnCode();
+        if (return_code == nullptr)
+            return resp_null();
+        return resp_int(return_code->getValue());
+    } else if (g_strcmp0(m, "abstractSessionGetFailStackTrace") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_utf8_string(session->getFailStackTrace());
+    } else if (g_strcmp0(m, "thereAreAsynchronousMessagesInTransmit") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        return resp_bool(session->thereAreAsynchronousMessagesInTransmit());
 
-      // -- Arch / platform / version -------------------------------------------
-  } else if (g_strcmp0(m, "getArch") == 0) {
-      return resp_string(ffmpegkit::ArchDetect::getArch().c_str());
-  } else if (g_strcmp0(m, "getPlatform") == 0) {
-      return resp_string(FFMPEG_KIT_PLATFORM_NAME);
-  } else if (g_strcmp0(m, "getFFmpegVersion") == 0) {
-      return resp_string(ffmpegkit::FFmpegKitConfig::getFFmpegVersion().c_str());
-  } else if (g_strcmp0(m, "isLTSBuild") == 0) {
+        // -- Arch / platform / version -------------------------------------------
+    } else if (g_strcmp0(m, "getArch") == 0) {
+        return resp_string(ffmpegkit::ArchDetect::getArch().c_str());
+    } else if (g_strcmp0(m, "getPlatform") == 0) {
+        return resp_string(FFMPEG_KIT_PLATFORM_NAME);
+    } else if (g_strcmp0(m, "getFFmpegVersion") == 0) {
+        return resp_string(ffmpegkit::FFmpegKitConfig::getFFmpegVersion().c_str());
+    } else if (g_strcmp0(m, "isLTSBuild") == 0) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     return resp_bool(ffmpegkit::FFmpegKitConfig::isLTSBuild());
@@ -661,17 +776,21 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       // -- Session creation -----------------------------------------------------
   } else if (g_strcmp0(m, "ffmpegSession") == 0) {
       auto session = ffmpegkit::FFmpegSession::create(
-          fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::FFmpegSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); }, [self](std::shared_ptr<ffmpegkit::Statistics> s) { emit_statistics(self, s); });
+          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFmpegSession> s) { emit_session(state, s); }, [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); },
+          [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Statistics> s) { emit_statistics(state, s); });
       if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
           (*self->shutdown_sessions)[session->getSessionId()] = session;
       return resp_take_value(to_session_map(session));
   } else if (g_strcmp0(m, "ffprobeSession") == 0) {
-      auto session = ffmpegkit::FFprobeSession::create(fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::FFprobeSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
+      auto session = ffmpegkit::FFprobeSession::create(
+          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFprobeSession> s) { emit_session(state, s); }, [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
       if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
           (*self->shutdown_sessions)[session->getSessionId()] = session;
       return resp_take_value(to_session_map(session));
   } else if (g_strcmp0(m, "mediaInformationSession") == 0) {
-      auto session = ffmpegkit::MediaInformationSession::create(fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::MediaInformationSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
+      auto session = ffmpegkit::MediaInformationSession::create(
+          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::MediaInformationSession> s) { emit_session(state, s); },
+          [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
       if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
           (*self->shutdown_sessions)[session->getSessionId()] = session;
       return resp_take_value(to_session_map(session));
@@ -806,12 +925,13 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
           return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
                                                   "type.");
       auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-      g_object_ref(call);
-      std::thread([call, ffmpeg_session]() {
-          ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
-          respond_later(call, resp_null());
-      }).detach();
-      return nullptr;
+      return enqueue_call(
+          self, call,
+          [ffmpeg_session]() {
+              ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
+              return resp_null();
+          },
+          [ffmpeg_session] { ffmpeg_session->cancel(); });
   } else if (g_strcmp0(m, "ffprobeSessionExecute") == 0) {
       auto session = get_session(self, args);
       if (session == nullptr)
@@ -820,12 +940,13 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
           return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
                                                    "type.");
       auto ffprobe_session = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
-      g_object_ref(call);
-      std::thread([call, ffprobe_session]() {
-          ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
-          respond_later(call, resp_null());
-      }).detach();
-      return nullptr;
+      return enqueue_call(
+          self, call,
+          [ffprobe_session]() {
+              ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
+              return resp_null();
+          },
+          [ffprobe_session] { ffprobe_session->cancel(); });
   } else if (g_strcmp0(m, "mediaInformationSessionExecute") == 0) {
       auto session = get_session(self, args);
       if (session == nullptr)
@@ -835,12 +956,13 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
                                                              "type.");
       auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
       int timeout = resolve_timeout(args);
-      g_object_ref(call);
-      std::thread([call, media_information_session, timeout]() {
-          ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(media_information_session, timeout);
-          respond_later(call, resp_null());
-      }).detach();
-      return nullptr;
+      return enqueue_call(
+          self, call,
+          [media_information_session, timeout]() {
+              ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(media_information_session, timeout);
+              return resp_null();
+          },
+          [media_information_session] { media_information_session->cancel(); });
 
       // -- Asynchronous execution (returns immediately) -------------------------
   } else if (g_strcmp0(m, "asyncFFmpegSessionExecute") == 0) {
@@ -850,8 +972,8 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       if (!session->isFFmpeg())
           return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
                                                   "type.");
-      ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
-      return resp_null();
+      auto typed = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+      return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(typed); });
   } else if (g_strcmp0(m, "asyncFFprobeSessionExecute") == 0) {
       auto session = get_session(self, args);
       if (session == nullptr)
@@ -859,8 +981,8 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       if (!session->isFFprobe())
           return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
                                                    "type.");
-      ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
-      return resp_null();
+      auto typed = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
+      return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(typed); });
   } else if (g_strcmp0(m, "asyncMediaInformationSessionExecute") == 0) {
       auto session = get_session(self, args);
       if (session == nullptr)
@@ -868,8 +990,9 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       if (!session->isMediaInformation())
           return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
                                                              "type.");
-      ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session), resolve_timeout(args));
-      return resp_null();
+      auto typed = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+      const int timeout = resolve_timeout(args);
+      return enqueue_async_execution(self, typed, [typed, timeout] { ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(typed, timeout); });
 
       // -- Log level / history / redirection strategy --------------------------
   } else if (g_strcmp0(m, "getLogLevel") == 0) {
@@ -970,33 +1093,61 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
           return resp_error("INVALID_ARGUMENTS", "input and pipe are required.");
       std::string input_path(input);
       std::string pipe_path(pipe);
-      g_object_ref(call);
-      std::thread([call, input_path, pipe_path]() {
-          FILE *in = fopen(input_path.c_str(), "rb");
-          if (in == nullptr) {
-              respond_later(call, resp_error("COPY_FAILED", "Failed to open file."));
-              return;
-          }
-          FILE *out = fopen(pipe_path.c_str(), "wb");
-          if (out == nullptr) {
-              fclose(in);
-              respond_later(call, resp_error("COPY_FAILED", "Failed to open pipe."));
-              return;
-          }
-          char buffer[4096];
-          size_t read_bytes;
-          bool ok = true;
-          while ((read_bytes = fread(buffer, 1, sizeof(buffer), in)) > 0) {
-              if (fwrite(buffer, 1, read_bytes, out) != read_bytes) {
-                  ok = false;
+      auto state = *self->state;
+      return enqueue_call(self, call, [state, input_path, pipe_path]() {
+          std::unique_ptr<FILE, decltype(&fclose)> input(fopen(input_path.c_str(), "rb"), fclose);
+          if (!input)
+              return resp_error("COPY_FAILED", "Failed to open file.");
+          int output = -1;
+          while (!state->executions->IsStopping()) {
+              output = open(pipe_path.c_str(), O_WRONLY | O_NONBLOCK | O_CREAT | O_TRUNC, 0666);
+              if (output >= 0)
                   break;
-              }
+              if (errno != ENXIO && errno != EINTR)
+                  return resp_error("COPY_FAILED", "Failed to open pipe.");
+              std::this_thread::sleep_for(std::chrono::milliseconds(10));
           }
-          fclose(in);
-          fclose(out);
-          respond_later(call, ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed."));
-      }).detach();
-      return nullptr;
+          if (output < 0)
+              return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+          // An abandoned FIFO must fail this worker rather than terminate the
+          // process. Block SIGPIPE only here; preserve the process signal policy.
+          sigset_t blocked, previous, pending;
+          sigemptyset(&blocked);
+          sigaddset(&blocked, SIGPIPE);
+          sigpending(&pending);
+          const bool already_pending = sigismember(&pending, SIGPIPE);
+          pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+          char buffer[4096];
+          bool ok = true;
+          size_t count;
+          while (!state->executions->IsStopping() && (count = fread(buffer, 1, sizeof(buffer), input.get())) > 0) {
+              size_t offset = 0;
+              while (offset < count && !state->executions->IsStopping()) {
+                  ssize_t written = write(output, buffer + offset, count - offset);
+                  if (written > 0)
+                      offset += static_cast<size_t>(written);
+                  else if (written < 0 && (errno == EAGAIN || errno == EINTR))
+                      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                  else {
+                      ok = false;
+                      break;
+                  }
+              }
+              if (!ok)
+                  break;
+          }
+          ok = ok && !ferror(input.get());
+          close(output);
+          sigpending(&pending);
+          if (!already_pending && sigismember(&pending, SIGPIPE)) {
+              int signal_number;
+              sigwait(&blocked, &signal_number);
+          }
+          pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+          if (state->executions->IsStopping())
+              return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+          return ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed.");
+      });
 
       // -- Android-only methods -> NOT_SUPPORTED --------------------------------
   } else if (g_strcmp0(m, "selectDocument") == 0 || g_strcmp0(m, "getSafParameter") == 0 || g_strcmp0(m, "unregisterSafProtocolUrl") == 0 || g_strcmp0(m, "getSupportedCameraIds") == 0) {
@@ -1081,19 +1232,21 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       if (it == self->stream_inputs->end())
           return resp_error("NOT_FOUND", "Stream input not found.");
       auto stream_input = it->second;
+      const long stream = stream_id(it->first);
       std::vector<uint8_t> data = fl_to_uint8_vector(lookup(args, "data"));
       gboolean has_timeout = FALSE;
       int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-      g_object_ref(call);
-      std::thread([call, stream_input, data, has_timeout, timeout]() {
-          try {
-              int written = has_timeout ? stream_input->write(data, static_cast<int>(timeout)) : stream_input->write(data);
-              respond_later(call, resp_int(written));
-          } catch (const std::exception &error) {
-              respond_later(call, resp_error("STREAM_INPUT_WRITE_FAILED", error.what()));
-          }
-      }).detach();
-      return nullptr;
+      return enqueue_call(
+          self, call,
+          [stream_input, data, has_timeout, timeout]() {
+              try {
+                  int written = has_timeout ? stream_input->write(data, static_cast<int>(timeout)) : stream_input->write(data);
+                  return resp_int(written);
+              } catch (const std::exception &error) {
+                  return resp_error("STREAM_INPUT_WRITE_FAILED", error.what());
+              }
+          },
+          [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
   } else if (g_strcmp0(m, "streamInputCloseInput") == 0) {
       const gchar *url = get_string_argument(args, "url");
       if (url != nullptr) {
@@ -1133,19 +1286,17 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
       if (it == self->stream_outputs->end())
           return resp_error("NOT_FOUND", "Stream output not found.");
       auto stream_output = it->second;
+      const long stream = stream_id(it->first);
       gboolean has_max = FALSE, has_timeout = FALSE;
       int64_t max_bytes = get_int_argument(args, "maxBytes", &has_max);
       int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-      g_object_ref(call);
-      std::thread([call, stream_output, max_bytes, has_timeout, timeout]() {
-          auto data = has_timeout ? stream_output->read(static_cast<int>(max_bytes), static_cast<int>(timeout)) : stream_output->read(static_cast<int>(max_bytes));
-          if (data == nullptr) {
-              respond_later(call, resp_null());
-          } else {
-              respond_later(call, resp_take_value(fl_value_new_uint8_list(data->data(), data->size())));
-          }
-      }).detach();
-      return nullptr;
+      return enqueue_call(
+          self, call,
+          [stream_output, max_bytes, has_timeout, timeout]() {
+              auto data = has_timeout ? stream_output->read(static_cast<int>(max_bytes), static_cast<int>(timeout)) : stream_output->read(static_cast<int>(max_bytes));
+              return data == nullptr ? resp_null() : resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
+          },
+          [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
   } else if (g_strcmp0(m, "streamOutputClose") == 0) {
       const gchar *url = get_string_argument(args, "url");
       if (url != nullptr) {
@@ -1183,7 +1334,7 @@ static FlMethodErrorResponse* event_listen_cb(FlEventChannel* channel,
   FfmpegKitNextFlutterPlugin* self = FFMPEG_KIT_NEXT_FLUTTER_PLUGIN(user_data);
   (void)channel;
   (void)args;
-  self->listening = TRUE;
+  self->listening = !(*self->state)->executions->IsStopping();
   return nullptr;
 }
 
@@ -1197,8 +1348,56 @@ static FlMethodErrorResponse* event_cancel_cb(FlEventChannel* channel,
   return nullptr;
 }
 
+static void detach_plugin(FfmpegKitNextFlutterPlugin *self) {
+    if (!self->state)
+        return;
+    auto state = *self->state;
+    if (!state->executions->BeginShutdown())
+        return;
+    self->listening = FALSE;
+    // Channel destroy notification runs independently of worker references. It
+    // is the earliest public Linux embedding hook for engine detachment. Attempt
+    // replies now; engine destruction may already have made delivery unavailable.
+    for (const auto &pending : state->pending)
+        pending->Complete(resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down."));
+    state->pending.clear();
+    state->CancelAsync();
+    if (self->delete_listener && *self->delete_listener)
+        ffmpegkit::FFmpegKitConfig::removeSessionDeleteListener(*self->delete_listener);
+    const auto inputs = *self->input_buffers;
+    const auto outputs = *self->output_buffers;
+    const auto stream_inputs = *self->stream_inputs;
+    const auto stream_outputs = *self->stream_outputs;
+    // Unblock native I/O through its locked registry. Facade closed flags are
+    // platform-thread fields, so do not mutate them concurrently with a worker.
+    for (const auto &resource : stream_inputs)
+        ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream_id(resource.first));
+    for (const auto &resource : stream_outputs)
+        ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream_id(resource.first));
+    // Cancel and drain off the platform thread. Workers keep only state/session
+    // ownership and never need a platform reply to release their lease.
+    std::thread([state, inputs, outputs, stream_inputs, stream_outputs] {
+        state->executions->CancelAndWait();
+        for (const auto &resource : inputs)
+            resource.second->close();
+        for (const auto &resource : outputs)
+            resource.second->close();
+        for (const auto &resource : stream_inputs)
+            resource.second->close();
+        for (const auto &resource : stream_outputs)
+            resource.second->close();
+    }).detach();
+}
+
+static void channel_detached(gpointer data) {
+    auto *self = FFMPEG_KIT_NEXT_FLUTTER_PLUGIN(data);
+    detach_plugin(self);
+    g_object_unref(self);
+}
+
 static void ffmpeg_kit_next_flutter_plugin_dispose(GObject* object) {
   FfmpegKitNextFlutterPlugin* self = FFMPEG_KIT_NEXT_FLUTTER_PLUGIN(object);
+  detach_plugin(self);
   delete self->input_buffers;
   delete self->output_buffers;
   delete self->stream_inputs;
@@ -1211,6 +1410,10 @@ static void ffmpeg_kit_next_flutter_plugin_dispose(GObject* object) {
   self->stream_inputs = nullptr;
   self->stream_outputs = nullptr;
   self->delete_listener = nullptr;
+  if (self->event_channel)
+      g_clear_object(&self->event_channel);
+  delete self->state;
+  self->state = nullptr;
   G_OBJECT_CLASS(ffmpeg_kit_next_flutter_plugin_parent_class)->dispose(object);
 }
 
@@ -1221,6 +1424,8 @@ static void ffmpeg_kit_next_flutter_plugin_class_init(
 
 static void ffmpeg_kit_next_flutter_plugin_init(
     FfmpegKitNextFlutterPlugin* self) {
+    self->state = new std::shared_ptr<PluginData>(std::make_shared<PluginData>());
+    g_weak_ref_set(&(*self->state)->plugin, G_OBJECT(self));
     self->retain_shutdown_sessions = FALSE;
     self->shutdown_sessions = new std::map<long, std::shared_ptr<ffmpegkit::Session>>();
     self->event_channel = nullptr;
@@ -1243,20 +1448,15 @@ void f_fmpeg_kit_flutter_plugin_register_with_registrar(
   g_autoptr(FlMethodChannel) method_channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar), kMethodChannelName,
       FL_METHOD_CODEC(codec));
-  fl_method_channel_set_method_call_handler(
-      method_channel, method_call_cb, g_object_ref(plugin), g_object_unref);
+  fl_method_channel_set_method_call_handler(method_channel, method_call_cb, g_object_ref(plugin), channel_detached);
 
   g_autoptr(FlStandardMethodCodec) event_codec = fl_standard_method_codec_new();
-  plugin->event_channel = fl_event_channel_new(
-      fl_plugin_registrar_get_messenger(registrar), kEventChannelName,
-      FL_METHOD_CODEC(event_codec));
-  fl_event_channel_set_stream_handlers(plugin->event_channel, event_listen_cb,
-                                       event_cancel_cb, g_object_ref(plugin),
-                                       g_object_unref);
+  g_autoptr(FlEventChannel) event_channel = fl_event_channel_new(fl_plugin_registrar_get_messenger(registrar), kEventChannelName, FL_METHOD_CODEC(event_codec));
+  plugin->event_channel = static_cast<FlEventChannel *>(g_object_ref(event_channel));
+  fl_event_channel_set_stream_handlers(plugin->event_channel, event_listen_cb, event_cancel_cb, g_object_ref(plugin), channel_detached);
 
-  // The session delete listener is process-global; the plugin outlives it.
-  *plugin->delete_listener =
-      std::make_shared<LinuxSessionDeleteListener>(plugin);
+  // The process-global listener and session callbacks retain only weak state.
+  *plugin->delete_listener = std::make_shared<LinuxSessionDeleteListener>(*plugin->state);
   ffmpegkit::FFmpegKitConfig::addSessionDeleteListener(*plugin->delete_listener);
 
   g_object_unref(plugin);
