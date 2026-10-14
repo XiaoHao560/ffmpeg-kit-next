@@ -43,6 +43,7 @@ extern "C" {
 #include "SessionState.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cerrno>
 #include <cstring>
@@ -53,10 +54,11 @@ extern "C" {
 #include <cstdio>
 #include <iostream>
 #include <mutex>
+#include <thread>
+#include <emscripten/threading.h>
 
 extern "C" {
-void set_report_callback(void (*callback)(int, float, float, int64_t, double,
-                                          double, double));
+void set_report_callback(void (*callback)(int, float, float, int64_t, double, double, double));
 void cancel_operation(long id);
 }
 
@@ -74,8 +76,7 @@ static int sessionHistorySize;
 static auto &sessionHistoryMap = *new std::map<long, std::shared_ptr<ffmpegkit::Session>>();
 static auto &sessionHistoryList = *new std::list<std::shared_ptr<ffmpegkit::Session>>();
 static std::recursive_mutex sessionMutex;
-static std::list<std::weak_ptr<ffmpegkit::SessionDeleteListener>>
-    sessionDeleteListeners;
+static std::list<std::weak_ptr<ffmpegkit::SessionDeleteListener>> sessionDeleteListeners;
 static std::recursive_mutex sessionDeleteListenerMutex;
 
 /** Session control variables */
@@ -130,8 +131,7 @@ template <typename CallbackFunction> static void exchangeGlobalCallback(std::sha
  * Atomic, like the other settings below that the delivery thread and the
  * worker threads read while a consumer can change them.
  */
-static std::atomic<ffmpegkit::LogRedirectionStrategy>
-    globalLogRedirectionStrategy;
+static std::atomic<ffmpegkit::LogRedirectionStrategy> globalLogRedirectionStrategy;
 
 /** Redirection control variables */
 static std::atomic<int> redirectionEnabled(0);
@@ -157,8 +157,7 @@ struct CallbackThreadRecord {
     int generationId;
     std::atomic<bool> finished;
 
-    explicit CallbackThreadRecord(int generation)
-        : thread{}, generationId{generation}, finished{false} {}
+    explicit CallbackThreadRecord(int generation) : thread{}, generationId{generation}, finished{false} {}
 };
 static std::list<CallbackThreadRecord> callbackThreads;
 static bool callbackThreadsShuttingDown = false;
@@ -167,6 +166,29 @@ static std::mutex callbackMutex;
 static std::condition_variable callbackMonitor;
 class CallbackData;
 static std::list<CallbackData *> callbackDataList;
+
+/** Lifecycle and admissions share executionMutex. Synchronization outlives workers. */
+enum LibraryState { LibraryRunning, LibraryTerminating, LibraryTerminated };
+static std::atomic<LibraryState> shutdownState(LibraryRunning);
+static auto &executionMutex = *new std::mutex();
+static auto &executionMonitor = *new std::condition_variable();
+static int pendingExecutions = 0;
+/** Submitted threads that have not claimed their sessions; counted during grace only. */
+static int queuedExecutionCount = 0;
+static int activeCallbacks = 0;
+static int activeDeliveryLoops = 0;
+static bool queuedMessagesDiscarded = false;
+static bool shutdownCleanupPending = false;
+static std::chrono::steady_clock::time_point shutdownGraceDeadline;
+/** Prevent self-wait in synchronous execution, callbacks and history cleanup too. */
+static thread_local int libraryWorkDepth = 0;
+static const char *const ShutdownReason = "FFmpegKit has been shut down";
+
+static bool beginCallback(bool completion);
+static void endCallback();
+struct CallbackEnd {
+    ~CallbackEnd() { endCallback(); }
+};
 
 /** Fields that control the handling of SIGNALs */
 volatile int handleSIGQUIT = 1;
@@ -193,19 +215,13 @@ std::atomic<int> configuredLogLevel(ffmpegkit::LevelAVLogInfo);
  * three copies in sync: any change here must be mirrored in the others.
  */
 static int64_t ffkit_max_alloc_size() {
-    const uint64_t maxSize =
-        (uint64_t)std::numeric_limits<size_t>::max();
-    const uint64_t maxInt64 =
-        (uint64_t)std::numeric_limits<int64_t>::max();
+    const uint64_t maxSize = (uint64_t)std::numeric_limits<size_t>::max();
+    const uint64_t maxInt64 = (uint64_t)std::numeric_limits<int64_t>::max();
     return (int64_t)std::min(maxSize, maxInt64);
 }
 
-static bool ffkit_int64_add_overflow(const int64_t left, const int64_t right,
-                                     int64_t *result) {
-    if ((right > 0 &&
-         left > std::numeric_limits<int64_t>::max() - right) ||
-        (right < 0 &&
-         left < std::numeric_limits<int64_t>::min() - right)) {
+static bool ffkit_int64_add_overflow(const int64_t left, const int64_t right, int64_t *result) {
+    if ((right > 0 && left > std::numeric_limits<int64_t>::max() - right) || (right < 0 && left < std::numeric_limits<int64_t>::min() - right)) {
         return true;
     }
 
@@ -265,24 +281,13 @@ static std::atomic<long long> ffkitNextResourceId(1);
 #ifdef USES_FFMPEG_KIT_PROTOCOLS
 typedef int (*ffkit_local_protocol_open_function)(int64_t, int, void **);
 typedef int (*ffkit_local_protocol_read_function)(void *, unsigned char *, int);
-typedef int (*ffkit_local_protocol_write_function)(void *, const unsigned char *,
-                                                   int);
+typedef int (*ffkit_local_protocol_write_function)(void *, const unsigned char *, int);
 typedef int64_t (*ffkit_local_protocol_seek_function)(void *, int64_t, int);
 typedef int (*ffkit_local_protocol_close_function)(void *);
 
-extern "C" void av_set_ffkitmem_functions(
-    ffkit_local_protocol_open_function open_function,
-    ffkit_local_protocol_read_function read_function,
-    ffkit_local_protocol_write_function write_function,
-    ffkit_local_protocol_seek_function seek_function,
-    ffkit_local_protocol_close_function close_function);
+extern "C" void av_set_ffkitmem_functions(ffkit_local_protocol_open_function open_function, ffkit_local_protocol_read_function read_function, ffkit_local_protocol_write_function write_function, ffkit_local_protocol_seek_function seek_function, ffkit_local_protocol_close_function close_function);
 
-extern "C" void av_set_ffkitstream_functions(
-    ffkit_local_protocol_open_function open_function,
-    ffkit_local_protocol_read_function read_function,
-    ffkit_local_protocol_write_function write_function,
-    ffkit_local_protocol_seek_function seek_function,
-    ffkit_local_protocol_close_function close_function);
+extern "C" void av_set_ffkitstream_functions(ffkit_local_protocol_open_function open_function, ffkit_local_protocol_read_function read_function, ffkit_local_protocol_write_function write_function, ffkit_local_protocol_seek_function seek_function, ffkit_local_protocol_close_function close_function);
 #endif
 
 #ifdef __cplusplus
@@ -298,8 +303,7 @@ int ffprobe_execute(int argc, char **argv);
 /** Forward declaration for function defined in fftools/ffprobe.c */
 void ffprobe_set_media_information_buffer(AVBPrint *buffer);
 
-void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
-                                     va_list vargs);
+void ffmpegkit_log_callback_function(void *ptr, int level, const char *format, va_list vargs);
 
 /* Per-session log duties defined in the fftools (fftools/opt_common.c and
  * fftools/ffprobe.c) plus the FFmpegKit callbacks that invoke them. Declared with
@@ -307,8 +311,7 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
 void ffmpegkit_report_write(void *ptr, int level, const char *fmt, va_list vl);
 void ffmpegkit_show_log_capture(void *ptr, int level, const char *fmt, va_list vl);
 int ffmpegkit_redirection_enabled(void);
-void ffmpegkit_log_callback_default(void *ptr, int level, const char *format,
-                                    va_list vargs);
+void ffmpegkit_log_callback_default(void *ptr, int level, const char *format, va_list vargs);
 
 #ifdef __cplusplus
 }
@@ -378,8 +381,7 @@ static struct CallbackThreadShutdown {
 
 enum CallbackType { LogType, StatisticsType };
 
-static bool fs_exists(const std::string &s, const bool isFile,
-                      const bool isDirectory) {
+static bool fs_exists(const std::string &s, const bool isFile, const bool isDirectory) {
     struct stat dir_info;
 
     if (stat(s.c_str(), &dir_info) == 0) {
@@ -397,9 +399,7 @@ static bool fs_exists(const std::string &s, const bool isFile,
 static bool fs_create_dir(const std::string &s) {
     if (!fs_exists(s, false, true)) {
         if (mkdir(s.c_str(), S_IRWXU | S_IRWXG | S_IROTH) != 0) {
-            std::cout << "Failed to create directory: " << s
-                      << ". Operation failed with " << errno << "."
-                      << std::endl;
+            std::cout << "Failed to create directory: " << s << ". Operation failed with " << errno << "." << std::endl;
             return false;
         }
     }
@@ -423,12 +423,10 @@ std::list<long> deleteExpiredSessionsLocked(std::list<std::shared_ptr<ffmpegkit:
 void notifySessionDeleted(const long sessionId) {
     std::list<std::shared_ptr<ffmpegkit::SessionDeleteListener>> listeners;
 
-    std::unique_lock<std::recursive_mutex> listenerLock(
-        sessionDeleteListenerMutex, std::defer_lock);
+    std::unique_lock<std::recursive_mutex> listenerLock(sessionDeleteListenerMutex, std::defer_lock);
     listenerLock.lock();
 
-    for (auto it = sessionDeleteListeners.begin();
-         it != sessionDeleteListeners.end();) {
+    for (auto it = sessionDeleteListeners.begin(); it != sessionDeleteListeners.end();) {
         auto listener = it->lock();
         if (listener == nullptr) {
             it = sessionDeleteListeners.erase(it);
@@ -440,15 +438,14 @@ void notifySessionDeleted(const long sessionId) {
 
     listenerLock.unlock();
 
-    for (auto it = listeners.begin(); it != listeners.end(); ++it) {
+    for (auto it = listeners.begin(); it != listeners.end() && beginCallback(false); ++it) {
+        CallbackEnd callbackEnd;
         try {
             (*it)->sessionDeleted(sessionId);
         } catch (const std::exception &exception) {
-            std::cout << "Exception thrown inside session delete listener. "
-                      << exception.what() << std::endl;
+            std::cout << "Exception thrown inside session delete listener. " << exception.what() << std::endl;
         } catch (...) {
-            std::cout << "Exception thrown inside session delete listener."
-                      << std::endl;
+            std::cout << "Exception thrown inside session delete listener." << std::endl;
         }
     }
 }
@@ -472,7 +469,7 @@ void addSessionToSessionHistory(const std::shared_ptr<ffmpegkit::Session> sessio
      * ASYNC SESSIONS CALL THIS METHOD TWICE
      * THIS CHECK PREVENTS ADDING THE SAME SESSION AGAIN
      */
-    if (sessionHistoryMap.count(sessionId) == 0) {
+    if (shutdownState == LibraryRunning && sessionHistoryMap.count(sessionId) == 0) {
         sessionHistoryMap.insert({sessionId, session});
         sessionHistoryList.push_back(session);
         deletedSessionIds = deleteExpiredSessionsLocked(retiredSessions);
@@ -489,21 +486,13 @@ void addSessionToSessionHistory(const std::shared_ptr<ffmpegkit::Session> sessio
  */
 class CallbackData {
   public:
-    CallbackData(const long sessionId, const int logLevel, const AVBPrint *data)
-        : _type{LogType}, _sessionId{sessionId}, _logLevel{logLevel} {
+    CallbackData(const long sessionId, const int logLevel, const AVBPrint *data) : _type{LogType}, _sessionId{sessionId}, _logLevel{logLevel} {
         av_bprint_init(&_logData, 0, AV_BPRINT_SIZE_UNLIMITED);
         av_bprintf(&_logData, "%s", data->str);
     }
 
-    CallbackData(const long sessionId, const int videoFrameNumber,
-                 const float videoFps, const float videoQuality,
-                 const int64_t size, const double time, const double bitrate,
-                 const double speed)
-        : _type{StatisticsType}, _sessionId{sessionId},
-          _statisticsFrameNumber{videoFrameNumber}, _statisticsFps{videoFps},
-          _statisticsQuality{videoQuality}, _statisticsSize{size},
-          _statisticsTime{time}, _statisticsBitrate{bitrate},
-          _statisticsSpeed{speed} {}
+    CallbackData(const long sessionId, const int videoFrameNumber, const float videoFps, const float videoQuality, const int64_t size, const double time, const double bitrate, const double speed)
+        : _type{StatisticsType}, _sessionId{sessionId}, _statisticsFrameNumber{videoFrameNumber}, _statisticsFps{videoFps}, _statisticsQuality{videoQuality}, _statisticsSize{size}, _statisticsTime{time}, _statisticsBitrate{bitrate}, _statisticsSpeed{speed} {}
 
     CallbackType getType() { return _type; }
 
@@ -550,8 +539,7 @@ class CallbackData {
  */
 static void callbackWait(int milliSeconds) {
     std::unique_lock<std::mutex> callbackLock{callbackMutex};
-    callbackMonitor.wait_for(callbackLock,
-                             std::chrono::milliseconds(milliSeconds));
+    callbackMonitor.wait_for(callbackLock, std::chrono::milliseconds(milliSeconds));
 }
 
 /**
@@ -584,9 +572,7 @@ static const char *avutil_log_get_level_str(int level) {
     }
 }
 
-static void avutil_log_format_line(void *avcl, int level, const char *fmt,
-                                   va_list vl, AVBPrint part[4],
-                                   int *print_prefix) {
+static void avutil_log_format_line(void *avcl, int level, const char *fmt, va_list vl, AVBPrint part[4], int *print_prefix) {
     int flags = av_log_get_flags();
     AVClass *avc = avcl ? *(AVClass **)avcl : NULL;
     av_bprint_init(part + 0, 0, 1);
@@ -596,11 +582,9 @@ static void avutil_log_format_line(void *avcl, int level, const char *fmt,
 
     if (*print_prefix && avc) {
         if (avc->parent_log_context_offset) {
-            AVClass **parent = *(AVClass ***)(((uint8_t *)avcl) +
-                                              avc->parent_log_context_offset);
+            AVClass **parent = *(AVClass ***)(((uint8_t *)avcl) + avc->parent_log_context_offset);
             if (parent && *parent) {
-                av_bprintf(part + 0, "[%s @ %p] ", (*parent)->item_name(parent),
-                           parent);
+                av_bprintf(part + 0, "[%s @ %p] ", (*parent)->item_name(parent), parent);
             }
         }
         av_bprintf(part + 1, "[%s @ %p] ", avc->item_name(avcl), avcl);
@@ -612,9 +596,7 @@ static void avutil_log_format_line(void *avcl, int level, const char *fmt,
     av_vbprintf(part + 3, fmt, vl);
 
     if (*part[0].str || *part[1].str || *part[2].str || *part[3].str) {
-        char lastc = part[3].len && part[3].len <= part[3].size
-                         ? part[3].str[part[3].len - 1]
-                         : 0;
+        char lastc = part[3].len && part[3].len <= part[3].size ? part[3].str[part[3].len - 1] : 0;
         *print_prefix = lastc == '\n' || lastc == '\r';
     }
 }
@@ -628,55 +610,46 @@ static void avutil_log_sanitize(char *line) {
 }
 
 /**
+ * Queues a message for the delivery thread and counts it as in transit for
+ * its session. The count is raised before the lock is released, so the
+ * discard at shutdown cannot reset it before it is raised. After shutdown the
+ * message is dropped.
+ */
+static void enqueueCallbackData(CallbackData *callbackData) {
+    std::unique_lock<std::recursive_mutex> lock(callbackDataMutex);
+    if (shutdownState != LibraryRunning) {
+        lock.unlock();
+        if (callbackData->getType() == LogType) {
+            av_bprint_finalize(callbackData->getLogData(), NULL);
+        }
+        delete callbackData;
+        return;
+    }
+    callbackDataList.push_back(callbackData);
+    std::atomic_fetch_add(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
+    lock.unlock();
+
+    callbackNotify();
+}
+
+/**
  * Adds log data to the end of callback data list.
  *
  * @param level log level
  * @param data log data
  */
-static void logCallbackDataAdd(int level, AVBPrint *data) {
-    std::unique_lock<std::recursive_mutex> lock(callbackDataMutex,
-                                                std::defer_lock);
-    CallbackData *callbackData = new CallbackData(globalSessionId, level, data);
-
-    lock.lock();
-    callbackDataList.push_back(callbackData);
-    lock.unlock();
-
-    callbackNotify();
-
-    std::atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
-}
+static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(new CallbackData(globalSessionId, level, data)); }
 
 /**
  * Adds statistics data to the end of callback data list.
  */
-static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality,
-                                      int64_t size, int time, double bitrate,
-                                      double speed) {
-    std::unique_lock<std::recursive_mutex> lock(callbackDataMutex,
-                                                std::defer_lock);
-    CallbackData *callbackData = new CallbackData(
-        globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed);
-
-    lock.lock();
-    callbackDataList.push_back(callbackData);
-    lock.unlock();
-
-    callbackNotify();
-
-    std::atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
-}
+static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, int time, double bitrate, double speed) { enqueueCallbackData(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed)); }
 
 /**
  * Removes head of callback data list.
  */
 static CallbackData *callbackDataRemove() {
-    std::unique_lock<std::recursive_mutex> lock(callbackDataMutex,
-                                                std::defer_lock);
+    std::unique_lock<std::recursive_mutex> lock(callbackDataMutex, std::defer_lock);
     CallbackData *newData = nullptr;
 
     lock.lock();
@@ -757,13 +730,84 @@ int cancelRequested(long sessionId) {
  *
  * @param sessionId session id
  */
-static void resetMessagesInTransmit(long sessionId) {
-    std::atomic_store(
-        &sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 0);
+static void resetMessagesInTransmit(long sessionId) { std::atomic_store(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 0); }
+
+/**
+ * Counts an execution unless shutdown was requested.
+ *
+ * @return true when the execution may run, false when it has to be rejected
+ */
+static bool beginExecution() {
+    std::lock_guard<std::mutex> lock(executionMutex);
+    if (shutdownState != LibraryRunning) {
+        return false;
+    }
+    pendingExecutions++;
+    libraryWorkDepth++;
+    return true;
 }
 
-static int ffkit_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mutex,
-                           int timeoutMs) {
+/** Ends a claimed execution, after releasing its worker's session reference. */
+static void endExecution() {
+    std::lock_guard<std::mutex> lock(executionMutex);
+    pendingExecutions--;
+    executionMonitor.notify_all();
+    libraryWorkDepth--;
+}
+
+/** Admit each invocation separately, atomically with the shutdown transition. */
+static bool beginCallback(bool completion) {
+    std::lock_guard<std::mutex> lock(executionMutex);
+    const LibraryState state = shutdownState;
+    if (state != LibraryRunning && !(completion && state == LibraryTerminating && std::chrono::steady_clock::now() < shutdownGraceDeadline)) {
+        return false;
+    }
+    activeCallbacks++;
+    libraryWorkDepth++;
+    return true;
+}
+
+static void endCallback() {
+    std::lock_guard<std::mutex> lock(executionMutex);
+    activeCallbacks--;
+    executionMonitor.notify_all();
+    libraryWorkDepth--;
+}
+
+/** Fails a session that shutdown does not let run. */
+static void rejectSession(const std::shared_ptr<ffmpegkit::Session> &session) { session->fail(ShutdownReason); }
+
+/**
+ * Drops the messages waiting for delivery and resets the in-transit counts,
+ * once, after shutdown, when no delivery thread is left that could be between
+ * taking a message and lowering its count. Called by shutdown and by every
+ * delivery thread on its way out (threadExited true). A leaving thread stops
+ * being counted here, together with the discard, so a shutdown that waits for
+ * the delivery threads finds the queue already empty.
+ */
+static void discardQueuedMessagesWhenIdle(const bool threadExited) {
+    std::lock_guard<std::recursive_mutex> dataLock(callbackDataMutex);
+    std::lock_guard<std::mutex> lock(executionMutex);
+    if (threadExited) {
+        activeDeliveryLoops--;
+    }
+    if (shutdownState != LibraryRunning && activeDeliveryLoops == 0 && !queuedMessagesDiscarded) {
+        queuedMessagesDiscarded = true;
+        for (CallbackData *callbackData : callbackDataList) {
+            if (callbackData->getType() == LogType) {
+                av_bprint_finalize(callbackData->getLogData(), NULL);
+            }
+            delete callbackData;
+        }
+        callbackDataList.clear();
+        for (int i = 0; i < SESSION_MAP_SIZE; i++) {
+            std::atomic_store(&sessionInTransitMessageCountMap[i], 0);
+        }
+    }
+    executionMonitor.notify_all();
+}
+
+static int ffkit_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mutex, int timeoutMs) {
     if (timeoutMs < 0) {
         return pthread_cond_wait(condition, mutex);
     }
@@ -863,11 +907,7 @@ static int ffkit_memory_open(int64_t id, int flags, void **opaque) {
     resource = ffkit_memory_find_locked(id);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->unregistered ||
-            ((flags & AVIO_FLAG_WRITE) &&
-             resource->type != FFKIT_RESOURCE_OUTPUT) ||
-            (!(flags & AVIO_FLAG_WRITE) &&
-             resource->type != FFKIT_RESOURCE_INPUT)) {
+        if (resource->unregistered || ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) || (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
             pthread_mutex_unlock(&resource->mutex);
             pthread_mutex_unlock(&ffkitMemoryRegistryMutex);
             return AVERROR(ENOENT);
@@ -925,8 +965,7 @@ static int ffkit_memory_read(void *opaque, unsigned char *buf, int size) {
     return bytesToRead;
 }
 
-static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource,
-                                        int64_t requiredCapacity) {
+static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource, int64_t requiredCapacity) {
     int64_t newCapacity;
     uint8_t *newData;
 
@@ -938,8 +977,7 @@ static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource,
         return AVERROR(ENOSPC);
     }
 
-    newCapacity = resource->capacity > 0 ? resource->capacity
-                                         : FFKIT_DEFAULT_OUTPUT_CAPACITY;
+    newCapacity = resource->capacity > 0 ? resource->capacity : FFKIT_DEFAULT_OUTPUT_CAPACITY;
     while (newCapacity < requiredCapacity) {
         if (newCapacity > resource->maxCapacity / 2) {
             newCapacity = resource->maxCapacity;
@@ -987,8 +1025,7 @@ static int ffkit_memory_write(void *opaque, const unsigned char *buf, int size) 
     }
 
     if (handle->position > resource->size) {
-        memset(resource->data + resource->size, 0,
-               handle->position - resource->size);
+        memset(resource->data + resource->size, 0, handle->position - resource->size);
     }
 
     memcpy(resource->data + handle->position, buf, size);
@@ -1081,11 +1118,7 @@ static int ffkit_stream_open(int64_t id, int flags, void **opaque) {
     resource = ffkit_stream_find_locked(id);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->unregistered ||
-            ((flags & AVIO_FLAG_WRITE) &&
-             resource->type != FFKIT_RESOURCE_OUTPUT) ||
-            (!(flags & AVIO_FLAG_WRITE) &&
-             resource->type != FFKIT_RESOURCE_INPUT)) {
+        if (resource->unregistered || ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) || (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
             pthread_mutex_unlock(&resource->mutex);
             pthread_mutex_unlock(&ffkitStreamRegistryMutex);
             return AVERROR(ENOENT);
@@ -1113,9 +1146,7 @@ static int ffkit_stream_open(int64_t id, int flags, void **opaque) {
     return 0;
 }
 
-static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
-                                    const uint8_t *buf, int size,
-                                    int timeoutMs) {
+static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t *buf, int size, int timeoutMs) {
     int written = 0;
 
     if (resource == NULL || (buf == NULL && size > 0) || size < 0) {
@@ -1124,11 +1155,8 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
 
     pthread_mutex_lock(&resource->mutex);
     while (written < size) {
-        while (resource->size == resource->capacity && !resource->closed &&
-               !resource->writeClosed) {
-            int waitRc =
-                ffkit_cond_wait(&resource->canWrite, &resource->mutex,
-                                timeoutMs);
+        while (resource->size == resource->capacity && !resource->closed && !resource->writeClosed) {
+            int waitRc = ffkit_cond_wait(&resource->canWrite, &resource->mutex, timeoutMs);
             if (waitRc == ETIMEDOUT) {
                 pthread_mutex_unlock(&resource->mutex);
                 return written;
@@ -1142,13 +1170,10 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
 
         int64_t freeSize = resource->capacity - resource->size;
         int chunkSize = (int)FFMIN((int64_t)(size - written), freeSize);
-        chunkSize = (int)FFMIN((int64_t)chunkSize,
-                               resource->capacity - resource->writePosition);
+        chunkSize = (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->writePosition);
 
-        memcpy(resource->data + resource->writePosition, buf + written,
-               chunkSize);
-        resource->writePosition =
-            (resource->writePosition + chunkSize) % resource->capacity;
+        memcpy(resource->data + resource->writePosition, buf + written, chunkSize);
+        resource->writePosition = (resource->writePosition + chunkSize) % resource->capacity;
         resource->size += chunkSize;
         written += chunkSize;
         pthread_cond_broadcast(&resource->canRead);
@@ -1158,9 +1183,7 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
     return written;
 }
 
-static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
-                                   int size, int timeoutMs, int *timedOut,
-                                   int *eof) {
+static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, int size, int timeoutMs, int *timedOut, int *eof) {
     int bytesRead = 0;
 
     if (timedOut != NULL) {
@@ -1176,8 +1199,7 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
 
     pthread_mutex_lock(&resource->mutex);
     while (resource->size == 0 && !resource->writeClosed && !resource->closed) {
-        int waitRc =
-            ffkit_cond_wait(&resource->canRead, &resource->mutex, timeoutMs);
+        int waitRc = ffkit_cond_wait(&resource->canRead, &resource->mutex, timeoutMs);
         if (waitRc == ETIMEDOUT) {
             if (timedOut != NULL) {
                 *timedOut = 1;
@@ -1202,13 +1224,10 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
 
     while (bytesRead < size && resource->size > 0) {
         int chunkSize = (int)FFMIN((int64_t)(size - bytesRead), resource->size);
-        chunkSize = (int)FFMIN((int64_t)chunkSize,
-                               resource->capacity - resource->readPosition);
+        chunkSize = (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->readPosition);
 
-        memcpy(buf + bytesRead, resource->data + resource->readPosition,
-               chunkSize);
-        resource->readPosition =
-            (resource->readPosition + chunkSize) % resource->capacity;
+        memcpy(buf + bytesRead, resource->data + resource->readPosition, chunkSize);
+        resource->readPosition = (resource->readPosition + chunkSize) % resource->capacity;
         resource->size -= chunkSize;
         bytesRead += chunkSize;
         pthread_cond_broadcast(&resource->canWrite);
@@ -1279,6 +1298,28 @@ static int ffkit_stream_close(void *opaque) {
 }
 
 /**
+ * Closes every registered stream and wakes the threads that wait on one.
+ * Shutdown uses it to stop sessions blocked reading or writing a stream, which
+ * cancel cannot interrupt. An output stream is also ended for writing, as when
+ * ffmpeg closes it, so its reader drains what is buffered and then gets the end
+ * of the stream. Closed alone, it would get no chunk, which reads as a timeout.
+ */
+static void ffkit_stream_close_all() {
+    pthread_mutex_lock(&ffkitStreamRegistryMutex);
+    for (FFKitStreamResource *resource = ffkitStreamResources; resource != NULL; resource = resource->next) {
+        pthread_mutex_lock(&resource->mutex);
+        resource->closed = 1;
+        if (resource->type == FFKIT_RESOURCE_OUTPUT) {
+            resource->writeClosed = 1;
+        }
+        pthread_cond_broadcast(&resource->canRead);
+        pthread_cond_broadcast(&resource->canWrite);
+        pthread_mutex_unlock(&resource->mutex);
+    }
+    pthread_mutex_unlock(&ffkitStreamRegistryMutex);
+}
+
+/**
  * Callback function for FFmpeg/FFprobe logs.
  *
  * @param ptr pointer to AVClass struct
@@ -1298,8 +1339,7 @@ static int ffkit_stream_close(void *opaque) {
  * each duty gets its own va_copy. Neither duty may call av_log() (it would recurse
  * back into the callback).
  */
-static void run_duties(void *ptr, int level, const char *format,
-                       va_list vargs) {
+static void run_duties(void *ptr, int level, const char *format, va_list vargs) {
     va_list copy;
 
     va_copy(copy, vargs);
@@ -1311,8 +1351,7 @@ static void run_duties(void *ptr, int level, const char *format,
     va_end(copy);
 }
 
-void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
-                                     va_list vargs) {
+void ffmpegkit_log_callback_function(void *ptr, int level, const char *format, va_list vargs) {
     AVBPrint fullLine;
     AVBPrint part[4];
     int print_prefix = 1;
@@ -1329,9 +1368,7 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
     int activeLogLevel = av_log_get_level();
 
     // LevelAVLogStdErr logs are always redirected
-    if ((activeLogLevel == ffmpegkit::LevelAVLogQuiet &&
-         level != ffmpegkit::LevelAVLogStdErr) ||
-        (level > activeLogLevel)) {
+    if ((activeLogLevel == ffmpegkit::LevelAVLogQuiet && level != ffmpegkit::LevelAVLogStdErr) || (level > activeLogLevel)) {
         return;
     }
 
@@ -1344,8 +1381,7 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
     avutil_log_sanitize(part[3].str);
 
     // COMBINE ALL 4 LOG PARTS
-    av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str,
-               part[3].str);
+    av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
 
     if (fullLine.len > 0) {
         logCallbackDataAdd(level, &fullLine);
@@ -1365,8 +1401,7 @@ int ffmpegkit_redirection_enabled(void) { return redirectionEnabled; }
  * Reproduces stock ffmpeg logging (stderr) while still running the per-session
  * duties, so -report / -show_log keep working even with redirection off.
  */
-void ffmpegkit_log_callback_default(void *ptr, int level, const char *format,
-                                    va_list vargs) {
+void ffmpegkit_log_callback_default(void *ptr, int level, const char *format, va_list vargs) {
     va_list copy;
 
     va_copy(copy, vargs);
@@ -1387,29 +1422,18 @@ void ffmpegkit_log_callback_default(void *ptr, int level, const char *format,
  * @param bitrate output bit rate in kbits/s
  * @param speed processing speed = processed duration / operation duration
  */
-void ffmpegkit_statistics_callback_function(int frameNumber, float fps,
-                                            float quality, int64_t size,
-                                            double time, double bitrate,
-                                            double speed) {
-    statisticsCallbackDataAdd(frameNumber, fps, quality, size, time, bitrate,
-                              speed);
-}
+void ffmpegkit_statistics_callback_function(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) { statisticsCallbackDataAdd(frameNumber, fps, quality, size, time, bitrate, speed); }
 
-static void process_log(long sessionId, int levelValueInt,
-                        AVBPrint *logMessage) {
+static void process_log(long sessionId, int levelValueInt, AVBPrint *logMessage) {
     int activeLogLevel = configuredLogLevel;
     ffmpegkit::Level levelValue = static_cast<ffmpegkit::Level>(levelValueInt);
-    std::shared_ptr<ffmpegkit::Log> log = std::make_shared<ffmpegkit::Log>(
-        sessionId, levelValue, logMessage->str);
+    std::shared_ptr<ffmpegkit::Log> log = std::make_shared<ffmpegkit::Log>(sessionId, levelValue, logMessage->str);
     bool globalCallbackDefined = false;
     bool sessionCallbackDefined = false;
-    ffmpegkit::LogRedirectionStrategy activeLogRedirectionStrategy =
-        globalLogRedirectionStrategy;
+    ffmpegkit::LogRedirectionStrategy activeLogRedirectionStrategy = globalLogRedirectionStrategy;
 
     // LevelAVLogStdErr logs are always redirected
-    if ((activeLogLevel == ffmpegkit::LevelAVLogQuiet &&
-         levelValue != ffmpegkit::LevelAVLogStdErr) ||
-        (levelValue > activeLogLevel)) {
+    if ((activeLogLevel == ffmpegkit::LevelAVLogQuiet && levelValue != ffmpegkit::LevelAVLogStdErr) || (levelValue > activeLogLevel)) {
         // LOG NEITHER PRINTED NOR FORWARDED
         return;
     }
@@ -1420,29 +1444,29 @@ static void process_log(long sessionId, int levelValueInt,
         session->addLog(log);
 
         ffmpegkit::LogCallback sessionLogCallback = session->getLogCallback();
-        if (sessionLogCallback != nullptr) {
+        if (sessionLogCallback != nullptr && beginCallback(false)) {
+            CallbackEnd callbackEnd;
             sessionCallbackDefined = true;
 
             try {
                 // NOTIFY SESSION CALLBACK DEFINED
                 sessionLogCallback(log);
             } catch (const std::exception &exception) {
-                std::cout << "Exception thrown inside session log callback. "
-                          << exception.what() << std::endl;
+                std::cout << "Exception thrown inside session log callback. " << exception.what() << std::endl;
             }
         }
     }
 
     ffmpegkit::LogCallback globalLogCallback = readGlobalCallback(logCallback);
-    if (globalLogCallback != nullptr) {
+    if (globalLogCallback != nullptr && beginCallback(false)) {
+        CallbackEnd callbackEnd;
         globalCallbackDefined = true;
 
         try {
             // NOTIFY GLOBAL CALLBACK DEFINED
             globalLogCallback(log);
         } catch (const std::exception &exception) {
-            std::cout << "Exception thrown inside global log callback. "
-                      << exception.what() << std::endl;
+            std::cout << "Exception thrown inside global log callback. " << exception.what() << std::endl;
         }
     }
 
@@ -1451,14 +1475,12 @@ static void process_log(long sessionId, int levelValueInt,
     case ffmpegkit::LogRedirectionStrategyNeverPrintLogs: {
         return;
     }
-    case ffmpegkit::
-        LogRedirectionStrategyPrintLogsWhenGlobalCallbackNotDefined: {
+    case ffmpegkit::LogRedirectionStrategyPrintLogsWhenGlobalCallbackNotDefined: {
         if (globalCallbackDefined) {
             return;
         }
     } break;
-    case ffmpegkit::
-        LogRedirectionStrategyPrintLogsWhenSessionCallbackNotDefined: {
+    case ffmpegkit::LogRedirectionStrategyPrintLogsWhenSessionCallbackNotDefined: {
         if (sessionCallbackDefined) {
             return;
         }
@@ -1479,46 +1501,37 @@ static void process_log(long sessionId, int levelValueInt,
         break;
     default:
         // WRITE TO STDOUT
-        std::cout << ffmpegkit::FFmpegKitConfig::logLevelToString(levelValue)
-                  << ": " << logMessage->str;
+        std::cout << ffmpegkit::FFmpegKitConfig::logLevelToString(levelValue) << ": " << logMessage->str;
         break;
     }
 }
 
-void process_statistics(long sessionId, int videoFrameNumber, float videoFps,
-                        float videoQuality, long size, double time,
-                        double bitrate, double speed) {
-    std::shared_ptr<ffmpegkit::Statistics> statistics =
-        std::make_shared<ffmpegkit::Statistics>(sessionId, videoFrameNumber,
-                                                videoFps, videoQuality, size,
-                                                time, bitrate, speed);
+void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, long size, double time, double bitrate, double speed) {
+    std::shared_ptr<ffmpegkit::Statistics> statistics = std::make_shared<ffmpegkit::Statistics>(sessionId, videoFrameNumber, videoFps, videoQuality, size, time, bitrate, speed);
 
     auto session = ffmpegkit::FFmpegKitConfig::getSession(sessionId);
     if (session != nullptr && session->isFFmpeg()) {
-        std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession =
-            std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+        std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
         ffmpegSession->addStatistics(statistics);
 
-        ffmpegkit::StatisticsCallback sessionStatisticsCallback =
-            ffmpegSession->getStatisticsCallback();
-        if (sessionStatisticsCallback != nullptr) {
+        ffmpegkit::StatisticsCallback sessionStatisticsCallback = ffmpegSession->getStatisticsCallback();
+        if (sessionStatisticsCallback != nullptr && beginCallback(false)) {
+            CallbackEnd callbackEnd;
             try {
                 sessionStatisticsCallback(statistics);
             } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside session statistics callback. "
-                    << exception.what() << std::endl;
+                std::cout << "Exception thrown inside session statistics callback. " << exception.what() << std::endl;
             }
         }
     }
 
     ffmpegkit::StatisticsCallback globalStatisticsCallback = readGlobalCallback(statisticsCallback);
-    if (globalStatisticsCallback != nullptr) {
+    if (globalStatisticsCallback != nullptr && beginCallback(false)) {
+        CallbackEnd callbackEnd;
         try {
             globalStatisticsCallback(statistics);
         } catch (const std::exception &exception) {
-            std::cout << "Exception thrown inside global statistics callback. "
-                      << exception.what() << std::endl;
+            std::cout << "Exception thrown inside global statistics callback. " << exception.what() << std::endl;
         }
     }
 }
@@ -1540,39 +1553,27 @@ void *callbackThreadFunction(void *pointer) {
         std::atomic<bool> &finished;
         ~Completion() { finished.store(true); }
     } completion{record->finished};
+    libraryWorkDepth++;
     int activeLogLevel = configuredLogLevel;
-    if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) &&
-        (ffmpegkit::LevelAVLogDebug <= activeLogLevel)) {
+    if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) && (ffmpegkit::LevelAVLogDebug <= activeLogLevel)) {
         std::cout << "Async callback block started." << std::endl;
     }
 
-    while (redirectionEnabled &&
-           generationId == std::atomic_load(&redirectionGenerationId)) {
+    while (redirectionEnabled && generationId == std::atomic_load(&redirectionGenerationId)) {
         try {
             CallbackData *callbackData = callbackDataRemove();
 
             if (callbackData != nullptr) {
 
                 if (callbackData->getType() == LogType) {
-                    process_log(callbackData->getSessionId(),
-                                callbackData->getLogLevel(),
-                                callbackData->getLogData());
+                    process_log(callbackData->getSessionId(), callbackData->getLogLevel(), callbackData->getLogData());
                     av_bprint_finalize(callbackData->getLogData(), NULL);
                 } else {
-                    process_statistics(callbackData->getSessionId(),
-                                       callbackData->getStatisticsFrameNumber(),
-                                       callbackData->getStatisticsFps(),
-                                       callbackData->getStatisticsQuality(),
-                                       callbackData->getStatisticsSize(),
-                                       callbackData->getStatisticsTime(),
-                                       callbackData->getStatisticsBitrate(),
+                    process_statistics(callbackData->getSessionId(), callbackData->getStatisticsFrameNumber(), callbackData->getStatisticsFps(), callbackData->getStatisticsQuality(), callbackData->getStatisticsSize(), callbackData->getStatisticsTime(), callbackData->getStatisticsBitrate(),
                                        callbackData->getStatisticsSpeed());
                 }
 
-                std::atomic_fetch_sub(
-                    &sessionInTransitMessageCountMap
-                        [callbackData->getSessionId() % SESSION_MAP_SIZE],
-                    1);
+                std::atomic_fetch_sub(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
 
             } else {
                 callbackWait(100);
@@ -1580,40 +1581,39 @@ void *callbackThreadFunction(void *pointer) {
 
         } catch (const std::exception &exception) {
             activeLogLevel = configuredLogLevel;
-            if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) &&
-                (ffmpegkit::LevelAVLogWarning <= activeLogLevel)) {
-                std::cout << "Async callback block received error: "
-                          << exception.what() << std::endl;
+            if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) && (ffmpegkit::LevelAVLogWarning <= activeLogLevel)) {
+                std::cout << "Async callback block received error: " << exception.what() << std::endl;
             }
         }
     }
 
     activeLogLevel = configuredLogLevel;
-    if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) &&
-        (ffmpegkit::LevelAVLogDebug <= activeLogLevel)) {
+    if ((activeLogLevel != ffmpegkit::LevelAVLogQuiet) && (ffmpegkit::LevelAVLogDebug <= activeLogLevel)) {
         std::cout << "Async callback block stopped." << std::endl;
     }
+
+    libraryWorkDepth--;
+
+    // THE THREAD STOPS BEING COUNTED; AFTER SHUTDOWN THE LAST ONE DROPS WHAT IS
+    // LEFT IN THE QUEUE
+    discardQueuedMessagesWhenIdle(true);
 
     return NULL;
 }
 
-static int
-executeFFmpeg(const long sessionId,
-              const std::shared_ptr<std::list<std::string>> arguments) {
+static int executeFFmpeg(const long sessionId, const std::shared_ptr<std::list<std::string>> arguments) {
     const char *LIB_NAME = "ffmpeg";
 
     // SETS DEFAULT LOG LEVEL BEFORE STARTING A NEW RUN
     av_log_set_level(configuredLogLevel);
 
-    char **commandCharPArray =
-        (char **)av_malloc(sizeof(char *) * (arguments->size() + 2));
+    char **commandCharPArray = (char **)av_malloc(sizeof(char *) * (arguments->size() + 2));
 
     /* PRESERVE USAGE FORMAT
      *
      * ffmpeg <arguments>
      */
-    commandCharPArray[0] =
-        (char *)av_malloc(sizeof(char) * (strlen(LIB_NAME) + 1));
+    commandCharPArray[0] = (char *)av_malloc(sizeof(char) * (strlen(LIB_NAME) + 1));
     strcpy(commandCharPArray[0], LIB_NAME);
 
     // PREPARE ARRAY ELEMENTS
@@ -1626,6 +1626,12 @@ executeFFmpeg(const long sessionId,
     // REGISTER THE ID BEFORE STARTING THE SESSION
     globalSessionId = sessionId;
     registerSessionId(sessionId);
+
+    // A SHUTDOWN THAT CANCELLED ALL SESSIONS JUST BEFORE THIS ONE REGISTERED
+    // STILL STOPS IT
+    if (shutdownState != LibraryRunning) {
+        cancelSession(sessionId);
+    }
 
     resetMessagesInTransmit(sessionId);
 
@@ -1642,24 +1648,19 @@ executeFFmpeg(const long sessionId,
     return returnCode;
 }
 
-int executeFFprobeToBuffer(
-    const long sessionId,
-    const std::shared_ptr<std::list<std::string>> arguments,
-    AVBPrint *outputBuffer) {
+int executeFFprobeToBuffer(const long sessionId, const std::shared_ptr<std::list<std::string>> arguments, AVBPrint *outputBuffer) {
     const char *LIB_NAME = "ffprobe";
 
     // SETS DEFAULT LOG LEVEL BEFORE STARTING A NEW RUN
     av_log_set_level(configuredLogLevel);
 
-    char **commandCharPArray =
-        (char **)av_malloc(sizeof(char *) * (arguments->size() + 2));
+    char **commandCharPArray = (char **)av_malloc(sizeof(char *) * (arguments->size() + 2));
 
     /* PRESERVE USAGE FORMAT
      *
      * ffprobe <arguments>
      */
-    commandCharPArray[0] =
-        (char *)av_malloc(sizeof(char) * (strlen(LIB_NAME) + 1));
+    commandCharPArray[0] = (char *)av_malloc(sizeof(char) * (strlen(LIB_NAME) + 1));
     strcpy(commandCharPArray[0], LIB_NAME);
 
     // PREPARE ARRAY ELEMENTS
@@ -1682,8 +1683,7 @@ int executeFFprobeToBuffer(
     ffprobe_set_media_information_buffer(outputBuffer);
 
     // RUN
-    int returnCode =
-        ffprobe_execute((arguments->size() + 1), commandCharPArray);
+    int returnCode = ffprobe_execute((arguments->size() + 1), commandCharPArray);
 
     ffprobe_set_media_information_buffer(NULL);
 
@@ -1697,10 +1697,7 @@ int executeFFprobeToBuffer(
     return returnCode;
 }
 
-int executeFFprobe(const long sessionId,
-                   const std::shared_ptr<std::list<std::string>> arguments) {
-    return executeFFprobeToBuffer(sessionId, arguments, nullptr);
-}
+int executeFFprobe(const long sessionId, const std::shared_ptr<std::list<std::string>> arguments) { return executeFFprobeToBuffer(sessionId, arguments, nullptr); }
 
 void *ffmpegKitInitialize() {
     std::call_once(ffmpegKitInitializerFlag, []() {
@@ -1717,18 +1714,13 @@ void *ffmpegKitInitialize() {
         ffprobeSessionCompleteCallback = nullptr;
         mediaInformationSessionCompleteCallback = nullptr;
 
-        globalLogRedirectionStrategy =
-            ffmpegkit::LogRedirectionStrategyPrintLogsWhenNoCallbacksDefined;
+        globalLogRedirectionStrategy = ffmpegkit::LogRedirectionStrategyPrintLogsWhenNoCallbacksDefined;
 
         redirectionEnabled = 0;
 
 #ifdef USES_FFMPEG_KIT_PROTOCOLS
-        av_set_ffkitmem_functions(ffkit_memory_open, ffkit_memory_read,
-                                  ffkit_memory_write, ffkit_memory_seek,
-                                  ffkit_memory_close);
-        av_set_ffkitstream_functions(ffkit_stream_open, ffkit_stream_read,
-                                     ffkit_stream_write, ffkit_stream_seek,
-                                     ffkit_stream_close);
+        av_set_ffkitmem_functions(ffkit_memory_open, ffkit_memory_read, ffkit_memory_write, ffkit_memory_seek, ffkit_memory_close);
+        av_set_ffkitstream_functions(ffkit_stream_open, ffkit_stream_read, ffkit_stream_write, ffkit_stream_seek, ffkit_stream_close);
 #endif
 
         ffmpegkit::FFmpegKitConfig::enableRedirection();
@@ -1741,14 +1733,9 @@ void *ffmpegKitInitialize() {
         // in std::ostream::sentry). C stdio's stdout is a constant-initialized FILE and
         // is safe at this point.
         const std::string packageName = ffmpegkit::Packages::getPackageName();
-        const std::string packageNamePart =
-            packageName.empty() ? "" : packageName + "-";
+        const std::string packageNamePart = packageName.empty() ? "" : packageName + "-";
 
-        printf("Loaded ffmpeg-kit-next-%s%s-%s-%s.\n",
-               packageNamePart.c_str(),
-               ffmpegkit::ArchDetect::getArch().c_str(),
-               ffmpegkit::FFmpegKitConfig::getVersion().c_str(),
-               ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
+        printf("Loaded ffmpeg-kit-next-%s%s-%s-%s.\n", packageNamePart.c_str(), ffmpegkit::ArchDetect::getArch().c_str(), ffmpegkit::FFmpegKitConfig::getVersion().c_str(), ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
     });
 
     return NULL;
@@ -1758,24 +1745,32 @@ void ffmpegkit::FFmpegKitConfig::enableRedirection() {
     reapFinishedCallbackThreads();
     std::lock_guard<std::mutex> lock(redirectionMutex);
 
-    if (callbackThreadsShuttingDown || redirectionEnabled != 0) {
+    if (callbackThreadsShuttingDown || redirectionEnabled != 0 || (shutdownState != LibraryRunning)) {
         return;
     }
 
     // THE LOOP OF AN EARLIER REDIRECTION, IF IT IS STILL ON ITS WAY OUT, ENDS
     // INSTEAD OF RUNNING NEXT TO THE NEW ONE
-    const int generationId =
-        std::atomic_fetch_add(&redirectionGenerationId, 1) + 1;
+    const int generationId = std::atomic_fetch_add(&redirectionGenerationId, 1) + 1;
 
     callbackThreads.emplace_back(generationId);
     auto &record = callbackThreads.back();
     redirectionEnabled = 1;
+    {
+        // THE THREAD IS COUNTED BEFORE IT STARTS, SO SHUTDOWN WAITS FOR IT
+        std::lock_guard<std::mutex> executionLock(executionMutex);
+        activeDeliveryLoops++;
+    }
     int rc = pthread_create(&record.thread, NULL, callbackThreadFunction, &record);
     if (rc != 0) {
         redirectionEnabled = 0;
         callbackThreads.pop_back();
-        std::cout << "Failed to create async callback block: " << rc
-                  << std::endl;
+        {
+            std::lock_guard<std::mutex> executionLock(executionMutex);
+            activeDeliveryLoops--;
+            executionMonitor.notify_all();
+        }
+        std::cout << "Failed to create async callback block: " << rc << std::endl;
         return;
     }
 
@@ -1800,22 +1795,82 @@ void ffmpegkit::FFmpegKitConfig::disableRedirection() {
     reapFinishedCallbackThreads();
 }
 
-int ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(
-    const std::string &path) {
-    return ffmpegkit::FFmpegKitConfig::setEnvironmentVariable("FONTCONFIG_PATH",
-                                                              path);
+/** Close callback admission after grace, then release history outside the locks. */
+static void finishShutdown(std::chrono::steady_clock::time_point cleanupDeadline) {
+    libraryWorkDepth++;
+    {
+        std::unique_lock<std::mutex> lock(executionMutex);
+        executionMonitor.wait_until(lock, std::min(shutdownGraceDeadline, cleanupDeadline), [] { return pendingExecutions == 0 && queuedExecutionCount == 0 && activeDeliveryLoops == 0 && activeCallbacks == 0; });
+        shutdownState = LibraryTerminated;
+        executionMonitor.notify_all();
+        executionMonitor.wait_until(lock, cleanupDeadline, [] { return pendingExecutions == 0 && activeDeliveryLoops == 0 && activeCallbacks == 0; });
+    }
+
+    // Active workers, not-yet-served threads and consumer handles retain their
+    // own references. Cookie free functions may re-enter shutdown here.
+    ffmpegkit::FFmpegKitConfig::clearSessions();
+    {
+        std::lock_guard<std::mutex> lock(executionMutex);
+        shutdownCleanupPending = false;
+        executionMonitor.notify_all();
+    }
+    libraryWorkDepth--;
 }
 
-void ffmpegkit::FFmpegKitConfig::setFontDirectory(
-    const std::string &fontDirectoryPath,
-    const std::map<std::string, std::string> &fontNameMapping) {
-    ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
-        std::list<std::string>{fontDirectoryPath}, fontNameMapping);
+bool ffmpegkit::FFmpegKitConfig::shutdown(const int waitTimeout) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = waitTimeout < 0 ? std::chrono::steady_clock::time_point::max() : now + std::chrono::milliseconds(waitTimeout);
+    bool initiate;
+    std::chrono::steady_clock::time_point cleanupDeadline;
+    {
+        std::lock_guard<std::mutex> lock(executionMutex);
+        initiate = shutdownState == LibraryRunning;
+        if (initiate) {
+            shutdownState = LibraryTerminating;
+            shutdownCleanupPending = true;
+            shutdownGraceDeadline = std::min(now + std::chrono::seconds(2), deadline);
+            cleanupDeadline = std::min(shutdownGraceDeadline + std::chrono::seconds(1), deadline);
+        }
+    }
+    if (initiate) {
+        cancelAllSessions();
+        ffkit_stream_close_all();
+        disableRedirection();
+        discardQueuedMessagesWhenIdle(false);
+        // Retries only wait; cancellation and the first-call deadlines stay fixed.
+        try {
+            std::thread(finishShutdown, cleanupDeadline).detach();
+        } catch (...) {
+            // If the coordinator cannot start, do not leave cleanup pending
+            // forever. Close admission and release history without a grace wait.
+            finishShutdown(now);
+            throw;
+        }
+    }
+    if (libraryWorkDepth > 0) {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(executionMutex);
+    const auto stopped = [] { return !shutdownCleanupPending && pendingExecutions == 0 && activeDeliveryLoops == 0 && activeCallbacks == 0; };
+    if (emscripten_is_main_runtime_thread()) {
+        return stopped();
+    }
+    if (waitTimeout < 0) {
+        executionMonitor.wait(lock, stopped);
+    } else {
+        executionMonitor.wait_until(lock, deadline, stopped);
+    }
+    return stopped();
 }
 
-void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
-    const std::list<std::string> &fontDirectoryList,
-    const std::map<std::string, std::string> &fontNameMapping) {
+bool ffmpegkit::FFmpegKitConfig::isShutdown() { return shutdownState != LibraryRunning; }
+
+int ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(const std::string &path) { return ffmpegkit::FFmpegKitConfig::setEnvironmentVariable("FONTCONFIG_PATH", path); }
+
+void ffmpegkit::FFmpegKitConfig::setFontDirectory(const std::string &fontDirectoryPath, const std::map<std::string, std::string> &fontNameMapping) { ffmpegkit::FFmpegKitConfig::setFontDirectoryList(std::list<std::string>{fontDirectoryPath}, fontNameMapping); }
+
+void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(const std::list<std::string> &fontDirectoryList, const std::map<std::string, std::string> &fontNameMapping) {
     int validFontNameMappingCount = 0;
 
     const char *parentDirectory = std::getenv("HOME");
@@ -1829,26 +1884,21 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
     std::string cacheDir = std::string(parentDirectory) + "/.cache";
     std::string ffmpegKitDir = cacheDir + "/ffmpegkit";
     auto tempConfigurationDirectory = ffmpegKitDir + "/fontconfig";
-    auto fontConfigurationFile =
-        std::string(tempConfigurationDirectory) + "/fonts.conf";
+    auto fontConfigurationFile = std::string(tempConfigurationDirectory) + "/fonts.conf";
     // Our fonts.conf replaces fontconfig's default config, so it must declare a
     // writable <cachedir>. In the browser MEMFS there is no usable default cache
     // location (the library's build-time cachedir path does not exist), which is
     // what triggers "Fontconfig error: No writable cache directories".
     auto fontConfigurationCacheDirectory = tempConfigurationDirectory + "/cache";
 
-    if (!fs_create_dir(cacheDir) || !fs_create_dir(ffmpegKitDir) ||
-        !fs_create_dir(tempConfigurationDirectory) ||
-        !fs_create_dir(fontConfigurationCacheDirectory)) {
+    if (!fs_create_dir(cacheDir) || !fs_create_dir(ffmpegKitDir) || !fs_create_dir(tempConfigurationDirectory) || !fs_create_dir(fontConfigurationCacheDirectory)) {
         return;
     }
     printf("Created temporary font conf directory: TRUE.\n");
 
     if (fs_exists(fontConfigurationFile, true, false)) {
-        int fontConfigurationDeleted =
-            std::remove(fontConfigurationFile.c_str());
-        printf("Deleted old temporary font configuration: %s.\n",
-               fontConfigurationDeleted == 0 ? "TRUE" : "FALSE");
+        int fontConfigurationDeleted = std::remove(fontConfigurationFile.c_str());
+        printf("Deleted old temporary font configuration: %s.\n", fontConfigurationDeleted == 0 ? "TRUE" : "FALSE");
     }
 
     /* PROCESS MAPPINGS FIRST */
@@ -1857,8 +1907,7 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
         if ((pair.first.size() > 0) && (pair.second.size() > 0)) {
 
             fontNameMappingBlock += "    <match target=\"pattern\">\n";
-            fontNameMappingBlock +=
-                "        <test qual=\"any\" name=\"family\">\n";
+            fontNameMappingBlock += "        <test qual=\"any\" name=\"family\">\n";
             fontNameMappingBlock += "                <string>";
             fontNameMappingBlock += pair.first;
             fontNameMappingBlock += "</string>\n";
@@ -1898,8 +1947,7 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
                "font configuration file for writing.\n");
         return;
     }
-    const size_t written =
-        fwrite(fontConfiguration.c_str(), sizeof(char), fontConfiguration.size(), fontConfigurationStream);
+    const size_t written = fwrite(fontConfiguration.c_str(), sizeof(char), fontConfiguration.size(), fontConfigurationStream);
     const bool writeFailed = written != fontConfiguration.size() || ferror(fontConfigurationStream);
 
     if (fclose(fontConfigurationStream) != 0 || writeFailed) {
@@ -1912,23 +1960,16 @@ void ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
            "mappings.\n",
            validFontNameMappingCount);
 
-    ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(
-        tempConfigurationDirectory.c_str());
+    ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(tempConfigurationDirectory.c_str());
 
     for (const auto &fontDirectoryPath : fontDirectoryList) {
-        printf("Font directory %s registered successfully.\n",
-               fontDirectoryPath.c_str());
+        printf("Font directory %s registered successfully.\n", fontDirectoryPath.c_str());
     }
 }
 
-long ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(
-    const std::vector<uint8_t> &data) {
-    return ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(
-        data.empty() ? NULL : data.data(), data.size());
-}
+long ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(const std::vector<uint8_t> &data) { return ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(data.empty() ? NULL : data.data(), data.size()); }
 
-long ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(
-    const uint8_t *data, const size_t size) {
+long ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(const uint8_t *data, const size_t size) {
     int64_t id;
     FFKitMemoryResource *resource;
 
@@ -1967,18 +2008,13 @@ long ffmpegkit::FFmpegKitConfig::registerFFmpegKitInputBuffer(
     return (long)id;
 }
 
-long ffmpegkit::FFmpegKitConfig::registerFFmpegKitOutputBuffer(
-    const long initialCapacity, const long maxCapacity) {
+long ffmpegkit::FFmpegKitConfig::registerFFmpegKitOutputBuffer(const long initialCapacity, const long maxCapacity) {
     int64_t id;
     FFKitMemoryResource *resource;
-    int64_t capacity =
-        initialCapacity > 0 ? initialCapacity : FFKIT_DEFAULT_OUTPUT_CAPACITY;
-    int64_t maximumCapacity =
-        maxCapacity > 0 ? maxCapacity : ffkit_max_alloc_size();
+    int64_t capacity = initialCapacity > 0 ? initialCapacity : FFKIT_DEFAULT_OUTPUT_CAPACITY;
+    int64_t maximumCapacity = maxCapacity > 0 ? maxCapacity : ffkit_max_alloc_size();
 
-    if (initialCapacity < 0 || maxCapacity < 0 ||
-        capacity > maximumCapacity || capacity > ffkit_max_alloc_size() ||
-        maximumCapacity > ffkit_max_alloc_size()) {
+    if (initialCapacity < 0 || maxCapacity < 0 || capacity > maximumCapacity || capacity > ffkit_max_alloc_size() || maximumCapacity > ffkit_max_alloc_size()) {
         return 0;
     }
 
@@ -2021,8 +2057,7 @@ long ffmpegkit::FFmpegKitConfig::getFFmpegKitBufferSize(const long bufferId) {
     return (long)size;
 }
 
-std::shared_ptr<std::vector<uint8_t>>
-ffmpegkit::FFmpegKitConfig::getFFmpegKitOutputBuffer(const long bufferId) {
+std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::getFFmpegKitOutputBuffer(const long bufferId) {
     FFKitMemoryResource *resource;
     std::shared_ptr<std::vector<uint8_t>> result = nullptr;
 
@@ -2030,12 +2065,8 @@ ffmpegkit::FFmpegKitConfig::getFFmpegKitOutputBuffer(const long bufferId) {
     resource = ffkit_memory_find_locked(bufferId);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->type == FFKIT_RESOURCE_OUTPUT &&
-            resource->size >= 0 &&
-            (uint64_t)resource->size <=
-                (uint64_t)std::numeric_limits<size_t>::max()) {
-            result = std::make_shared<std::vector<uint8_t>>(
-                resource->data, resource->data + resource->size);
+        if (resource->type == FFKIT_RESOURCE_OUTPUT && resource->size >= 0 && (uint64_t)resource->size <= (uint64_t)std::numeric_limits<size_t>::max()) {
+            result = std::make_shared<std::vector<uint8_t>>(resource->data, resource->data + resource->size);
         }
         pthread_mutex_unlock(&resource->mutex);
     }
@@ -2044,8 +2075,7 @@ ffmpegkit::FFmpegKitConfig::getFFmpegKitOutputBuffer(const long bufferId) {
     return result;
 }
 
-void ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitBuffer(
-    const long bufferId) {
+void ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitBuffer(const long bufferId) {
     FFKitMemoryResource *current;
     FFKitMemoryResource *previous = NULL;
     FFKitMemoryResource *resource = NULL;
@@ -2080,15 +2110,12 @@ void ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitBuffer(
     }
 }
 
-long ffmpegkit::FFmpegKitConfig::registerFFmpegKitStream(const long capacity,
-                                                         const int type) {
+long ffmpegkit::FFmpegKitConfig::registerFFmpegKitStream(const long capacity, const int type) {
     int64_t id;
     FFKitStreamResource *resource;
-    int64_t streamCapacity =
-        capacity > 0 ? capacity : FFKIT_DEFAULT_STREAM_CAPACITY;
+    int64_t streamCapacity = capacity > 0 ? capacity : FFKIT_DEFAULT_STREAM_CAPACITY;
 
-    if (capacity < 0 || streamCapacity > ffkit_max_alloc_size() ||
-        (type != FFKIT_RESOURCE_INPUT && type != FFKIT_RESOURCE_OUTPUT)) {
+    if (capacity < 0 || streamCapacity > ffkit_max_alloc_size() || (type != FFKIT_RESOURCE_INPUT && type != FFKIT_RESOURCE_OUTPUT)) {
         return 0;
     }
 
@@ -2115,27 +2142,20 @@ long ffmpegkit::FFmpegKitConfig::registerFFmpegKitStream(const long capacity,
     return (long)id;
 }
 
-int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(
-    const long streamId, const std::vector<uint8_t> &data, const size_t offset,
-    const size_t length, const int timeoutMs) {
+int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(const long streamId, const std::vector<uint8_t> &data, const size_t offset, const size_t length, const int timeoutMs) {
     if (offset > data.size() || length > (data.size() - offset)) {
         return AVERROR(EINVAL);
     }
 
-    return ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(
-        streamId, data.empty() ? NULL : data.data() + offset, length,
-        timeoutMs);
+    return ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(streamId, data.empty() ? NULL : data.data() + offset, length, timeoutMs);
 }
 
-int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(
-    const long streamId, const uint8_t *data, const size_t length,
-    const int timeoutMs) {
+int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(const long streamId, const uint8_t *data, const size_t length, const int timeoutMs) {
     FFKitStreamResource *resource;
     int ret = AVERROR(ENOENT);
     int freeResource = 0;
 
-    if ((data == NULL && length > 0) ||
-        length > (size_t)std::numeric_limits<int>::max()) {
+    if ((data == NULL && length > 0) || length > (size_t)std::numeric_limits<int>::max()) {
         return AVERROR(EINVAL);
     }
 
@@ -2169,10 +2189,7 @@ int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(
     return ret;
 }
 
-std::shared_ptr<std::vector<uint8_t>>
-ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId,
-                                                const int maxBytes,
-                                                const int timeoutMs) {
+std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId, const int maxBytes, const int timeoutMs) {
     FFKitStreamResource *resource;
     uint8_t *buffer;
     int ret = AVERROR(ENOENT);
@@ -2203,8 +2220,7 @@ ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId,
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs,
-                                      &timedOut, &eof);
+        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, &timedOut, &eof);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -2228,8 +2244,7 @@ ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId,
     return result;
 }
 
-void ffmpegkit::FFmpegKitConfig::closeFFmpegKitStreamInput(
-    const long streamId) {
+void ffmpegkit::FFmpegKitConfig::closeFFmpegKitStreamInput(const long streamId) {
     FFKitStreamResource *resource;
 
     pthread_mutex_lock(&ffkitStreamRegistryMutex);
@@ -2244,8 +2259,7 @@ void ffmpegkit::FFmpegKitConfig::closeFFmpegKitStreamInput(
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 }
 
-void ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(
-    const long streamId) {
+void ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(const long streamId) {
     FFKitStreamResource *current;
     FFKitStreamResource *previous = NULL;
     FFKitStreamResource *resource = NULL;
@@ -2298,61 +2312,40 @@ std::string ffmpegkit::FFmpegKitConfig::getBuildDate() {
     return std::string(buildDate);
 }
 
-int ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(
-    const std::string &variableName, const std::string &variableValue) {
-    return setenv(variableName.c_str(), variableValue.c_str(), true);
-}
+int ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(const std::string &variableName, const std::string &variableValue) { return setenv(variableName.c_str(), variableValue.c_str(), true); }
 
-void ffmpegkit::FFmpegKitConfig::ffmpegExecute(
-    const std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession) {
+static void runFFmpegSession(const std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession) {
     ffmpegSession->startRunning();
 
     try {
-        int returnCode = executeFFmpeg(ffmpegSession->getSessionId(),
-                                       ffmpegSession->getArguments());
-        ffmpegSession->complete(
-            std::make_shared<ffmpegkit::ReturnCode>(returnCode));
+        int returnCode = executeFFmpeg(ffmpegSession->getSessionId(), ffmpegSession->getArguments());
+        ffmpegSession->complete(std::make_shared<ffmpegkit::ReturnCode>(returnCode));
     } catch (const std::exception &exception) {
         ffmpegSession->fail(exception.what());
-        std::cout << "FFmpeg execute failed: "
-                  << ffmpegkit::FFmpegKitConfig::argumentsToString(
-                         ffmpegSession->getArguments())
-                  << "." << exception.what() << std::endl;
+        std::cout << "FFmpeg execute failed: " << ffmpegkit::FFmpegKitConfig::argumentsToString(ffmpegSession->getArguments()) << "." << exception.what() << std::endl;
     }
 }
 
-void ffmpegkit::FFmpegKitConfig::ffprobeExecute(
-    const std::shared_ptr<ffmpegkit::FFprobeSession> ffprobeSession) {
+static void runFFprobeSession(const std::shared_ptr<ffmpegkit::FFprobeSession> ffprobeSession) {
     ffprobeSession->startRunning();
 
     try {
-        int returnCode = executeFFprobe(ffprobeSession->getSessionId(),
-                                        ffprobeSession->getArguments());
-        ffprobeSession->complete(
-            std::make_shared<ffmpegkit::ReturnCode>(returnCode));
+        int returnCode = executeFFprobe(ffprobeSession->getSessionId(), ffprobeSession->getArguments());
+        ffprobeSession->complete(std::make_shared<ffmpegkit::ReturnCode>(returnCode));
     } catch (const std::exception &exception) {
         ffprobeSession->fail(exception.what());
-        std::cout << "FFprobe execute failed: "
-                  << ffmpegkit::FFmpegKitConfig::argumentsToString(
-                         ffprobeSession->getArguments())
-                  << "." << exception.what() << std::endl;
+        std::cout << "FFprobe execute failed: " << ffmpegkit::FFmpegKitConfig::argumentsToString(ffprobeSession->getArguments()) << "." << exception.what() << std::endl;
     }
 }
 
-void ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(
-    const std::shared_ptr<ffmpegkit::MediaInformationSession>
-        mediaInformationSession,
-    const int waitTimeout) {
+static void runMediaInformationSession(const std::shared_ptr<ffmpegkit::MediaInformationSession> mediaInformationSession, const int waitTimeout) {
     mediaInformationSession->startRunning();
 
     AVBPrint mediaInformationBuffer;
     av_bprint_init(&mediaInformationBuffer, 0, AV_BPRINT_SIZE_UNLIMITED);
     try {
-        int returnCodeValue = executeFFprobeToBuffer(
-            mediaInformationSession->getSessionId(),
-            mediaInformationSession->getArguments(), &mediaInformationBuffer);
-        auto returnCode =
-            std::make_shared<ffmpegkit::ReturnCode>(returnCodeValue);
+        int returnCodeValue = executeFFprobeToBuffer(mediaInformationSession->getSessionId(), mediaInformationSession->getArguments(), &mediaInformationBuffer);
+        auto returnCode = std::make_shared<ffmpegkit::ReturnCode>(returnCodeValue);
         mediaInformationSession->complete(returnCode);
 
         // NOTE: waitTimeout is retained for API compatibility but is no longer
@@ -2361,132 +2354,199 @@ void ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(
         // delivery. Callers that read the session logs afterwards still get the
         // wait, because getAllLogs applies the timeout itself.
         if (returnCode->isValueSuccess()) {
-            auto mediaInformation =
-                ffmpegkit::MediaInformationJsonParser::fromWithError(
-                    mediaInformationBuffer.str);
+            auto mediaInformation = ffmpegkit::MediaInformationJsonParser::fromWithError(mediaInformationBuffer.str);
             mediaInformationSession->setMediaInformation(mediaInformation);
         }
         av_bprint_finalize(&mediaInformationBuffer, NULL);
     } catch (const std::exception &exception) {
         av_bprint_finalize(&mediaInformationBuffer, NULL);
         mediaInformationSession->fail(exception.what());
-        std::cout << "Get media information execute failed: "
-                  << ffmpegkit::FFmpegKitConfig::argumentsToString(
-                         mediaInformationSession->getArguments())
-                  << "." << exception.what() << std::endl;
+        std::cout << "Get media information execute failed: " << ffmpegkit::FFmpegKitConfig::argumentsToString(mediaInformationSession->getArguments()) << "." << exception.what() << std::endl;
     }
 }
 
-void ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(
-    const std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession) {
-    auto thread = std::thread([ffmpegSession]() {
-        ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpegSession);
-
-        ffmpegkit::FFmpegSessionCompleteCallback completeCallback =
-            ffmpegSession->getCompleteCallback();
-        if (completeCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                completeCallback(ffmpegSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside session complete callback. "
-                    << exception.what() << std::endl;
-            }
+/** Calls the session's complete callback, then the global one. */
+static void notifyFFmpegSessionComplete(const std::shared_ptr<ffmpegkit::FFmpegSession> &ffmpegSession) {
+    ffmpegkit::FFmpegSessionCompleteCallback completeCallback = ffmpegSession->getCompleteCallback();
+    if (completeCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(ffmpegSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside session complete callback. " << exception.what() << std::endl;
         }
+    }
 
-        ffmpegkit::FFmpegSessionCompleteCallback
-            globalFFmpegSessionCompleteCallback =
-                ffmpegkit::FFmpegKitConfig::getFFmpegSessionCompleteCallback();
-        if (globalFFmpegSessionCompleteCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                globalFFmpegSessionCompleteCallback(ffmpegSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside global complete callback. "
-                    << exception.what() << std::endl;
-            }
+    ffmpegkit::FFmpegSessionCompleteCallback globalFFmpegSessionCompleteCallback = ffmpegkit::FFmpegKitConfig::getFFmpegSessionCompleteCallback();
+    if (globalFFmpegSessionCompleteCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalFFmpegSessionCompleteCallback(ffmpegSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside global complete callback. " << exception.what() << std::endl;
         }
-    });
-
-    thread.detach();
+    }
 }
 
-void ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(
-    const std::shared_ptr<ffmpegkit::FFprobeSession> ffprobeSession) {
-    auto thread = std::thread([ffprobeSession]() {
-        ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobeSession);
-
-        ffmpegkit::FFprobeSessionCompleteCallback completeCallback =
-            ffprobeSession->getCompleteCallback();
-        if (completeCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                completeCallback(ffprobeSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside session complete callback. "
-                    << exception.what() << std::endl;
-            }
+/** Calls the session's complete callback, then the global one. */
+static void notifyFFprobeSessionComplete(const std::shared_ptr<ffmpegkit::FFprobeSession> &ffprobeSession) {
+    ffmpegkit::FFprobeSessionCompleteCallback completeCallback = ffprobeSession->getCompleteCallback();
+    if (completeCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(ffprobeSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside session complete callback. " << exception.what() << std::endl;
         }
+    }
 
-        ffmpegkit::FFprobeSessionCompleteCallback
-            globalFFprobeSessionCompleteCallback =
-                ffmpegkit::FFmpegKitConfig::getFFprobeSessionCompleteCallback();
-        if (globalFFprobeSessionCompleteCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                globalFFprobeSessionCompleteCallback(ffprobeSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside global complete callback. "
-                    << exception.what() << std::endl;
-            }
+    ffmpegkit::FFprobeSessionCompleteCallback globalFFprobeSessionCompleteCallback = ffmpegkit::FFmpegKitConfig::getFFprobeSessionCompleteCallback();
+    if (globalFFprobeSessionCompleteCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalFFprobeSessionCompleteCallback(ffprobeSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside global complete callback. " << exception.what() << std::endl;
         }
-    });
-
-    thread.detach();
+    }
 }
 
-void ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(
-    const std::shared_ptr<ffmpegkit::MediaInformationSession>
-        mediaInformationSession,
-    const int waitTimeout) {
-    auto thread = std::thread([mediaInformationSession, waitTimeout]() {
-        ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(
-            mediaInformationSession, waitTimeout);
-
-        ffmpegkit::MediaInformationSessionCompleteCallback completeCallback =
-            mediaInformationSession->getCompleteCallback();
-        if (completeCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                completeCallback(mediaInformationSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside session complete callback. "
-                    << exception.what() << std::endl;
-            }
+/** Calls the session's complete callback, then the global one. */
+static void notifyMediaInformationSessionComplete(const std::shared_ptr<ffmpegkit::MediaInformationSession> &mediaInformationSession) {
+    ffmpegkit::MediaInformationSessionCompleteCallback completeCallback = mediaInformationSession->getCompleteCallback();
+    if (completeCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(mediaInformationSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside session complete callback. " << exception.what() << std::endl;
         }
+    }
 
-        ffmpegkit::MediaInformationSessionCompleteCallback
-            globalMediaInformationSessionCompleteCallback = ffmpegkit::
-                FFmpegKitConfig::getMediaInformationSessionCompleteCallback();
-        if (globalMediaInformationSessionCompleteCallback != nullptr) {
-            try {
-                // NOTIFY SESSION CALLBACK DEFINED
-                globalMediaInformationSessionCompleteCallback(
-                    mediaInformationSession);
-            } catch (const std::exception &exception) {
-                std::cout
-                    << "Exception thrown inside global complete callback. "
-                    << exception.what() << std::endl;
-            }
+    ffmpegkit::MediaInformationSessionCompleteCallback globalMediaInformationSessionCompleteCallback = ffmpegkit::FFmpegKitConfig::getMediaInformationSessionCompleteCallback();
+    if (globalMediaInformationSessionCompleteCallback != nullptr && beginCallback(true)) {
+        CallbackEnd callbackEnd;
+        try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalMediaInformationSessionCompleteCallback(mediaInformationSession);
+        } catch (const std::exception &exception) {
+            std::cout << "Exception thrown inside global complete callback. " << exception.what() << std::endl;
         }
-    });
+    }
+}
 
-    thread.detach();
+/** Calls the complete callbacks of a session of any type. */
+static void notifySessionComplete(const std::shared_ptr<ffmpegkit::Session> &session) {
+    if (session->isFFmpeg()) {
+        notifyFFmpegSessionComplete(std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
+    } else if (session->isFFprobe()) {
+        notifyFFprobeSessionComplete(std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
+    } else if (session->isMediaInformation()) {
+        notifyMediaInformationSessionComplete(std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session));
+    }
+}
+
+/** Ends a synchronous execution when it goes out of scope. */
+struct ExecutionEnd {
+    ~ExecutionEnd() { endExecution(); }
+};
+
+void ffmpegkit::FFmpegKitConfig::ffmpegExecute(const std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession) {
+    if (!beginExecution()) {
+        rejectSession(ffmpegSession);
+        return;
+    }
+    ExecutionEnd executionEnd;
+    runFFmpegSession(ffmpegSession);
+}
+
+void ffmpegkit::FFmpegKitConfig::ffprobeExecute(const std::shared_ptr<ffmpegkit::FFprobeSession> ffprobeSession) {
+    if (!beginExecution()) {
+        rejectSession(ffprobeSession);
+        return;
+    }
+    ExecutionEnd executionEnd;
+    runFFprobeSession(ffprobeSession);
+}
+
+void ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(const std::shared_ptr<ffmpegkit::MediaInformationSession> mediaInformationSession, const int waitTimeout) {
+    if (!beginExecution()) {
+        rejectSession(mediaInformationSession);
+        return;
+    }
+    ExecutionEnd executionEnd;
+    runMediaInformationSession(mediaInformationSession, waitTimeout);
+}
+
+/**
+ * Keep each submission on its original detached worker. A worker claims its
+ * session under the shutdown lock; one served late only rejects and releases.
+ */
+template <typename SessionType, typename Execute> static void submitAsyncExecution(const std::shared_ptr<SessionType> &session, Execute execute) {
+    bool accepted;
+    {
+        std::lock_guard<std::mutex> lock(executionMutex);
+        accepted = shutdownState == LibraryRunning;
+        if (accepted)
+            queuedExecutionCount++;
+    }
+    if (!accepted) {
+        rejectSession(session);
+        return;
+    }
+    std::shared_ptr<SessionType> workerSession = session;
+    try {
+        std::thread([workerSession, execute]() mutable {
+            LibraryState state;
+            bool counted;
+            {
+                std::lock_guard<std::mutex> lock(executionMutex);
+                queuedExecutionCount--;
+                state = shutdownState;
+                counted = state != LibraryTerminated;
+                if (counted) {
+                    pendingExecutions++;
+                    libraryWorkDepth++;
+                }
+                executionMonitor.notify_all();
+            }
+            struct WorkEnd {
+                bool counted;
+                ~WorkEnd() {
+                    if (counted)
+                        endExecution();
+                }
+            } work{counted};
+            // Release before the counted execution ends, including on exception.
+            std::shared_ptr<SessionType> heldSession = std::move(workerSession);
+            if (state == LibraryRunning) {
+                execute(heldSession);
+            } else {
+                rejectSession(heldSession);
+            }
+            if (counted) {
+                notifySessionComplete(heldSession);
+            }
+        }).detach();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(executionMutex);
+        queuedExecutionCount--;
+        executionMonitor.notify_all();
+        throw;
+    }
+}
+
+void ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(const std::shared_ptr<ffmpegkit::FFmpegSession> ffmpegSession) { submitAsyncExecution(ffmpegSession, runFFmpegSession); }
+
+void ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(const std::shared_ptr<ffmpegkit::FFprobeSession> ffprobeSession) { submitAsyncExecution(ffprobeSession, runFFprobeSession); }
+
+void ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(const std::shared_ptr<ffmpegkit::MediaInformationSession> mediaInformationSession, const int waitTimeout) {
+    submitAsyncExecution(mediaInformationSession, [waitTimeout](std::shared_ptr<ffmpegkit::MediaInformationSession> session) { runMediaInformationSession(session, waitTimeout); });
 }
 
 void ffmpegkit::FFmpegKitConfig::enableLogCallback(const ffmpegkit::LogCallback callback) {
@@ -2529,8 +2589,7 @@ void ffmpegkit::FFmpegKitConfig::setLogLevel(const ffmpegkit::Level level) {
     configuredLogLevel = level;
 }
 
-std::string
-ffmpegkit::FFmpegKitConfig::logLevelToString(const ffmpegkit::Level level) {
+std::string ffmpegkit::FFmpegKitConfig::logLevelToString(const ffmpegkit::Level level) {
     switch (level) {
     case ffmpegkit::LevelAVLogStdErr:
         return "STDERR";
@@ -2562,21 +2621,18 @@ int ffmpegkit::FFmpegKitConfig::getSessionHistorySize() {
     return sessionHistorySize;
 }
 
-void ffmpegkit::FFmpegKitConfig::setSessionHistorySize(
-    const int newSessionHistorySize) {
+void ffmpegkit::FFmpegKitConfig::setSessionHistorySize(const int newSessionHistorySize) {
     if (newSessionHistorySize >= SESSION_MAP_SIZE) {
 
         /*
          * THERE IS A HARD LIMIT ON THE NATIVE SIDE. HISTORY SIZE MUST BE
          * SMALLER THAN SESSION_MAP_SIZE
          */
-        throw std::runtime_error(
-            "Session history size must not exceed the hard limit!");
+        throw std::runtime_error("Session history size must not exceed the hard limit!");
     } else if (newSessionHistorySize > 0) {
         std::list<std::shared_ptr<ffmpegkit::Session>> retiredSessions;
         std::list<long> deletedSessionIds;
-        std::unique_lock<std::recursive_mutex> lock(sessionMutex,
-                                                    std::defer_lock);
+        std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
         lock.lock();
 
         sessionHistorySize = newSessionHistorySize;
@@ -2589,8 +2645,7 @@ void ffmpegkit::FFmpegKitConfig::setSessionHistorySize(
     }
 }
 
-std::shared_ptr<ffmpegkit::Session>
-ffmpegkit::FFmpegKitConfig::getSession(const long sessionId) {
+std::shared_ptr<ffmpegkit::Session> ffmpegkit::FFmpegKitConfig::getSession(const long sessionId) {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
     lock.lock();
 
@@ -2614,11 +2669,7 @@ void ffmpegkit::FFmpegKitConfig::deleteSession(const long sessionId) {
     if (deleted) {
         retiredSession = entry->second;
         sessionHistoryMap.erase(entry);
-        auto it = std::remove_if(
-            sessionHistoryList.begin(), sessionHistoryList.end(),
-            [sessionId](std::shared_ptr<ffmpegkit::Session> session) {
-                return session->getSessionId() == sessionId;
-            });
+        auto it = std::remove_if(sessionHistoryList.begin(), sessionHistoryList.end(), [sessionId](std::shared_ptr<ffmpegkit::Session> session) { return session->getSessionId() == sessionId; });
         sessionHistoryList.erase(it, sessionHistoryList.end());
     }
 
@@ -2630,18 +2681,15 @@ void ffmpegkit::FFmpegKitConfig::deleteSession(const long sessionId) {
     }
 }
 
-void ffmpegkit::FFmpegKitConfig::addSessionDeleteListener(
-    const std::shared_ptr<ffmpegkit::SessionDeleteListener> listener) {
+void ffmpegkit::FFmpegKitConfig::addSessionDeleteListener(const std::shared_ptr<ffmpegkit::SessionDeleteListener> listener) {
     if (listener == nullptr) {
         return;
     }
 
-    std::unique_lock<std::recursive_mutex> listenerLock(
-        sessionDeleteListenerMutex, std::defer_lock);
+    std::unique_lock<std::recursive_mutex> listenerLock(sessionDeleteListenerMutex, std::defer_lock);
     listenerLock.lock();
 
-    for (auto it = sessionDeleteListeners.begin();
-         it != sessionDeleteListeners.end();) {
+    for (auto it = sessionDeleteListeners.begin(); it != sessionDeleteListeners.end();) {
         auto existingListener = it->lock();
         if (existingListener == nullptr || existingListener == listener) {
             it = sessionDeleteListeners.erase(it);
@@ -2655,18 +2703,15 @@ void ffmpegkit::FFmpegKitConfig::addSessionDeleteListener(
     listenerLock.unlock();
 }
 
-void ffmpegkit::FFmpegKitConfig::removeSessionDeleteListener(
-    const std::shared_ptr<ffmpegkit::SessionDeleteListener> listener) {
+void ffmpegkit::FFmpegKitConfig::removeSessionDeleteListener(const std::shared_ptr<ffmpegkit::SessionDeleteListener> listener) {
     if (listener == nullptr) {
         return;
     }
 
-    std::unique_lock<std::recursive_mutex> listenerLock(
-        sessionDeleteListenerMutex, std::defer_lock);
+    std::unique_lock<std::recursive_mutex> listenerLock(sessionDeleteListenerMutex, std::defer_lock);
     listenerLock.lock();
 
-    for (auto it = sessionDeleteListeners.begin();
-         it != sessionDeleteListeners.end();) {
+    for (auto it = sessionDeleteListeners.begin(); it != sessionDeleteListeners.end();) {
         auto existingListener = it->lock();
         if (existingListener == nullptr || existingListener == listener) {
             it = sessionDeleteListeners.erase(it);
@@ -2678,8 +2723,7 @@ void ffmpegkit::FFmpegKitConfig::removeSessionDeleteListener(
     listenerLock.unlock();
 }
 
-std::shared_ptr<ffmpegkit::Session>
-ffmpegkit::FFmpegKitConfig::getLastSession() {
+std::shared_ptr<ffmpegkit::Session> ffmpegkit::FFmpegKitConfig::getLastSession() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
     lock.lock();
 
@@ -2690,14 +2734,12 @@ ffmpegkit::FFmpegKitConfig::getLastSession() {
     return sessionHistoryList.back();
 }
 
-std::shared_ptr<ffmpegkit::Session>
-ffmpegkit::FFmpegKitConfig::getLastCompletedSession() {
+std::shared_ptr<ffmpegkit::Session> ffmpegkit::FFmpegKitConfig::getLastCompletedSession() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
 
     lock.lock();
 
-    for (auto rit = sessionHistoryList.rbegin();
-         rit != sessionHistoryList.rend(); ++rit) {
+    for (auto rit = sessionHistoryList.rbegin(); rit != sessionHistoryList.rend(); ++rit) {
         auto session = *rit;
         if (session->getState() == SessionStateCompleted) {
             return session;
@@ -2707,14 +2749,11 @@ ffmpegkit::FFmpegKitConfig::getLastCompletedSession() {
     return nullptr;
 }
 
-std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::Session>>>
-ffmpegkit::FFmpegKitConfig::getSessions() {
+std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::Session>>> ffmpegkit::FFmpegKitConfig::getSessions() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
     lock.lock();
 
-    auto sessionHistoryListCopy =
-        std::make_shared<std::list<std::shared_ptr<ffmpegkit::Session>>>(
-            sessionHistoryList);
+    auto sessionHistoryListCopy = std::make_shared<std::list<std::shared_ptr<ffmpegkit::Session>>>(sessionHistoryList);
 
     lock.unlock();
 
@@ -2729,8 +2768,7 @@ void ffmpegkit::FFmpegKitConfig::clearSessions() {
 
     lock.lock();
 
-    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end();
-         ++it) {
+    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end(); ++it) {
         auto session = *it;
         if (session != nullptr) {
             deletedSessionIds.push_back(session->getSessionId());
@@ -2748,20 +2786,16 @@ void ffmpegkit::FFmpegKitConfig::clearSessions() {
     notifySessionsDeleted(deletedSessionIds);
 }
 
-std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::FFmpegSession>>>
-ffmpegkit::FFmpegKitConfig::getFFmpegSessions() {
+std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::FFmpegSession>>> ffmpegkit::FFmpegKitConfig::getFFmpegSessions() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
-    const auto ffmpegSessions = std::make_shared<
-        std::list<std::shared_ptr<ffmpegkit::FFmpegSession>>>();
+    const auto ffmpegSessions = std::make_shared<std::list<std::shared_ptr<ffmpegkit::FFmpegSession>>>();
 
     lock.lock();
 
-    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end();
-         ++it) {
+    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end(); ++it) {
         auto session = *it;
         if (session->isFFmpeg()) {
-            ffmpegSessions->push_back(
-                std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
+            ffmpegSessions->push_back(std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
         }
     }
 
@@ -2770,20 +2804,16 @@ ffmpegkit::FFmpegKitConfig::getFFmpegSessions() {
     return ffmpegSessions;
 }
 
-std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::FFprobeSession>>>
-ffmpegkit::FFmpegKitConfig::getFFprobeSessions() {
+std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::FFprobeSession>>> ffmpegkit::FFmpegKitConfig::getFFprobeSessions() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
-    const auto ffprobeSessions = std::make_shared<
-        std::list<std::shared_ptr<ffmpegkit::FFprobeSession>>>();
+    const auto ffprobeSessions = std::make_shared<std::list<std::shared_ptr<ffmpegkit::FFprobeSession>>>();
 
     lock.lock();
 
-    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end();
-         ++it) {
+    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end(); ++it) {
         auto session = *it;
         if (session->isFFprobe()) {
-            ffprobeSessions->push_back(
-                std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
+            ffprobeSessions->push_back(std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
         }
     }
 
@@ -2792,21 +2822,16 @@ ffmpegkit::FFmpegKitConfig::getFFprobeSessions() {
     return ffprobeSessions;
 }
 
-std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::MediaInformationSession>>>
-ffmpegkit::FFmpegKitConfig::getMediaInformationSessions() {
+std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::MediaInformationSession>>> ffmpegkit::FFmpegKitConfig::getMediaInformationSessions() {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
-    const auto mediaInformationSessions = std::make_shared<
-        std::list<std::shared_ptr<ffmpegkit::MediaInformationSession>>>();
+    const auto mediaInformationSessions = std::make_shared<std::list<std::shared_ptr<ffmpegkit::MediaInformationSession>>>();
 
     lock.lock();
 
-    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end();
-         ++it) {
+    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end(); ++it) {
         auto session = *it;
         if (session->isMediaInformation()) {
-            mediaInformationSessions->push_back(
-                std::static_pointer_cast<ffmpegkit::MediaInformationSession>(
-                    session));
+            mediaInformationSessions->push_back(std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session));
         }
     }
 
@@ -2815,16 +2840,13 @@ ffmpegkit::FFmpegKitConfig::getMediaInformationSessions() {
     return mediaInformationSessions;
 }
 
-std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::Session>>>
-ffmpegkit::FFmpegKitConfig::getSessionsByState(const SessionState state) {
+std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::Session>>> ffmpegkit::FFmpegKitConfig::getSessionsByState(const SessionState state) {
     std::unique_lock<std::recursive_mutex> lock(sessionMutex, std::defer_lock);
-    auto sessions =
-        std::make_shared<std::list<std::shared_ptr<ffmpegkit::Session>>>();
+    auto sessions = std::make_shared<std::list<std::shared_ptr<ffmpegkit::Session>>>();
 
     lock.lock();
 
-    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end();
-         ++it) {
+    for (auto it = sessionHistoryList.begin(); it != sessionHistoryList.end(); ++it) {
         auto session = *it;
         if (session->getState() == state) {
             sessions->push_back(session);
@@ -2836,23 +2858,13 @@ ffmpegkit::FFmpegKitConfig::getSessionsByState(const SessionState state) {
     return sessions;
 }
 
-ffmpegkit::LogRedirectionStrategy
-ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy() {
-    return globalLogRedirectionStrategy;
-}
+ffmpegkit::LogRedirectionStrategy ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy() { return globalLogRedirectionStrategy; }
 
-void ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(
-    const LogRedirectionStrategy logRedirectionStrategy) {
-    globalLogRedirectionStrategy = logRedirectionStrategy;
-}
+void ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(const LogRedirectionStrategy logRedirectionStrategy) { globalLogRedirectionStrategy = logRedirectionStrategy; }
 
-int ffmpegkit::FFmpegKitConfig::messagesInTransmit(const long sessionId) {
-    return std::atomic_load(
-        &sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE]);
-}
+int ffmpegkit::FFmpegKitConfig::messagesInTransmit(const long sessionId) { return std::atomic_load(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE]); }
 
-std::string
-ffmpegkit::FFmpegKitConfig::sessionStateToString(SessionState state) {
+std::string ffmpegkit::FFmpegKitConfig::sessionStateToString(SessionState state) {
     switch (state) {
     case SessionStateCreated:
         return "CREATED";
@@ -2867,8 +2879,7 @@ ffmpegkit::FFmpegKitConfig::sessionStateToString(SessionState state) {
     }
 }
 
-std::list<std::string>
-ffmpegkit::FFmpegKitConfig::parseArguments(const std::string &command) {
+std::list<std::string> ffmpegkit::FFmpegKitConfig::parseArguments(const std::string &command) {
     std::list<std::string> argumentList;
     std::string currentArgument;
 
@@ -2891,8 +2902,7 @@ ffmpegkit::FFmpegKitConfig::parseArguments(const std::string &command) {
                 argumentList.push_back(currentArgument);
                 currentArgument = "";
             }
-        } else if (currentChar == '\'' &&
-                   (previousChar == 0 || previousChar != '\\')) {
+        } else if (currentChar == '\'' && (previousChar == 0 || previousChar != '\\')) {
             if (singleQuoteStarted) {
                 singleQuoteStarted = false;
             } else if (doubleQuoteStarted) {
@@ -2900,8 +2910,7 @@ ffmpegkit::FFmpegKitConfig::parseArguments(const std::string &command) {
             } else {
                 singleQuoteStarted = true;
             }
-        } else if (currentChar == '\"' &&
-                   (previousChar == 0 || previousChar != '\\')) {
+        } else if (currentChar == '\"' && (previousChar == 0 || previousChar != '\\')) {
             if (doubleQuoteStarted) {
                 doubleQuoteStarted = false;
             } else if (singleQuoteStarted) {
@@ -2921,8 +2930,7 @@ ffmpegkit::FFmpegKitConfig::parseArguments(const std::string &command) {
     return argumentList;
 }
 
-std::string ffmpegkit::FFmpegKitConfig::argumentsToString(
-    std::shared_ptr<std::list<std::string>> arguments) {
+std::string ffmpegkit::FFmpegKitConfig::argumentsToString(std::shared_ptr<std::list<std::string>> arguments) {
     if (arguments == nullptr) {
         return "null";
     }
