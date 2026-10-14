@@ -74,9 +74,7 @@ inline void checkError() {
         return;
     }
     char *message = ffk_take_error();
-    const std::string text =
-        message == nullptr ? std::string("FFmpegKit call failed.")
-                           : std::string(message);
+    const std::string text = message == nullptr ? std::string("FFmpegKit call failed.") : std::string(message);
     ffk_string_free(message);
     throw ffmpegkit::Exception(text);
 }
@@ -106,8 +104,7 @@ inline std::shared_ptr<std::string> takeOptionalString(char *value) {
 }
 
 /** Copies a library owned byte buffer into a vector and releases it. */
-inline std::shared_ptr<std::vector<uint8_t>> takeBytes(uint8_t *data,
-                                                       const size_t size) {
+inline std::shared_ptr<std::vector<uint8_t>> takeBytes(uint8_t *data, const size_t size) {
     if (data == nullptr) {
         return nullptr;
     }
@@ -140,11 +137,7 @@ inline std::shared_ptr<ffmpegkit::json::Value> takeJson(char *json) {
 }
 
 /** Serializes a value so that it can be handed to the library. */
-inline std::string
-fromJson(const std::shared_ptr<ffmpegkit::json::Value> &value) {
-    return value == nullptr ? std::string("null")
-                            : ffmpegkit::json::detail::serialize(*value);
-}
+inline std::string fromJson(const std::shared_ptr<ffmpegkit::json::Value> &value) { return value == nullptr ? std::string("null") : ffmpegkit::json::detail::serialize(*value); }
 
 /* ------------------------------------------------------------------------ */
 /* Protocol urls                                                             */
@@ -156,10 +149,8 @@ fromJson(const std::shared_ptr<ffmpegkit::json::Value> &value) {
  * <p>The library builds the string, because the ffkitmem and ffkitstream
  * protocol handlers inside it have to parse back exactly what was built.
  */
-inline std::string buildProtocolUrl(const char *protocol, const long id,
-                                    const std::string &extension) {
-    std::string url = takeString(
-        ffk_protocol_build_url(protocol, id, extension.c_str()));
+inline std::string buildProtocolUrl(const char *protocol, const long id, const std::string &extension) {
+    std::string url = takeString(ffk_protocol_build_url(protocol, id, extension.c_str()));
     checkError();
     return url;
 }
@@ -169,11 +160,7 @@ inline std::string buildProtocolUrl(const char *protocol, const long id,
 /* ------------------------------------------------------------------------ */
 
 /** Rebuilds a time point from the epoch milliseconds the C API carries. */
-inline std::chrono::time_point<std::chrono::system_clock>
-toTimePoint(const int64_t epochMilliseconds) {
-    return std::chrono::time_point<std::chrono::system_clock>(
-        std::chrono::milliseconds(epochMilliseconds));
-}
+inline std::chrono::time_point<std::chrono::system_clock> toTimePoint(const int64_t epochMilliseconds) { return std::chrono::time_point<std::chrono::system_clock>(std::chrono::milliseconds(epochMilliseconds)); }
 
 /* ------------------------------------------------------------------------ */
 /* Argument marshalling                                                      */
@@ -185,8 +172,7 @@ toTimePoint(const int64_t epochMilliseconds) {
  */
 class ArgumentArray {
   public:
-    explicit ArgumentArray(const std::list<std::string> &arguments)
-        : _storage(arguments.begin(), arguments.end()) {
+    explicit ArgumentArray(const std::list<std::string> &arguments) : _storage(arguments.begin(), arguments.end()) {
         _pointers.reserve(_storage.size());
         for (const std::string &argument : _storage) {
             _pointers.push_back(argument.c_str());
@@ -209,8 +195,7 @@ class ArgumentArray {
 /* ------------------------------------------------------------------------ */
 
 /** Rebuilds a std::list of strings from a library list and releases it. */
-inline std::shared_ptr<std::list<std::string>>
-takeStringList(FFKStringList *list) {
+inline std::shared_ptr<std::list<std::string>> takeStringList(FFKStringList *list) {
     auto result = std::make_shared<std::list<std::string>>();
     if (list == nullptr) {
         return result;
@@ -245,18 +230,14 @@ inline std::shared_ptr<SessionType> adoptSession(FFKSession *handle) {
 }
 
 /** Rebuilds a std::list of sessions from a library list and releases it. */
-template <typename SessionType>
-inline std::shared_ptr<std::list<std::shared_ptr<SessionType>>>
-takeSessionList(FFKSessionList *list) {
-    auto result =
-        std::make_shared<std::list<std::shared_ptr<SessionType>>>();
+template <typename SessionType> inline std::shared_ptr<std::list<std::shared_ptr<SessionType>>> takeSessionList(FFKSessionList *list) {
+    auto result = std::make_shared<std::list<std::shared_ptr<SessionType>>>();
     if (list == nullptr) {
         return result;
     }
     const size_t size = ffk_session_list_size(list);
     for (size_t index = 0; index < size; index++) {
-        result->push_back(
-            adoptSession<SessionType>(ffk_session_list_get(list, index)));
+        result->push_back(adoptSession<SessionType>(ffk_session_list_get(list, index)));
     }
     ffk_session_list_free(list);
     return result;
@@ -311,17 +292,13 @@ template <typename Function> inline ffk_free_cb callbackHolderDeleter() {
  * @return the original std::function, or an empty one when the callback did
  * not come from this facade
  */
-template <typename Function, typename CallbackType, typename TrampolineType>
-inline Function recoverCallback(const int registered,
-                                const CallbackType callback, void *userData,
-                                const TrampolineType trampoline) {
+template <typename Function, typename CallbackType, typename TrampolineType> inline Function recoverCallback(const int registered, const CallbackType callback, void *userData, const TrampolineType trampoline) {
     if (registered == 0 || callback == nullptr || userData == nullptr) {
         return Function();
     }
     // The two pointers differ only in language linkage, which some compilers
     // model as a type difference, so they are compared through a common type
-    if (reinterpret_cast<void (*)()>(callback) !=
-        reinterpret_cast<void (*)()>(trampoline)) {
+    if (reinterpret_cast<void (*)()>(callback) != reinterpret_cast<void (*)()>(trampoline)) {
         return Function();
     }
     return static_cast<CallbackHolder<Function> *>(userData)->function;

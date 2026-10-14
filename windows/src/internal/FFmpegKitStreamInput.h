@@ -35,11 +35,9 @@ namespace internal {
  */
 class FFmpegKitStreamInput {
   public:
-    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamInput>
-    create(const std::string &extension);
+    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamInput> create(const std::string &extension);
 
-    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamInput>
-    create(const std::string &extension, const long capacity);
+    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamInput> create(const std::string &extension, const long capacity);
 
     ~FFmpegKitStreamInput();
 
@@ -49,8 +47,7 @@ class FFmpegKitStreamInput {
 
     int write(const std::vector<uint8_t> &data, const int timeoutMs);
 
-    int write(const std::vector<uint8_t> &data, const size_t offset,
-              const size_t length, const int timeoutMs);
+    int write(const std::vector<uint8_t> &data, const size_t offset, const size_t length, const int timeoutMs);
 
     int write(const uint8_t *data, const size_t length, const int timeoutMs);
 

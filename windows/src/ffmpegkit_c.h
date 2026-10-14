@@ -73,7 +73,10 @@
  *   no-op). The ffk_*_free and ffk_*_list_size functions cannot fail and leave
  *   the slot alone, so an error outlives the release of the handles and
  *   strings of the failed call. Callers check ffk_has_error() and take the
- *   message with ffk_take_error(). The message can be of any length.
+ *   message with ffk_take_error(). The message can be of any length. A
+ *   callback, a session delete listener or a free function runs with a slot
+ *   of its own: what its own calls leave there is dropped when it returns, so
+ *   it never shows up as the error of a call that it ran inside.
  *
  * CALLBACKS
  *
@@ -108,6 +111,13 @@
  *   session delete listener. A session that is still running, or that the
  *   consumer still holds a handle to, keeps its cookies until it has finished
  *   and the handle is released with ffk_session_free().
+ *
+ *   Before teardown, stop submissions and call ffk_config_shutdown(); if it
+ *   returns 0, retry before releasing state used by active work. Completion callbacks
+ *   may be dropped. Even after 1, queued workers and handles may retain sessions
+ *   and invoke cookie free functions later. Keep cleanup code and its runtime
+ *   valid until workers drain and handles/callback registrations are released.
+ *   See ffk_config_shutdown() for the timeout and callback grace rules.
  *
  * METADATA
  *
@@ -229,8 +239,7 @@ FFK_API void ffk_string_list_free(FFKStringList *list);
 
 FFK_API size_t ffk_session_list_size(const FFKSessionList *list);
 /** @return element to release with ffk_session_free(), or NULL when out of range */
-FFK_API FFKSession *ffk_session_list_get(const FFKSessionList *list,
-                                         size_t index);
+FFK_API FFKSession *ffk_session_list_get(const FFKSessionList *list, size_t index);
 FFK_API void ffk_session_list_free(FFKSessionList *list);
 
 FFK_API size_t ffk_log_list_size(const FFKLogList *list);
@@ -240,31 +249,24 @@ FFK_API void ffk_log_list_free(FFKLogList *list);
 
 FFK_API size_t ffk_statistics_list_size(const FFKStatisticsList *list);
 /** @return element to release with ffk_statistics_free(), or NULL when out of range */
-FFK_API FFKStatistics *ffk_statistics_list_get(const FFKStatisticsList *list,
-                                               size_t index);
+FFK_API FFKStatistics *ffk_statistics_list_get(const FFKStatisticsList *list, size_t index);
 FFK_API void ffk_statistics_list_free(FFKStatisticsList *list);
 
-FFK_API size_t
-ffk_stream_information_list_size(const FFKStreamInformationList *list);
+FFK_API size_t ffk_stream_information_list_size(const FFKStreamInformationList *list);
 /** @return element to release with ffk_stream_information_free(), or NULL */
-FFK_API FFKStreamInformation *
-ffk_stream_information_list_get(const FFKStreamInformationList *list,
-                                size_t index);
-FFK_API void
-ffk_stream_information_list_free(FFKStreamInformationList *list);
+FFK_API FFKStreamInformation *ffk_stream_information_list_get(const FFKStreamInformationList *list, size_t index);
+FFK_API void ffk_stream_information_list_free(FFKStreamInformationList *list);
 
 FFK_API size_t ffk_chapter_list_size(const FFKChapterList *list);
 /** @return element to release with ffk_chapter_free(), or NULL when out of range */
-FFK_API FFKChapter *ffk_chapter_list_get(const FFKChapterList *list,
-                                         size_t index);
+FFK_API FFKChapter *ffk_chapter_list_get(const FFKChapterList *list, size_t index);
 FFK_API void ffk_chapter_list_free(FFKChapterList *list);
 
 /* ------------------------------------------------------------------------ */
 /* Log                                                                       */
 /* ------------------------------------------------------------------------ */
 
-FFK_API FFKLog *ffk_log_create(long session_id, int level,
-                               const char *message);
+FFK_API FFKLog *ffk_log_create(long session_id, int level, const char *message);
 FFK_API void ffk_log_free(FFKLog *log);
 FFK_API long ffk_log_get_session_id(const FFKLog *log);
 FFK_API int ffk_log_get_level(const FFKLog *log);
@@ -274,17 +276,12 @@ FFK_API char *ffk_log_get_message(const FFKLog *log);
 /* Statistics                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFK_API FFKStatistics *
-ffk_statistics_create(long session_id, int video_frame_number, float video_fps,
-                      float video_quality, int64_t size, double time,
-                      double bitrate, double speed);
+FFK_API FFKStatistics *ffk_statistics_create(long session_id, int video_frame_number, float video_fps, float video_quality, int64_t size, double time, double bitrate, double speed);
 FFK_API void ffk_statistics_free(FFKStatistics *statistics);
 FFK_API long ffk_statistics_get_session_id(const FFKStatistics *statistics);
-FFK_API int
-ffk_statistics_get_video_frame_number(const FFKStatistics *statistics);
+FFK_API int ffk_statistics_get_video_frame_number(const FFKStatistics *statistics);
 FFK_API float ffk_statistics_get_video_fps(const FFKStatistics *statistics);
-FFK_API float
-ffk_statistics_get_video_quality(const FFKStatistics *statistics);
+FFK_API float ffk_statistics_get_video_quality(const FFKStatistics *statistics);
 FFK_API int64_t ffk_statistics_get_size(const FFKStatistics *statistics);
 FFK_API double ffk_statistics_get_time(const FFKStatistics *statistics);
 FFK_API double ffk_statistics_get_bitrate(const FFKStatistics *statistics);
@@ -300,10 +297,7 @@ FFK_API double ffk_statistics_get_speed(const FFKStatistics *statistics);
  * @param log_redirection_strategy strategy as int, or -1 to use the value
  * configured with ffk_config_set_log_redirection_strategy()
  */
-FFK_API FFKSession *ffk_abstract_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int log_redirection_strategy);
+FFK_API FFKSession *ffk_abstract_session_create(const char *const *arguments, size_t argument_count, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int log_redirection_strategy);
 
 /**
  * Creates an FFmpeg session.
@@ -311,25 +305,12 @@ FFK_API FFKSession *ffk_abstract_session_create(
  * @param log_redirection_strategy strategy as int, or -1 to use the value
  * configured with ffk_config_set_log_redirection_strategy()
  */
-FFK_API FFKSession *ffk_ffmpeg_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
-    void *statistics_user_data, ffk_free_cb statistics_free,
-    int log_redirection_strategy);
+FFK_API FFKSession *ffk_ffmpeg_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
+                                              void *statistics_user_data, ffk_free_cb statistics_free, int log_redirection_strategy);
 
-FFK_API FFKSession *ffk_ffprobe_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, int log_redirection_strategy);
+FFK_API FFKSession *ffk_ffprobe_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int log_redirection_strategy);
 
-FFK_API FFKSession *ffk_media_information_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free);
+FFK_API FFKSession *ffk_media_information_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free);
 
 /** Releases a session handle. The session itself stays in the history. */
 FFK_API void ffk_session_free(FFKSession *session);
@@ -347,14 +328,10 @@ FFK_API int64_t ffk_session_get_end_time(const FFKSession *session);
 FFK_API long ffk_session_get_duration(const FFKSession *session);
 FFK_API FFKStringList *ffk_session_get_arguments(const FFKSession *session);
 FFK_API char *ffk_session_get_command(const FFKSession *session);
-FFK_API FFKLogList *
-ffk_session_get_all_logs_with_timeout(const FFKSession *session,
-                                      int wait_timeout);
+FFK_API FFKLogList *ffk_session_get_all_logs_with_timeout(const FFKSession *session, int wait_timeout);
 FFK_API FFKLogList *ffk_session_get_all_logs(const FFKSession *session);
 FFK_API FFKLogList *ffk_session_get_logs(const FFKSession *session);
-FFK_API char *
-ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session,
-                                                int wait_timeout);
+FFK_API char *ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session, int wait_timeout);
 FFK_API char *ffk_session_get_all_logs_as_string(const FFKSession *session);
 FFK_API char *ffk_session_get_logs_as_string(const FFKSession *session);
 FFK_API char *ffk_session_get_output(const FFKSession *session);
@@ -370,15 +347,10 @@ FFK_API int ffk_session_get_return_code(const FFKSession *session, int *value);
  * platform specific.
  */
 FFK_API char *ffk_session_get_fail_stack_trace(const FFKSession *session);
-FFK_API int
-ffk_session_get_log_redirection_strategy(const FFKSession *session);
-FFK_API int ffk_session_there_are_asynchronous_messages_in_transmit(
-    const FFKSession *session);
-FFK_API void
-ffk_session_wait_for_asynchronous_messages_in_transmit(const FFKSession *session,
-                                                       int timeout);
-FFK_API void ffk_session_add_log(FFKSession *session, long log_session_id,
-                                 int level, const char *message);
+FFK_API int ffk_session_get_log_redirection_strategy(const FFKSession *session);
+FFK_API int ffk_session_there_are_asynchronous_messages_in_transmit(const FFKSession *session);
+FFK_API void ffk_session_wait_for_asynchronous_messages_in_transmit(const FFKSession *session, int timeout);
+FFK_API void ffk_session_add_log(FFKSession *session, long log_session_id, int level, const char *message);
 FFK_API void ffk_session_start_running(FFKSession *session);
 FFK_API void ffk_session_complete(FFKSession *session, int return_code);
 /**
@@ -403,40 +375,25 @@ FFK_API void ffk_session_cancel(FFKSession *session);
  *
  * @return 1 when a callback registered through this API is present, 0 otherwise
  */
-FFK_API int ffk_session_get_log_callback(const FFKSession *session,
-                                         ffk_log_cb *callback,
-                                         void **user_data);
+FFK_API int ffk_session_get_log_callback(const FFKSession *session, ffk_log_cb *callback, void **user_data);
 
 /** Same rules as ffk_session_get_log_callback(). */
-FFK_API int ffk_session_get_complete_callback(const FFKSession *session,
-                                              ffk_session_cb *callback,
-                                              void **user_data);
+FFK_API int ffk_session_get_complete_callback(const FFKSession *session, ffk_session_cb *callback, void **user_data);
 
 /* ---- FFmpeg session specific -------------------------------------------- */
 
-FFK_API FFKStatisticsList *
-ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session,
-                                                   int wait_timeout);
-FFK_API FFKStatisticsList *
-ffk_ffmpeg_session_get_all_statistics(FFKSession *session);
-FFK_API FFKStatisticsList *
-ffk_ffmpeg_session_get_statistics(FFKSession *session);
-FFK_API FFKStatistics *
-ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session);
-FFK_API void ffk_ffmpeg_session_add_statistics(FFKSession *session,
-                                               const FFKStatistics *statistics);
+FFK_API FFKStatisticsList *ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session, int wait_timeout);
+FFK_API FFKStatisticsList *ffk_ffmpeg_session_get_all_statistics(FFKSession *session);
+FFK_API FFKStatisticsList *ffk_ffmpeg_session_get_statistics(FFKSession *session);
+FFK_API FFKStatistics *ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session);
+FFK_API void ffk_ffmpeg_session_add_statistics(FFKSession *session, const FFKStatistics *statistics);
 /** Same rules as ffk_session_get_log_callback(). */
-FFK_API int
-ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session,
-                                           ffk_statistics_cb *callback,
-                                           void **user_data);
+FFK_API int ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session, ffk_statistics_cb *callback, void **user_data);
 
 /* ---- media information session specific --------------------------------- */
 
-FFK_API FFKMediaInformation *
-ffk_media_information_session_get_media_information(FFKSession *session);
-FFK_API void ffk_media_information_session_set_media_information(
-    FFKSession *session, FFKMediaInformation *media_information);
+FFK_API FFKMediaInformation *ffk_media_information_session_get_media_information(FFKSession *session);
+FFK_API void ffk_media_information_session_set_media_information(FFKSession *session, FFKMediaInformation *media_information);
 
 /* ------------------------------------------------------------------------ */
 /* Chapter                                                                   */
@@ -453,13 +410,10 @@ FFK_API void ffk_chapter_free(FFKChapter *chapter);
  * @return 1 when the property is a JSON integer that fits in 64 bits, 0
  * otherwise
  */
-FFK_API int ffk_chapter_get_number_property(FFKChapter *chapter,
-                                            const char *key, int64_t *value);
-FFK_API char *ffk_chapter_get_string_property(FFKChapter *chapter,
-                                              const char *key);
+FFK_API int ffk_chapter_get_number_property(FFKChapter *chapter, const char *key, int64_t *value);
+FFK_API char *ffk_chapter_get_string_property(FFKChapter *chapter, const char *key);
 /** @return the property as JSON text, or NULL when it does not exist */
-FFK_API char *ffk_chapter_get_property_json(FFKChapter *chapter,
-                                            const char *key);
+FFK_API char *ffk_chapter_get_property_json(FFKChapter *chapter, const char *key);
 /** @return every property as JSON text, or NULL */
 FFK_API char *ffk_chapter_get_all_properties_json(FFKChapter *chapter);
 
@@ -471,26 +425,19 @@ FFK_API char *ffk_chapter_get_all_properties_json(FFKChapter *chapter);
  * @param value_json stream properties as a JSON object; anything else is
  * treated as no properties
  */
-FFK_API FFKStreamInformation *
-ffk_stream_information_create(const char *value_json);
+FFK_API FFKStreamInformation *ffk_stream_information_create(const char *value_json);
 FFK_API void ffk_stream_information_free(FFKStreamInformation *stream);
 /**
  * @param value receives the property, and is left alone when there is none
  * @return 1 when the property is a JSON integer that fits in 64 bits, 0
  * otherwise
  */
-FFK_API int ffk_stream_information_get_number_property(
-    FFKStreamInformation *stream, const char *key, int64_t *value);
-FFK_API char *
-ffk_stream_information_get_string_property(FFKStreamInformation *stream,
-                                           const char *key);
+FFK_API int ffk_stream_information_get_number_property(FFKStreamInformation *stream, const char *key, int64_t *value);
+FFK_API char *ffk_stream_information_get_string_property(FFKStreamInformation *stream, const char *key);
 /** @return the property as JSON text, or NULL when it does not exist */
-FFK_API char *
-ffk_stream_information_get_property_json(FFKStreamInformation *stream,
-                                         const char *key);
+FFK_API char *ffk_stream_information_get_property_json(FFKStreamInformation *stream, const char *key);
 /** @return every property as JSON text, or NULL */
-FFK_API char *
-ffk_stream_information_get_all_properties_json(FFKStreamInformation *stream);
+FFK_API char *ffk_stream_information_get_all_properties_json(FFKStreamInformation *stream);
 
 /* ------------------------------------------------------------------------ */
 /* Media information                                                         */
@@ -503,57 +450,38 @@ ffk_stream_information_get_all_properties_json(FFKStreamInformation *stream);
  * @param stream_json per stream properties as JSON text
  * @param chapter_json per chapter properties as JSON text
  */
-FFK_API FFKMediaInformation *
-ffk_media_information_create(const char *value_json,
-                             const char *const *stream_json,
-                             size_t stream_count,
-                             const char *const *chapter_json,
-                             size_t chapter_count);
+FFK_API FFKMediaInformation *ffk_media_information_create(const char *value_json, const char *const *stream_json, size_t stream_count, const char *const *chapter_json, size_t chapter_count);
 FFK_API void ffk_media_information_free(FFKMediaInformation *media_information);
-FFK_API FFKStreamInformationList *
-ffk_media_information_get_streams(FFKMediaInformation *media_information);
-FFK_API FFKChapterList *
-ffk_media_information_get_chapters(FFKMediaInformation *media_information);
+FFK_API FFKStreamInformationList *ffk_media_information_get_streams(FFKMediaInformation *media_information);
+FFK_API FFKChapterList *ffk_media_information_get_chapters(FFKMediaInformation *media_information);
 /**
  * @param value receives the property, and is left alone when there is none
  * @return 1 when the property is a JSON integer that fits in 64 bits, 0
  * otherwise
  */
-FFK_API int
-ffk_media_information_get_number_property(FFKMediaInformation *media_information,
-                                          const char *key, int64_t *value);
-FFK_API char *
-ffk_media_information_get_string_property(FFKMediaInformation *media_information,
-                                          const char *key);
+FFK_API int ffk_media_information_get_number_property(FFKMediaInformation *media_information, const char *key, int64_t *value);
+FFK_API char *ffk_media_information_get_string_property(FFKMediaInformation *media_information, const char *key);
 /** @return the property as JSON text, or NULL when it does not exist */
-FFK_API char *
-ffk_media_information_get_property_json(FFKMediaInformation *media_information,
-                                        const char *key);
+FFK_API char *ffk_media_information_get_property_json(FFKMediaInformation *media_information, const char *key);
 /**
  * @param value receives the property, and is left alone when there is none
  * @return 1 when the format property is a JSON integer that fits in 64 bits, 0
  * otherwise
  */
-FFK_API int ffk_media_information_get_number_format_property(
-    FFKMediaInformation *media_information, const char *key, int64_t *value);
-FFK_API char *ffk_media_information_get_string_format_property(
-    FFKMediaInformation *media_information, const char *key);
+FFK_API int ffk_media_information_get_number_format_property(FFKMediaInformation *media_information, const char *key, int64_t *value);
+FFK_API char *ffk_media_information_get_string_format_property(FFKMediaInformation *media_information, const char *key);
 /** @return the format property as JSON text, or NULL when it does not exist */
-FFK_API char *ffk_media_information_get_format_property_json(
-    FFKMediaInformation *media_information, const char *key);
+FFK_API char *ffk_media_information_get_format_property_json(FFKMediaInformation *media_information, const char *key);
 /** @return the format properties as JSON text, or NULL */
-FFK_API char *ffk_media_information_get_format_properties_json(
-    FFKMediaInformation *media_information);
+FFK_API char *ffk_media_information_get_format_properties_json(FFKMediaInformation *media_information);
 /** @return every property as JSON text, or NULL */
-FFK_API char *ffk_media_information_get_all_properties_json(
-    FFKMediaInformation *media_information);
+FFK_API char *ffk_media_information_get_all_properties_json(FFKMediaInformation *media_information);
 
 /**
  * @return the parsed ffprobe output, or NULL when it cannot be parsed. Nothing
  * is printed and the error slot is left alone.
  */
-FFK_API FFKMediaInformation *
-ffk_media_information_parser_from(const char *ffprobe_json_output);
+FFK_API FFKMediaInformation *ffk_media_information_parser_from(const char *ffprobe_json_output);
 /**
  * Like ffk_media_information_parser_from(), but a parse failure also fills the
  * error slot with "Media information could not be parsed: " followed by the
@@ -561,29 +489,18 @@ ffk_media_information_parser_from(const char *ffprobe_json_output);
  * is not an object."; the wording of other reasons is the parser's own and
  * platform specific.
  */
-FFK_API FFKMediaInformation *
-ffk_media_information_parser_from_with_error(const char *ffprobe_json_output);
+FFK_API FFKMediaInformation *ffk_media_information_parser_from_with_error(const char *ffprobe_json_output);
 
 /* ------------------------------------------------------------------------ */
 /* FFmpegKit                                                                 */
 /* ------------------------------------------------------------------------ */
 
-FFK_API FFKSession *
-ffk_ffmpegkit_execute_with_arguments(const char *const *arguments,
-                                     size_t argument_count);
-FFK_API FFKSession *ffk_ffmpegkit_execute_with_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
-    void *statistics_user_data, ffk_free_cb statistics_free);
+FFK_API FFKSession *ffk_ffmpegkit_execute_with_arguments(const char *const *arguments, size_t argument_count);
+FFK_API FFKSession *ffk_ffmpegkit_execute_with_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
+                                                               ffk_statistics_cb statistics_callback, void *statistics_user_data, ffk_free_cb statistics_free);
 FFK_API FFKSession *ffk_ffmpegkit_execute(const char *command);
-FFK_API FFKSession *ffk_ffmpegkit_execute_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    ffk_statistics_cb statistics_callback, void *statistics_user_data,
-    ffk_free_cb statistics_free);
+FFK_API FFKSession *ffk_ffmpegkit_execute_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, ffk_statistics_cb statistics_callback, void *statistics_user_data,
+                                                ffk_free_cb statistics_free);
 FFK_API void ffk_ffmpegkit_cancel(void);
 FFK_API void ffk_ffmpegkit_cancel_session(long session_id);
 FFK_API FFKSessionList *ffk_ffmpegkit_list_sessions(void);
@@ -592,58 +509,34 @@ FFK_API FFKSessionList *ffk_ffmpegkit_list_sessions(void);
 /* FFprobeKit                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFK_API FFKSession *
-ffk_ffprobekit_execute_with_arguments(const char *const *arguments,
-                                      size_t argument_count);
-FFK_API FFKSession *ffk_ffprobekit_execute_with_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free);
+FFK_API FFKSession *ffk_ffprobekit_execute_with_arguments(const char *const *arguments, size_t argument_count);
+FFK_API FFKSession *ffk_ffprobekit_execute_with_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free);
 FFK_API FFKSession *ffk_ffprobekit_execute(const char *command);
-FFK_API FFKSession *ffk_ffprobekit_execute_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free);
-FFK_API FFKSession *
-ffk_ffprobekit_get_media_information(const char *path, int wait_timeout);
-FFK_API FFKSession *ffk_ffprobekit_get_media_information_async(
-    const char *path, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int wait_timeout);
-FFK_API FFKSession *
-ffk_ffprobekit_get_media_information_from_command(const char *command);
+FFK_API FFKSession *ffk_ffprobekit_execute_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information(const char *path, int wait_timeout);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information_async(const char *path, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int wait_timeout);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command(const char *command);
 
 /**
  * Starts asynchronous media information extraction with a command that emits
  * JSON. The returned session handle is owned by the caller; execution may still
  * be running.
  */
-FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int wait_timeout);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int wait_timeout);
 /**
  * Extracts media information synchronously using arguments that emit JSON.
  * Arguments are copied without command parsing. The caller owns the returned
  * handle.
  */
-FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(
-    const char *const *arguments, size_t argument_count, int wait_timeout);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(const char *const *arguments, size_t argument_count, int wait_timeout);
 /**
  * Starts asynchronous media information extraction using arguments that emit
  * JSON. Arguments are copied without command parsing. The caller owns the
  * returned handle. Callback cookies follow the ownership rules documented at
  * the top of this header.
  */
-FFK_API FFKSession *
-ffk_ffprobekit_get_media_information_from_command_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, int wait_timeout);
+FFK_API FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
+                                                                                      int wait_timeout);
 
 FFK_API FFKSessionList *ffk_ffprobekit_list_ffprobe_sessions(void);
 FFK_API FFKSessionList *ffk_ffprobekit_list_media_information_sessions(void);
@@ -654,16 +547,42 @@ FFK_API FFKSessionList *ffk_ffprobekit_list_media_information_sessions(void);
 
 FFK_API void ffk_config_enable_redirection(void);
 FFK_API void ffk_config_disable_redirection(void);
+/**
+ * Permanently shuts down the library: requests FFmpeg cancellation, closes
+ * streams, disables redirection and drops pending messages and delete
+ * notifications. New executions fail without completion callbacks. Running
+ * ffprobe and media information executions cannot be cancelled.
+ *
+ * Within timeout_ms, the first call allows up to two seconds of completion
+ * callback grace, then up to one second before clearing history. Queued workers
+ * stay on their original threads and fail without execution when served;
+ * callbacks may run there during grace and are dropped afterwards. Admitted callbacks may
+ * continue. After a return of 0, call again to wait longer; retries never restart
+ * grace or callback delivery.
+ *
+ * In-flight results, full output and callbacks are not guaranteed. For
+ * predictable results, cancel and wait for execution and output delivery first.
+ * Even after 1, queued workers and handles may retain sessions and invoke cookie
+ * free functions later; keep cleanup code/state valid until those owners release.
+ * Stop submissions and stream writers first. Do not wait while holding a lock
+ * or thread that active work needs.
+ *
+ * Never call this from DllMain or a DLL static destructor: the loader lock
+ * prevents other library threads from finishing.
+ *
+ * @param timeout_ms total wait budget in milliseconds; 0 does not wait,
+ * a negative value waits indefinitely for counted work and history cleanup
+ * @return 1 when running executions, admitted callbacks, message delivery and
+ * history cleanup have finished; 0 at the deadline or from counted library work
+ * that cannot wait for itself. Queued workers are excluded after grace.
+ */
+FFK_API int ffk_config_shutdown(int timeout_ms);
+/** @return 1 after ffk_config_shutdown() was called, 0 before */
+FFK_API int ffk_config_is_shutdown(void);
 /** @return 0 on success, non-zero on failure, -1 when the path is not valid UTF-8 */
 FFK_API int ffk_config_set_fontconfig_configuration_path(const char *path);
-FFK_API void ffk_config_set_font_directory(const char *font_directory_path,
-                                           const char *const *mapping_keys,
-                                           const char *const *mapping_values,
-                                           size_t mapping_count);
-FFK_API void ffk_config_set_font_directory_list(
-    const char *const *font_directories, size_t font_directory_count,
-    const char *const *mapping_keys, const char *const *mapping_values,
-    size_t mapping_count);
+FFK_API void ffk_config_set_font_directory(const char *font_directory_path, const char *const *mapping_keys, const char *const *mapping_values, size_t mapping_count);
+FFK_API void ffk_config_set_font_directory_list(const char *const *font_directories, size_t font_directory_count, const char *const *mapping_keys, const char *const *mapping_values, size_t mapping_count);
 
 /**
  * Named pipes are not supported on Windows. Always returns NULL.
@@ -678,33 +597,25 @@ FFK_API char *ffk_config_register_new_ffmpeg_pipe(void);
  */
 FFK_API void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path);
 
-FFK_API long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data,
-                                                        size_t size);
-FFK_API long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity,
-                                                         long max_capacity);
+FFK_API long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data, size_t size);
+FFK_API long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity, long max_capacity);
 FFK_API long ffk_config_get_ffmpegkit_buffer_size(long buffer_id);
 /**
  * @param data receives a buffer to release with ffk_bytes_free()
  * @param size receives the buffer size
  * @return 1 when a buffer was returned, 0 otherwise
  */
-FFK_API int ffk_config_get_ffmpegkit_output_buffer(long buffer_id,
-                                                   uint8_t **data,
-                                                   size_t *size);
+FFK_API int ffk_config_get_ffmpegkit_output_buffer(long buffer_id, uint8_t **data, size_t *size);
 FFK_API void ffk_config_unregister_ffmpegkit_buffer(long buffer_id);
 
 FFK_API long ffk_config_register_ffmpegkit_stream(long capacity, int type);
-FFK_API int ffk_config_write_ffmpegkit_stream(long stream_id,
-                                              const uint8_t *data,
-                                              size_t length, int timeout_ms);
+FFK_API int ffk_config_write_ffmpegkit_stream(long stream_id, const uint8_t *data, size_t length, int timeout_ms);
 /**
  * @param data receives a buffer to release with ffk_bytes_free()
  * @param size receives the buffer size
  * @return 1 when a buffer was returned, 0 otherwise
  */
-FFK_API int ffk_config_read_ffmpegkit_stream(long stream_id, int max_bytes,
-                                             int timeout_ms, uint8_t **data,
-                                             size_t *size);
+FFK_API int ffk_config_read_ffmpegkit_stream(long stream_id, int max_bytes, int timeout_ms, uint8_t **data, size_t *size);
 FFK_API void ffk_config_close_ffmpegkit_stream_input(long stream_id);
 FFK_API void ffk_config_unregister_ffmpegkit_stream(long stream_id);
 
@@ -719,50 +630,34 @@ FFK_API void ffk_config_unregister_ffmpegkit_stream(long stream_id);
  * @param extension file extension hint, normalised by the library
  * @return url to release with ffk_string_free()
  */
-FFK_API char *ffk_protocol_build_url(const char *protocol, long id,
-                                     const char *extension);
+FFK_API char *ffk_protocol_build_url(const char *protocol, long id, const char *extension);
 
 FFK_API char *ffk_config_get_ffmpeg_version(void);
 FFK_API char *ffk_config_get_version(void);
 FFK_API int ffk_config_is_lts_build(void);
 FFK_API char *ffk_config_get_build_date(void);
 /** @return 0 on success, non-zero on failure, -1 when a text is not valid UTF-8 */
-FFK_API int ffk_config_set_environment_variable(const char *variable_name,
-                                                const char *variable_value);
+FFK_API int ffk_config_set_environment_variable(const char *variable_name, const char *variable_value);
 FFK_API void ffk_config_ignore_signal(int signal);
 
 FFK_API void ffk_config_ffmpeg_execute(FFKSession *session);
 FFK_API void ffk_config_ffprobe_execute(FFKSession *session);
-FFK_API void ffk_config_get_media_information_execute(FFKSession *session,
-                                                      int wait_timeout);
+FFK_API void ffk_config_get_media_information_execute(FFKSession *session, int wait_timeout);
 FFK_API void ffk_config_async_ffmpeg_execute(FFKSession *session);
 FFK_API void ffk_config_async_ffprobe_execute(FFKSession *session);
-FFK_API void ffk_config_async_get_media_information_execute(FFKSession *session,
-                                                            int wait_timeout);
+FFK_API void ffk_config_async_get_media_information_execute(FFKSession *session, int wait_timeout);
 
-FFK_API void ffk_config_enable_log_callback(ffk_log_cb callback,
-                                            void *user_data,
-                                            ffk_free_cb free_user_data);
-FFK_API void ffk_config_enable_statistics_callback(ffk_statistics_cb callback,
-                                                   void *user_data,
-                                                   ffk_free_cb free_user_data);
-FFK_API void ffk_config_enable_ffmpeg_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
+FFK_API void ffk_config_enable_log_callback(ffk_log_cb callback, void *user_data, ffk_free_cb free_user_data);
+FFK_API void ffk_config_enable_statistics_callback(ffk_statistics_cb callback, void *user_data, ffk_free_cb free_user_data);
+FFK_API void ffk_config_enable_ffmpeg_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
 /** Same rules as ffk_session_get_log_callback(). */
-FFK_API int
-ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback,
-                                                void **user_data);
-FFK_API void ffk_config_enable_ffprobe_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
+FFK_API int ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback, void **user_data);
+FFK_API void ffk_config_enable_ffprobe_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
 /** Same rules as ffk_session_get_log_callback(). */
-FFK_API int
-ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback,
-                                                 void **user_data);
-FFK_API void ffk_config_enable_media_information_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
+FFK_API int ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback, void **user_data);
+FFK_API void ffk_config_enable_media_information_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data);
 /** Same rules as ffk_session_get_log_callback(). */
-FFK_API int ffk_config_get_media_information_session_complete_callback(
-    ffk_session_cb *callback, void **user_data);
+FFK_API int ffk_config_get_media_information_session_complete_callback(ffk_session_cb *callback, void **user_data);
 
 FFK_API int ffk_config_get_log_level(void);
 FFK_API void ffk_config_set_log_level(int level);
@@ -779,10 +674,7 @@ FFK_API void ffk_config_delete_session(long session_id);
  * @return token to pass to ffk_config_remove_session_delete_listener(), or 0
  * when the listener could not be registered
  */
-FFK_API long
-ffk_config_add_session_delete_listener(ffk_session_delete_cb callback,
-                                       void *user_data,
-                                       ffk_free_cb free_user_data);
+FFK_API long ffk_config_add_session_delete_listener(ffk_session_delete_cb callback, void *user_data, ffk_free_cb free_user_data);
 FFK_API void ffk_config_remove_session_delete_listener(long token);
 
 FFK_API FFKSession *ffk_config_get_last_session(void);
@@ -799,8 +691,7 @@ FFK_API void ffk_config_set_log_redirection_strategy(int strategy);
 FFK_API int ffk_config_messages_in_transmit(long session_id);
 FFK_API char *ffk_config_session_state_to_string(int state);
 FFK_API FFKStringList *ffk_config_parse_arguments(const char *command);
-FFK_API char *ffk_config_arguments_to_string(const char *const *arguments,
-                                             size_t argument_count);
+FFK_API char *ffk_config_arguments_to_string(const char *const *arguments, size_t argument_count);
 
 /* ------------------------------------------------------------------------ */
 /* Packages and architecture                                                 */

@@ -58,8 +58,7 @@ class FFprobeKit {
      * @param arguments FFprobe command options/arguments as string array
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    executeWithArguments(const std::list<std::string> &arguments);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> executeWithArguments(const std::list<std::string> &arguments);
 
     /**
      * <p>Starts an asynchronous FFprobe execution with arguments provided.
@@ -73,9 +72,7 @@ class FFprobeKit {
      * has completed
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    executeWithArgumentsAsync(const std::list<std::string> &arguments,
-                              FFprobeSessionCompleteCallback completeCallback);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> executeWithArgumentsAsync(const std::list<std::string> &arguments, FFprobeSessionCompleteCallback completeCallback);
 
     /**
      * <p>Starts an asynchronous FFprobe execution with arguments provided.
@@ -90,10 +87,7 @@ class FFprobeKit {
      * @param logCallback      callback that will receive logs
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    executeWithArgumentsAsync(const std::list<std::string> &arguments,
-                              FFprobeSessionCompleteCallback completeCallback,
-                              ffmpegkit::internal::LogCallback logCallback);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> executeWithArgumentsAsync(const std::list<std::string> &arguments, FFprobeSessionCompleteCallback completeCallback, ffmpegkit::internal::LogCallback logCallback);
 
     /**
      * <p>Synchronously executes FFprobe command provided. Space character is
@@ -103,8 +97,7 @@ class FFprobeKit {
      * @param command FFprobe command
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    execute(const std::string command);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> execute(const std::string command);
 
     /**
      * <p>Starts an asynchronous FFprobe execution for the given command. Space
@@ -120,9 +113,7 @@ class FFprobeKit {
      * has completed
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    executeAsync(const std::string command,
-                 FFprobeSessionCompleteCallback completeCallback);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> executeAsync(const std::string command, FFprobeSessionCompleteCallback completeCallback);
 
     /**
      * <p>Starts an asynchronous FFprobe execution for the given command. Space
@@ -139,10 +130,7 @@ class FFprobeKit {
      * @param logCallback      callback that will receive logs
      * @return FFprobe session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::FFprobeSession>
-    executeAsync(const std::string command,
-                 FFprobeSessionCompleteCallback completeCallback,
-                 ffmpegkit::internal::LogCallback logCallback);
+    static std::shared_ptr<ffmpegkit::internal::FFprobeSession> executeAsync(const std::string command, FFprobeSessionCompleteCallback completeCallback, ffmpegkit::internal::LogCallback logCallback);
 
     /**
      * <p>Extracts media information for the file specified with path.
@@ -150,8 +138,7 @@ class FFprobeKit {
      * @param path path or uri of a media file
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformation(const std::string path);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformation(const std::string path);
 
     /**
      * <p>Extracts media information for the file specified with path.
@@ -161,8 +148,7 @@ class FFprobeKit {
      * transmitted
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformation(const std::string path, const int waitTimeout);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformation(const std::string path, const int waitTimeout);
 
     /**
      * <p>Starts an asynchronous FFprobe execution to extract the media
@@ -178,10 +164,7 @@ class FFprobeKit {
      * has completed
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationAsync(
-        const std::string path,
-        MediaInformationSessionCompleteCallback completeCallback);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationAsync(const std::string path, MediaInformationSessionCompleteCallback completeCallback);
 
     /**
      * <p>Starts an asynchronous FFprobe execution to extract the media
@@ -200,11 +183,7 @@ class FFprobeKit {
      * transmitted
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationAsync(
-        const std::string path,
-        MediaInformationSessionCompleteCallback completeCallback,
-        ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationAsync(const std::string path, MediaInformationSessionCompleteCallback completeCallback, ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
 
     /**
      * <p>Synchronously extracts media information using the command provided.
@@ -213,8 +192,7 @@ class FFprobeKit {
      * in JSON format
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommand(const std::string command);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommand(const std::string command);
 
     /**
      * <p>Synchronously extracts media information using command arguments
@@ -223,9 +201,7 @@ class FFprobeKit {
      * @param arguments FFprobe command arguments that print JSON
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandArguments(
-        const std::list<std::string> &arguments);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandArguments(const std::list<std::string> &arguments);
 
     /**
      * <p>Synchronously extracts media information using command arguments
@@ -236,9 +212,7 @@ class FFprobeKit {
      * transmitted
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandArguments(
-        const std::list<std::string> &arguments, const int waitTimeout);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandArguments(const std::list<std::string> &arguments, const int waitTimeout);
 
     /**
      * <p>Starts asynchronous media information extraction using a custom
@@ -248,10 +222,7 @@ class FFprobeKit {
      * @param completeCallback callback notified when execution has completed
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandAsync(
-        const std::string command,
-        MediaInformationSessionCompleteCallback completeCallback);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandAsync(const std::string command, MediaInformationSessionCompleteCallback completeCallback);
 
     /**
      * <p>Starts asynchronous media information extraction using a custom
@@ -264,11 +235,7 @@ class FFprobeKit {
      * transmitted
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandAsync(
-        const std::string command,
-        MediaInformationSessionCompleteCallback completeCallback,
-        ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandAsync(const std::string command, MediaInformationSessionCompleteCallback completeCallback, ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
 
     /**
      * <p>Starts asynchronous media information extraction using command
@@ -279,10 +246,7 @@ class FFprobeKit {
      * @param completeCallback callback notified when execution has completed
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandArgumentsAsync(
-        const std::list<std::string> &arguments,
-        MediaInformationSessionCompleteCallback completeCallback);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandArgumentsAsync(const std::list<std::string> &arguments, MediaInformationSessionCompleteCallback completeCallback);
 
     /**
      * <p>Starts asynchronous media information extraction using command
@@ -296,29 +260,21 @@ class FFprobeKit {
      * transmitted
      * @return media information session created for this execution
      */
-    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession>
-    getMediaInformationFromCommandArgumentsAsync(
-        const std::list<std::string> &arguments,
-        MediaInformationSessionCompleteCallback completeCallback,
-        ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
+    static std::shared_ptr<ffmpegkit::internal::MediaInformationSession> getMediaInformationFromCommandArgumentsAsync(const std::list<std::string> &arguments, MediaInformationSessionCompleteCallback completeCallback, ffmpegkit::internal::LogCallback logCallback, const int waitTimeout);
 
     /**
      * <p>Lists all FFprobe sessions in the session history.
      *
      * @return all FFprobe sessions in the session history
      */
-    static std::shared_ptr<
-        std::list<std::shared_ptr<ffmpegkit::internal::FFprobeSession>>>
-    listFFprobeSessions();
+    static std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::internal::FFprobeSession>>> listFFprobeSessions();
 
     /**
      * <p>Lists all MediaInformation sessions in the session history.
      *
      * @return all MediaInformation sessions in the session history
      */
-    static std::shared_ptr<
-        std::list<std::shared_ptr<ffmpegkit::internal::MediaInformationSession>>>
-    listMediaInformationSessions();
+    static std::shared_ptr<std::list<std::shared_ptr<ffmpegkit::internal::MediaInformationSession>>> listMediaInformationSessions();
 };
 
 } // namespace internal

@@ -33,8 +33,7 @@ std::string ffmpegkit::internal::Packages::getPackageName() {
     return FFMPEG_KIT_PACKAGE_NAME_STR;
 }
 
-std::shared_ptr<std::set<std::string>>
-ffmpegkit::internal::Packages::getExternalLibraries() {
+std::shared_ptr<std::set<std::string>> ffmpegkit::internal::Packages::getExternalLibraries() {
     const std::set<const char *> supportedExternalLibraries{
         "dav1d",
         "fontconfig",
@@ -79,20 +78,16 @@ ffmpegkit::internal::Packages::getExternalLibraries() {
     std::string buildConfiguration(FFMPEG_CONFIGURATION);
     char libraryName1[50];
     char libraryName2[50];
-    std::shared_ptr<std::set<std::string>> enabledLibrarySet =
-        std::make_shared<std::set<std::string>>();
+    std::shared_ptr<std::set<std::string>> enabledLibrarySet = std::make_shared<std::set<std::string>>();
 
-    std::for_each(
-        supportedExternalLibraries.cbegin(), supportedExternalLibraries.cend(),
-        [&](const char *supportedExternalLibrary) {
-            sprintf(libraryName1, "enable-%s", supportedExternalLibrary);
-            sprintf(libraryName2, "enable-lib%s", supportedExternalLibrary);
+    std::for_each(supportedExternalLibraries.cbegin(), supportedExternalLibraries.cend(), [&](const char *supportedExternalLibrary) {
+        sprintf(libraryName1, "enable-%s", supportedExternalLibrary);
+        sprintf(libraryName2, "enable-lib%s", supportedExternalLibrary);
 
-            if (buildConfiguration.find(libraryName1) != std::string::npos ||
-                buildConfiguration.find(libraryName2) != std::string::npos) {
-                enabledLibrarySet->insert(supportedExternalLibrary);
-            }
-        });
+        if (buildConfiguration.find(libraryName1) != std::string::npos || buildConfiguration.find(libraryName2) != std::string::npos) {
+            enabledLibrarySet->insert(supportedExternalLibrary);
+        }
+    });
 
     return enabledLibrarySet;
 }

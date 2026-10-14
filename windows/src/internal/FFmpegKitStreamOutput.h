@@ -34,11 +34,9 @@ namespace internal {
  */
 class FFmpegKitStreamOutput {
   public:
-    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamOutput>
-    create(const std::string &extension);
+    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamOutput> create(const std::string &extension);
 
-    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamOutput>
-    create(const std::string &extension, const long capacity);
+    static std::shared_ptr<ffmpegkit::internal::FFmpegKitStreamOutput> create(const std::string &extension, const long capacity);
 
     ~FFmpegKitStreamOutput();
 
@@ -46,8 +44,7 @@ class FFmpegKitStreamOutput {
 
     std::shared_ptr<std::vector<uint8_t>> read(const int maxBytes);
 
-    std::shared_ptr<std::vector<uint8_t>> read(const int maxBytes,
-                                               const int timeoutMs);
+    std::shared_ptr<std::vector<uint8_t>> read(const int maxBytes, const int timeoutMs);
 
     void close();
 

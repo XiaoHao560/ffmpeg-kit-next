@@ -191,18 +191,13 @@ class Value {
 
 inline Value::Value() : _type{Type::Null}, _bool{false}, _int{0}, _double{0} {}
 
-inline Value::Value(const bool value)
-    : _type{Type::Bool}, _bool{value}, _int{0}, _double{0} {}
+inline Value::Value(const bool value) : _type{Type::Bool}, _bool{value}, _int{0}, _double{0} {}
 
-inline Value::Value(const int64_t value)
-    : _type{Type::Int}, _bool{false}, _int{value}, _double{0} {}
+inline Value::Value(const int64_t value) : _type{Type::Int}, _bool{false}, _int{value}, _double{0} {}
 
-inline Value::Value(const double value)
-    : _type{Type::Double}, _bool{false}, _int{0}, _double{value} {}
+inline Value::Value(const double value) : _type{Type::Double}, _bool{false}, _int{0}, _double{value} {}
 
-inline Value::Value(std::string value)
-    : _type{Type::String}, _bool{false}, _int{0}, _double{0},
-      _string{std::move(value)} {}
+inline Value::Value(std::string value) : _type{Type::String}, _bool{false}, _int{0}, _double{0}, _string{std::move(value)} {}
 
 inline Value Value::makeArray() {
     Value value;
@@ -356,8 +351,7 @@ inline void serializeValue(const Value &value, std::string &out) {
         break;
     case Value::Type::Int: {
         char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "%lld",
-                      static_cast<long long>(*value.getInt()));
+        std::snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(*value.getInt()));
         out += buffer;
         break;
     }
@@ -468,8 +462,7 @@ class Parser {
     /** Moves past one or more decimal digits; false when there is none. */
     bool acceptDigits() {
         const size_t start = _position;
-        while (_position < _text.size() && _text[_position] >= '0' &&
-               _text[_position] <= '9') {
+        while (_position < _text.size() && _text[_position] >= '0' && _text[_position] <= '9') {
             _position++;
         }
         return _position > start;
@@ -572,9 +565,7 @@ class Parser {
                 if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
                     // A high surrogate is only valid when its low surrogate
                     // follows; the pair encodes a single codepoint.
-                    if (_position + 1 >= _text.size() ||
-                        _text[_position] != '\\' ||
-                        _text[_position + 1] != 'u') {
+                    if (_position + 1 >= _text.size() || _text[_position] != '\\' || _text[_position + 1] != 'u') {
                         return false;
                     }
                     _position += 2;
@@ -582,8 +573,7 @@ class Parser {
                     if (!parseHex4(low) || low < 0xdc00 || low > 0xdfff) {
                         return false;
                     }
-                    codepoint =
-                        0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
                 } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
                     // A low surrogate is only valid after a high surrogate
                     return false;
