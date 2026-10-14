@@ -226,4 +226,18 @@ JNIEXPORT void JNICALL
 Java_com_arthenica_ffmpegkit_FFmpegKitConfig_unregisterNativeFFmpegKitStream(
     JNIEnv *env, jclass object, jlong id);
 
+/*
+ * Class:     com_arthenica_ffmpegkit_FFmpegKitConfig
+ * Method:    nativeShutdown
+ * Signature: ()V
+ */
+JNIEXPORT void JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeShutdown(JNIEnv *env, jclass object);
+
+/*
+ * Class:     com_arthenica_ffmpegkit_FFmpegKitConfig
+ * Method:    nativeAwaitDeliveryLoops
+ * Signature: (J)Z
+ */
+JNIEXPORT jboolean JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeAwaitDeliveryLoops(JNIEnv *env, jclass object, jlong timeoutMs);
+
 #endif /* FFMPEG_KIT_H */

@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "config.h"
 #include "ffmpegkit.h"
@@ -89,6 +90,23 @@ static atomic_int redirectionGenerationId;
  * created.
  */
 static pthread_mutex_t redirectionMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Set by shutdown and never cleared. A session that registers after the
+ * cancel-all scan cancels itself, redirection cannot be enabled again and new
+ * log and statistics messages are dropped.
+ */
+static atomic_int shutdownRequested;
+
+/**
+ * Counts the delivery loops. A loop is counted before its thread is created and
+ * stops being counted when its thread leaves, so Kotlin can wait until none runs.
+ * After shutdown the last one to leave discards the undelivered messages.
+ */
+static int activeDeliveryLoops = 0;
+static int queuedMessagesDiscarded = 0;
+static pthread_mutex_t deliveryMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t deliveryCondition;
 
 struct CallbackData *callbackDataHead;
 struct CallbackData *callbackDataTail;
@@ -240,69 +258,36 @@ extern void av_set_ffkitstream_functions(
 #endif
 
 /** Prototypes of native functions defined by Config class. */
-JNINativeMethod configMethods[] = {
-    {"enableNativeRedirection", "()V",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_enableNativeRedirection},
-    {"disableNativeRedirection", "()V",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_disableNativeRedirection},
-    {"setNativeLogLevel", "(I)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_setNativeLogLevel},
-    {"getNativeLogLevel", "()I",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeLogLevel},
-    {"getNativeFFmpegVersion", "()Ljava/lang/String;",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegVersion},
-    {"getNativeVersion", "()Ljava/lang/String;",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeVersion},
-    {"getNativePackageName", "()Ljava/lang/String;",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativePackageName},
-    {"nativeFFmpegExecute", "(J[Ljava/lang/String;)I",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegExecute},
-    {"nativeFFmpegCancel", "(J)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegCancel},
-    {"nativeFFprobeExecute", "(J[Ljava/lang/String;)I",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFprobeExecute},
-    {"nativeFFprobeGetMediaInformation", "(J[Ljava/lang/String;)[B",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFprobeGetMediaInformation},
-    {"registerNewNativeFFmpegPipe", "(Ljava/lang/String;)I",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNewNativeFFmpegPipe},
-    {"getNativeBuildDate", "()Ljava/lang/String;",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeBuildDate},
-    {"setNativeEnvironmentVariable", "(Ljava/lang/String;Ljava/lang/String;)I",
-     (void *)
-         Java_com_arthenica_ffmpegkit_FFmpegKitConfig_setNativeEnvironmentVariable},
-    {"ignoreNativeSignal", "(I)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_ignoreNativeSignal},
-    {"messagesInTransmit", "(J)I",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_messagesInTransmit},
-    {"registerNativeFFmpegKitInputBuffer", "([B)J",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitInputBuffer},
-    {"registerNativeFFmpegKitInputDirectBuffer", "(Ljava/nio/ByteBuffer;I)J",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitInputDirectBuffer},
-    {"registerNativeFFmpegKitOutputBuffer", "(JJ)J",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitOutputBuffer},
-    {"getNativeFFmpegKitBufferSize", "(J)J",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitBufferSize},
-    {"getNativeFFmpegKitOutputBuffer", "(J)[B",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitOutputBuffer},
-    {"getNativeFFmpegKitOutputBufferDirect", "(J)Ljava/nio/ByteBuffer;",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitOutputBufferDirect},
-    {"unregisterNativeFFmpegKitBuffer", "(J)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_unregisterNativeFFmpegKitBuffer},
-    {"registerNativeFFmpegKitStream", "(JI)J",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitStream},
-    {"nativeFFmpegKitStreamWrite", "(J[BIII)I",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamWrite},
-    {"nativeFFmpegKitStreamRead", "(JII)[B",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamRead},
-    {"nativeFFmpegKitStreamCloseInput", "(J)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamCloseInput},
-    {"unregisterNativeFFmpegKitStream", "(J)V",
-     (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_unregisterNativeFFmpegKitStream}};
+JNINativeMethod configMethods[] = {{"enableNativeRedirection", "()V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_enableNativeRedirection},
+                                   {"disableNativeRedirection", "()V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_disableNativeRedirection},
+                                   {"setNativeLogLevel", "(I)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_setNativeLogLevel},
+                                   {"getNativeLogLevel", "()I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeLogLevel},
+                                   {"getNativeFFmpegVersion", "()Ljava/lang/String;", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegVersion},
+                                   {"getNativeVersion", "()Ljava/lang/String;", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeVersion},
+                                   {"getNativePackageName", "()Ljava/lang/String;", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativePackageName},
+                                   {"nativeFFmpegExecute", "(J[Ljava/lang/String;)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegExecute},
+                                   {"nativeFFmpegCancel", "(J)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegCancel},
+                                   {"nativeFFprobeExecute", "(J[Ljava/lang/String;)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFprobeExecute},
+                                   {"nativeFFprobeGetMediaInformation", "(J[Ljava/lang/String;)[B", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFprobeGetMediaInformation},
+                                   {"registerNewNativeFFmpegPipe", "(Ljava/lang/String;)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNewNativeFFmpegPipe},
+                                   {"getNativeBuildDate", "()Ljava/lang/String;", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeBuildDate},
+                                   {"setNativeEnvironmentVariable", "(Ljava/lang/String;Ljava/lang/String;)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_setNativeEnvironmentVariable},
+                                   {"ignoreNativeSignal", "(I)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_ignoreNativeSignal},
+                                   {"messagesInTransmit", "(J)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_messagesInTransmit},
+                                   {"registerNativeFFmpegKitInputBuffer", "([B)J", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitInputBuffer},
+                                   {"registerNativeFFmpegKitInputDirectBuffer", "(Ljava/nio/ByteBuffer;I)J", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitInputDirectBuffer},
+                                   {"registerNativeFFmpegKitOutputBuffer", "(JJ)J", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitOutputBuffer},
+                                   {"getNativeFFmpegKitBufferSize", "(J)J", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitBufferSize},
+                                   {"getNativeFFmpegKitOutputBuffer", "(J)[B", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitOutputBuffer},
+                                   {"getNativeFFmpegKitOutputBufferDirect", "(J)Ljava/nio/ByteBuffer;", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_getNativeFFmpegKitOutputBufferDirect},
+                                   {"unregisterNativeFFmpegKitBuffer", "(J)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_unregisterNativeFFmpegKitBuffer},
+                                   {"registerNativeFFmpegKitStream", "(JI)J", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_registerNativeFFmpegKitStream},
+                                   {"nativeFFmpegKitStreamWrite", "(J[BIII)I", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamWrite},
+                                   {"nativeFFmpegKitStreamRead", "(JII)[B", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamRead},
+                                   {"nativeFFmpegKitStreamCloseInput", "(J)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegKitStreamCloseInput},
+                                   {"unregisterNativeFFmpegKitStream", "(J)V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_unregisterNativeFFmpegKitStream},
+                                   {"nativeShutdown", "()V", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeShutdown},
+                                   {"nativeAwaitDeliveryLoops", "(J)Z", (void *)Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeAwaitDeliveryLoops}};
 
 /** Forward declaration for function defined in fftools/ffmpeg.c */
 int ffmpeg_execute(int argc, char **argv);
@@ -440,24 +425,31 @@ void monitorNotify() {
 }
 
 /**
- * Adds log data to the end of callback data list.
- *
- * @param level log level
- * @param data log data
+ * Frees a message that will not be delivered.
  */
-void logCallbackDataAdd(int level, AVBPrint *data) {
+static void callbackDataFree(struct CallbackData *callbackData) {
+    if (callbackData->type == LogType) {
+        av_bprint_finalize(&callbackData->logData, NULL);
+    }
+    av_free(callbackData);
+}
 
-    // CREATE DATA STRUCT FIRST
-    struct CallbackData *newData =
-        (struct CallbackData *)av_malloc(sizeof(struct CallbackData));
-    newData->type = LogType;
-    newData->sessionId = globalSessionId;
-    newData->logLevel = level;
-    av_bprint_init(&newData->logData, 0, AV_BPRINT_SIZE_UNLIMITED);
-    av_bprintf(&newData->logData, "%s", data->str);
-    newData->next = NULL;
-
+/**
+ * Adds a message to the end of callback data list and counts it as in transit
+ * for its session. The count is raised before the queue lock is released, so
+ * the discard at shutdown cannot reset it before it is raised. After shutdown
+ * the message is dropped.
+ *
+ * @param newData message to add
+ */
+static void callbackDataAdd(struct CallbackData *newData) {
     mutexLock();
+
+    if (atomic_load(&shutdownRequested)) {
+        mutexUnlock();
+        callbackDataFree(newData);
+        return;
+    }
 
     // INSERT IT TO THE END OF QUEUE
     if (callbackDataTail == NULL) {
@@ -476,13 +468,31 @@ void logCallbackDataAdd(int level, AVBPrint *data) {
         callbackDataTail = newData;
     }
 
+    atomic_fetch_add(&sessionInTransitMessageCountMap[newData->sessionId % SESSION_MAP_SIZE], 1);
+
     mutexUnlock();
 
     monitorNotify();
+}
 
-    atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
+/**
+ * Adds log data to the end of callback data list.
+ *
+ * @param level log level
+ * @param data log data
+ */
+void logCallbackDataAdd(int level, AVBPrint *data) {
+
+    // CREATE DATA STRUCT FIRST
+    struct CallbackData *newData = (struct CallbackData *)av_malloc(sizeof(struct CallbackData));
+    newData->type = LogType;
+    newData->sessionId = globalSessionId;
+    newData->logLevel = level;
+    av_bprint_init(&newData->logData, 0, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprintf(&newData->logData, "%s", data->str);
+    newData->next = NULL;
+
+    callbackDataAdd(newData);
 }
 
 /**
@@ -507,32 +517,7 @@ void statisticsCallbackDataAdd(int frameNumber, float fps, float quality,
 
     newData->next = NULL;
 
-    mutexLock();
-
-    // INSERT IT TO THE END OF QUEUE
-    if (callbackDataTail == NULL) {
-        callbackDataTail = newData;
-
-        if (callbackDataHead != NULL) {
-            LOGE("Dangling callback data head detected. This can cause memory "
-                 "leak.");
-        } else {
-            callbackDataHead = newData;
-        }
-    } else {
-        struct CallbackData *oldTail = callbackDataTail;
-        oldTail->next = newData;
-
-        callbackDataTail = newData;
-    }
-
-    mutexUnlock();
-
-    monitorNotify();
-
-    atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
+    callbackDataAdd(newData);
 }
 
 /**
@@ -631,6 +616,39 @@ int cancelRequested(long id) {
  */
 void resetMessagesInTransmit(long id) {
     atomic_store(&sessionInTransitMessageCountMap[id % SESSION_MAP_SIZE], 0);
+}
+
+/**
+ * Drops the messages waiting for delivery and resets the in-transit counts,
+ * once, after shutdown, when no delivery thread is left that could be between
+ * taking a message and lowering its count. Called by shutdown and by every
+ * delivery thread on its way out (threadExited 1). A leaving thread stops being
+ * counted here, together with the discard, so Kotlin waiting for the delivery
+ * loops finds the queue already empty. Never calls into Java.
+ */
+static void discardQueuedMessagesWhenIdle(int threadExited) {
+    mutexLock();
+    pthread_mutex_lock(&deliveryMutex);
+    if (threadExited) {
+        activeDeliveryLoops--;
+    }
+    if (atomic_load(&shutdownRequested) && activeDeliveryLoops == 0 && !queuedMessagesDiscarded) {
+        queuedMessagesDiscarded = 1;
+        struct CallbackData *callbackData = callbackDataHead;
+        while (callbackData != NULL) {
+            struct CallbackData *next = callbackData->next;
+            callbackDataFree(callbackData);
+            callbackData = next;
+        }
+        callbackDataHead = NULL;
+        callbackDataTail = NULL;
+        for (int i = 0; i < SESSION_MAP_SIZE; i++) {
+            atomic_store(&sessionInTransitMessageCountMap[i], 0);
+        }
+    }
+    pthread_cond_broadcast(&deliveryCondition);
+    pthread_mutex_unlock(&deliveryMutex);
+    mutexUnlock();
 }
 
 /*
@@ -767,6 +785,7 @@ void *callbackThreadFunction(void *pointer) {
         if (getEnvRc != JNI_EDETACHED) {
             LOGE("Callback thread failed to GetEnv for class %s with rc %d.\n",
                  configClassName, getEnvRc);
+            discardQueuedMessagesWhenIdle(1);
             return NULL;
         }
 
@@ -774,6 +793,7 @@ void *callbackThreadFunction(void *pointer) {
             LOGE(
                 "Callback thread failed to AttachCurrentThread for class %s.\n",
                 configClassName);
+            discardQueuedMessagesWhenIdle(1);
             return NULL;
         }
     }
@@ -835,6 +855,10 @@ void *callbackThreadFunction(void *pointer) {
     (*globalVm)->DetachCurrentThread(globalVm);
 
     LOGD("Async callback block stopped.\n");
+
+    // THE THREAD STOPS BEING COUNTED; AFTER SHUTDOWN THE LAST ONE DROPS WHAT IS
+    // LEFT IN THE QUEUE
+    discardQueuedMessagesWhenIdle(1);
 
     return NULL;
 }
@@ -1451,12 +1475,32 @@ static int ffkit_stream_close(void *opaque) {
 }
 
 /**
- * Used by JNI methods to enable redirection.
+ * Closes every registered stream and wakes its blocked readers and writers.
+ * Output streams are also closed for writing, so their readers drain the
+ * buffered data and then reach end of stream. Writes to input streams fail.
+ */
+static void ffkit_stream_close_all(void) {
+    pthread_mutex_lock(&ffkitStreamRegistryMutex);
+    for (FFKitStreamResource *resource = ffkitStreamResources; resource != NULL; resource = resource->next) {
+        pthread_mutex_lock(&resource->mutex);
+        resource->closed = 1;
+        if (resource->type == FFKIT_RESOURCE_OUTPUT) {
+            resource->writeClosed = 1;
+        }
+        pthread_cond_broadcast(&resource->canRead);
+        pthread_cond_broadcast(&resource->canWrite);
+        pthread_mutex_unlock(&resource->mutex);
+    }
+    pthread_mutex_unlock(&ffkitStreamRegistryMutex);
+}
+
+/**
+ * Used by JNI methods to enable redirection. Does nothing after shutdown.
  */
 static void enableNativeRedirection() {
     pthread_mutex_lock(&redirectionMutex);
 
-    if (redirectionEnabled != 0) {
+    if (redirectionEnabled != 0 || atomic_load(&shutdownRequested)) {
         pthread_mutex_unlock(&redirectionMutex);
         return;
     }
@@ -1465,6 +1509,11 @@ static void enableNativeRedirection() {
     // THE LOOP OF AN EARLIER REDIRECTION, IF IT IS STILL ON ITS WAY OUT, ENDS
     // INSTEAD OF RUNNING NEXT TO THE NEW ONE
     const int generationId = atomic_fetch_add(&redirectionGenerationId, 1) + 1;
+
+    // THE THREAD IS COUNTED BEFORE IT STARTS, SO SHUTDOWN WAITS FOR IT
+    pthread_mutex_lock(&deliveryMutex);
+    activeDeliveryLoops++;
+    pthread_mutex_unlock(&deliveryMutex);
 
     int rc = pthread_create(&callbackThread, 0, callbackThreadFunction,
                             (void *)(intptr_t)generationId);
@@ -1475,6 +1524,10 @@ static void enableNativeRedirection() {
         // OTHERWISE disableNativeRedirection() WOULD DETACH A THREAD THAT DOES
         // NOT EXIST
         redirectionEnabled = 0;
+        pthread_mutex_lock(&deliveryMutex);
+        activeDeliveryLoops--;
+        pthread_cond_broadcast(&deliveryCondition);
+        pthread_mutex_unlock(&deliveryMutex);
         pthread_mutex_unlock(&redirectionMutex);
         return;
     }
@@ -1483,6 +1536,29 @@ static void enableNativeRedirection() {
     set_report_callback(ffmpegkit_statistics_callback_function);
 
     pthread_mutex_unlock(&redirectionMutex);
+}
+
+/**
+ * Used by JNI methods to disable redirection. The loop ends by itself.
+ */
+static void disableNativeRedirection() {
+    pthread_mutex_lock(&redirectionMutex);
+
+    if (redirectionEnabled != 1) {
+        pthread_mutex_unlock(&redirectionMutex);
+        return;
+    }
+    redirectionEnabled = 0;
+
+    // THE LOOP ENDS BY ITSELF, SO ITS RESOURCES MUST BE RELEASED WITHOUT A JOIN
+    pthread_detach(callbackThread);
+
+    av_log_set_callback(ffmpegkit_log_callback_default);
+    set_report_callback(NULL);
+
+    pthread_mutex_unlock(&redirectionMutex);
+
+    monitorNotify();
 }
 
 /**
@@ -1572,6 +1648,12 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     mutexInit();
     monitorInit();
 
+    pthread_condattr_t deliveryAttributes;
+    pthread_condattr_init(&deliveryAttributes);
+    pthread_condattr_setclock(&deliveryAttributes, CLOCK_MONOTONIC);
+    pthread_cond_init(&deliveryCondition, &deliveryAttributes);
+    pthread_condattr_destroy(&deliveryAttributes);
+
     redirectionEnabled = 0;
 
 #ifdef USES_FFMPEG_KIT_PROTOCOLS
@@ -1634,27 +1716,66 @@ Java_com_arthenica_ffmpegkit_FFmpegKitConfig_enableNativeRedirection(
  * @param env pointer to native method interface
  * @param object reference to the class on which this method is invoked
  */
-JNIEXPORT void JNICALL
-Java_com_arthenica_ffmpegkit_FFmpegKitConfig_disableNativeRedirection(
-    JNIEnv *env, jclass object) {
+JNIEXPORT void JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_disableNativeRedirection(JNIEnv *env, jclass object) { disableNativeRedirection(); }
 
+/**
+ * Performs the native part of the first shutdown call: drops new messages and
+ * keeps redirection off for good, requests cancellation of running FFmpeg
+ * sessions, closes every stream, disables redirection and discards the
+ * undelivered messages once no delivery loop runs. Never calls into Java.
+ *
+ * @param env pointer to native method interface
+ * @param object reference to the class on which this method is invoked
+ */
+JNIEXPORT void JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeShutdown(JNIEnv *env, jclass object) {
     pthread_mutex_lock(&redirectionMutex);
-
-    if (redirectionEnabled != 1) {
-        pthread_mutex_unlock(&redirectionMutex);
-        return;
-    }
-    redirectionEnabled = 0;
-
-    // THE LOOP ENDS BY ITSELF, SO ITS RESOURCES MUST BE RELEASED WITHOUT A JOIN
-    pthread_detach(callbackThread);
-
-    av_log_set_callback(ffmpegkit_log_callback_default);
-    set_report_callback(NULL);
-
+    mutexLock();
+    atomic_store(&shutdownRequested, 1);
+    mutexUnlock();
     pthread_mutex_unlock(&redirectionMutex);
 
-    monitorNotify();
+    // A SESSION THAT REGISTERS AFTER THIS SCAN CANCELS ITSELF
+    cancelAllSessions();
+    ffkit_stream_close_all();
+    disableNativeRedirection();
+    discardQueuedMessagesWhenIdle(0);
+}
+
+/**
+ * Waits until no delivery loop runs. Holds no lock that a delivery loop needs
+ * while it calls into Java.
+ *
+ * @param env pointer to native method interface
+ * @param object reference to the class on which this method is invoked
+ * @param timeoutMs maximum wait in milliseconds; zero only checks, a negative
+ * value waits without a limit
+ * @return true when no delivery loop runs
+ */
+JNIEXPORT jboolean JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeAwaitDeliveryLoops(JNIEnv *env, jclass object, jlong timeoutMs) {
+    struct timespec deadline;
+
+    if (timeoutMs > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += (time_t)(timeoutMs / 1000);
+        deadline.tv_nsec += (long)(timeoutMs % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
+    pthread_mutex_lock(&deliveryMutex);
+    while (activeDeliveryLoops > 0 && timeoutMs != 0) {
+        if (timeoutMs < 0) {
+            pthread_cond_wait(&deliveryCondition, &deliveryMutex);
+        } else if (pthread_cond_timedwait(&deliveryCondition, &deliveryMutex, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    const int idle = activeDeliveryLoops == 0;
+    pthread_mutex_unlock(&deliveryMutex);
+
+    return idle ? JNI_TRUE : JNI_FALSE;
 }
 
 /**
@@ -1755,6 +1876,12 @@ Java_com_arthenica_ffmpegkit_FFmpegKitConfig_nativeFFmpegExecute(
     // REGISTER THE ID BEFORE STARTING THE SESSION
     globalSessionId = (long)id;
     addSession((long)id);
+
+    // A SHUTDOWN THAT CANCELLED ALL SESSIONS JUST BEFORE THIS ONE REGISTERED
+    // STILL STOPS IT
+    if (atomic_load(&shutdownRequested)) {
+        cancelSession((long)id);
+    }
 
     resetMessagesInTransmit(globalSessionId);
 

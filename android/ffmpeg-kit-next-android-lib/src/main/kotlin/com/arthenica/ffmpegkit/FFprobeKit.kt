@@ -37,6 +37,10 @@ import java.util.concurrent.ExecutorService
  * <pre>
  * MediaInformationSession session = FFprobeKit.getMediaInformation("file1.mp4");
  * </pre>
+ * <p>After {@link FFmpegKitConfig#shutdown} every execute method fails the session with the reason
+ * "FFmpegKit has been shut down", without native execution or completion callbacks. Tasks submitted
+ * earlier but not run yet fail on their executors; their completion callbacks may run during
+ * shutdown grace and are dropped afterwards.
  */
 open class FFprobeKit private constructor() {
     companion object {
