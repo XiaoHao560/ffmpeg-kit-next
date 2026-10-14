@@ -132,6 +132,8 @@ export interface Spec extends TurboModule {
   streamOutputClose(url: string): Promise<void>;
 
   // Lifecycle
+  shutdown(waitTimeout: number): Promise<boolean>;
+  isShutdown(): Promise<boolean>;
   uninit(): Promise<void>;
 }
 
