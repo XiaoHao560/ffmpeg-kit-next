@@ -1969,7 +1969,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
         final HashMap<String, Object> logMap = new HashMap<>();
         logMap.put(EVENT_LOG_CALLBACK_EVENT, toMap(log));
-        resultHandler.successAsync(sink, logMap);
+        resultHandler.successAsync(sink, logMap, () -> eventSink == sink);
     }
 
     protected void emitStatistics(final Statistics statistics) {
@@ -1980,7 +1980,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
         final HashMap<String, Object> statisticsMap = new HashMap<>();
         statisticsMap.put(EVENT_STATISTICS_CALLBACK_EVENT, toMap(statistics));
-        resultHandler.successAsync(sink, statisticsMap);
+        resultHandler.successAsync(sink, statisticsMap, () -> eventSink == sink);
     }
 
     protected void emitSession(final Session session) {
@@ -1991,7 +1991,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
         final HashMap<String, Object> sessionMap = new HashMap<>();
         sessionMap.put(EVENT_COMPLETE_CALLBACK_EVENT, toMap(session));
-        resultHandler.successAsync(sink, sessionMap);
+        resultHandler.successAsync(sink, sessionMap, () -> eventSink == sink);
     }
 
     protected void emitSessionDeleted(final long sessionId) {
@@ -2005,7 +2005,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
         final HashMap<String, Object> deletedSessionMap = new HashMap<>();
         deletedSessionMap.put(EVENT_SESSION_DELETED_CALLBACK_EVENT, deletedSession);
-        resultHandler.successAsync(sink, deletedSessionMap);
+        resultHandler.successAsync(sink, deletedSessionMap, () -> eventSink == sink);
     }
 
     @Nullable

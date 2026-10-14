@@ -933,8 +933,20 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
     return BytesResult(buffer->toByteArray());
   }
   if (method == "streamInputCloseInput") {
-    state->FindResource<ffmpegkit::FFmpegKitStreamInput>(args)->closeInput();
-    return Value();
+      const auto url = args.String("url");
+      std::shared_ptr<ffmpegkit::FFmpegKitStreamInput> stream;
+      {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          const auto found = state->resources.find(url);
+          if (found != state->resources.end()) {
+              if (const auto *resource = std::get_if<std::shared_ptr<ffmpegkit::FFmpegKitStreamInput>>(&found->second))
+                  stream = *resource;
+          }
+      }
+      // Like Linux, input closure is a no-op once the input stream is absent.
+      if (stream)
+          stream->closeInput();
+      return Value();
   }
   throw ChannelError("METHOD_NOT_IMPLEMENTED", method);
 }
