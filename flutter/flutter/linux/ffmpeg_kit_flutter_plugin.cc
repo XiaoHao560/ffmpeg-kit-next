@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <list>
 #include <map>
 #include <memory>
@@ -101,6 +102,8 @@ struct _FfmpegKitNextFlutterPlugin {
   gboolean listening;
   gboolean logs_enabled;
   gboolean statistics_enabled;
+  gboolean retain_shutdown_sessions;
+  std::map<long, std::shared_ptr<ffmpegkit::Session>> *shutdown_sessions;
 
   // "ffkit" protocol object registries, keyed by the generated protocol url.
   // Held as pointers because g_object_new does not run C++ member constructors.
@@ -430,11 +433,16 @@ static FlMethodResponse* resp_not_supported() {
   return resp_error("NOT_SUPPORTED", "Not supported on linux platform.");
 }
 
-static std::shared_ptr<ffmpegkit::Session> get_session(FlValue* args) {
-  gboolean found = FALSE;
-  int64_t id = get_int_argument(args, "sessionId", &found);
-  if (!found) return nullptr;
-  return ffmpegkit::FFmpegKitConfig::getSession(static_cast<long>(id));
+static std::shared_ptr<ffmpegkit::Session> get_session(FfmpegKitNextFlutterPlugin *self, FlValue *args) {
+    gboolean found = FALSE;
+    int64_t id = get_int_argument(args, "sessionId", &found);
+    if (!found)
+        return nullptr;
+    auto session = ffmpegkit::FFmpegKitConfig::getSession(static_cast<long>(id));
+    if (session)
+        return session;
+    auto found_session = self->shutdown_sessions->find(static_cast<long>(id));
+    return found_session == self->shutdown_sessions->end() ? nullptr : found_session->second;
 }
 
 // ---------------------------------------------------------------------------
@@ -545,201 +553,213 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
   FlValue* args = fl_method_call_get_args(call);
 
   // -- Abstract session accessors --------------------------------------------
-  if (g_strcmp0(m, "abstractSessionGetEndTime") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    auto end_time = session->getEndTime();
-    // getEndTime() is epoch (time_since_epoch()==0) until the session ends.
-    if (end_time.time_since_epoch().count() == 0) return resp_null();
-    return resp_int(to_epoch_millis(end_time));
+  if (g_strcmp0(m, "shutdown") == 0) {
+      gboolean found = FALSE;
+      int64_t wait = get_int_argument(args, "waitTimeout", &found);
+      if (!found || wait < INT32_MIN || wait > INT32_MAX)
+          return resp_error("INVALID_ARGUMENTS", "waitTimeout must be a signed 32-bit integer.");
+      self->retain_shutdown_sessions = TRUE;
+      auto sessions = ffmpegkit::FFmpegKitConfig::getSessions();
+      if (sessions)
+          for (const auto &session : *sessions)
+              (*self->shutdown_sessions)[session->getSessionId()] = session;
+      g_object_ref(call);
+      try {
+          std::thread([call, wait]() {
+              try {
+                  respond_later(call, resp_bool(ffmpegkit::FFmpegKitConfig::shutdown(static_cast<int>(wait))));
+              } catch (const std::exception &error) {
+                  respond_later(call, resp_error("SHUTDOWN_FAILED", error.what()));
+              }
+          }).detach();
+      } catch (const std::exception &error) {
+          g_object_unref(call);
+          return resp_error("SHUTDOWN_FAILED", error.what());
+      }
+      return nullptr;
+  } else if (g_strcmp0(m, "isShutdown") == 0) {
+      return resp_bool(ffmpegkit::FFmpegKitConfig::isShutdown());
+  } else if (g_strcmp0(m, "abstractSessionGetEndTime") == 0) {
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      auto end_time = session->getEndTime();
+      // getEndTime() is epoch (time_since_epoch()==0) until the session ends.
+      if (end_time.time_since_epoch().count() == 0)
+          return resp_null();
+      return resp_int(to_epoch_millis(end_time));
   } else if (g_strcmp0(m, "abstractSessionGetDuration") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_int(session->getDuration());
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_int(session->getDuration());
   } else if (g_strcmp0(m, "abstractSessionGetAllLogs") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_take_value(
-        to_log_list_value(session->getAllLogsWithTimeout(resolve_timeout(args))));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_take_value(to_log_list_value(session->getAllLogsWithTimeout(resolve_timeout(args))));
   } else if (g_strcmp0(m, "abstractSessionGetLogs") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_take_value(to_log_list_value(session->getLogs()));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_take_value(to_log_list_value(session->getLogs()));
   } else if (g_strcmp0(m, "abstractSessionGetAllLogsAsString") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_utf8_string(
-        session->getAllLogsAsStringWithTimeout(resolve_timeout(args)));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_utf8_string(session->getAllLogsAsStringWithTimeout(resolve_timeout(args)));
   } else if (g_strcmp0(m, "abstractSessionGetState") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_int(static_cast<int>(session->getState()));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_int(static_cast<int>(session->getState()));
   } else if (g_strcmp0(m, "abstractSessionGetReturnCode") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    auto return_code = session->getReturnCode();
-    if (return_code == nullptr) return resp_null();
-    return resp_int(return_code->getValue());
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      auto return_code = session->getReturnCode();
+      if (return_code == nullptr)
+          return resp_null();
+      return resp_int(return_code->getValue());
   } else if (g_strcmp0(m, "abstractSessionGetFailStackTrace") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_utf8_string(session->getFailStackTrace());
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_utf8_string(session->getFailStackTrace());
   } else if (g_strcmp0(m, "thereAreAsynchronousMessagesInTransmit") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_bool(session->thereAreAsynchronousMessagesInTransmit());
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      return resp_bool(session->thereAreAsynchronousMessagesInTransmit());
 
-    // -- Arch / platform / version -------------------------------------------
+      // -- Arch / platform / version -------------------------------------------
   } else if (g_strcmp0(m, "getArch") == 0) {
-    return resp_string(ffmpegkit::ArchDetect::getArch().c_str());
+      return resp_string(ffmpegkit::ArchDetect::getArch().c_str());
   } else if (g_strcmp0(m, "getPlatform") == 0) {
-    return resp_string(FFMPEG_KIT_PLATFORM_NAME);
+      return resp_string(FFMPEG_KIT_PLATFORM_NAME);
   } else if (g_strcmp0(m, "getFFmpegVersion") == 0) {
-    return resp_string(ffmpegkit::FFmpegKitConfig::getFFmpegVersion().c_str());
+      return resp_string(ffmpegkit::FFmpegKitConfig::getFFmpegVersion().c_str());
   } else if (g_strcmp0(m, "isLTSBuild") == 0) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     return resp_bool(ffmpegkit::FFmpegKitConfig::isLTSBuild());
 #pragma GCC diagnostic pop
   } else if (g_strcmp0(m, "getBuildDate") == 0) {
-    return resp_string(ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
+      return resp_string(ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
   } else if (g_strcmp0(m, "getPackageName") == 0) {
-    return resp_string(ffmpegkit::Packages::getPackageName().c_str());
+      return resp_string(ffmpegkit::Packages::getPackageName().c_str());
   } else if (g_strcmp0(m, "getExternalLibraries") == 0) {
-    FlValue* list = fl_value_new_list();
-    auto libraries = ffmpegkit::Packages::getExternalLibraries();
-    if (libraries != nullptr) {
-      for (const auto& name : *libraries) {
-        fl_value_append_take(list, fl_value_new_string(name.c_str()));
+      FlValue *list = fl_value_new_list();
+      auto libraries = ffmpegkit::Packages::getExternalLibraries();
+      if (libraries != nullptr) {
+          for (const auto &name : *libraries) {
+              fl_value_append_take(list, fl_value_new_string(name.c_str()));
+          }
       }
-    }
-    return resp_take_value(list);
+      return resp_take_value(list);
 
-    // -- Session creation -----------------------------------------------------
+      // -- Session creation -----------------------------------------------------
   } else if (g_strcmp0(m, "ffmpegSession") == 0) {
-    auto session = ffmpegkit::FFmpegSession::create(
-        fl_to_string_list(lookup(args, "arguments")),
-        [self](std::shared_ptr<ffmpegkit::FFmpegSession> s) {
-          emit_session(self, s);
-        },
-        [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); },
-        [self](std::shared_ptr<ffmpegkit::Statistics> s) {
-          emit_statistics(self, s);
-        });
-    return resp_take_value(to_session_map(session));
+      auto session = ffmpegkit::FFmpegSession::create(
+          fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::FFmpegSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); }, [self](std::shared_ptr<ffmpegkit::Statistics> s) { emit_statistics(self, s); });
+      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+          (*self->shutdown_sessions)[session->getSessionId()] = session;
+      return resp_take_value(to_session_map(session));
   } else if (g_strcmp0(m, "ffprobeSession") == 0) {
-    auto session = ffmpegkit::FFprobeSession::create(
-        fl_to_string_list(lookup(args, "arguments")),
-        [self](std::shared_ptr<ffmpegkit::FFprobeSession> s) {
-          emit_session(self, s);
-        },
-        [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
-    return resp_take_value(to_session_map(session));
+      auto session = ffmpegkit::FFprobeSession::create(fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::FFprobeSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
+      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+          (*self->shutdown_sessions)[session->getSessionId()] = session;
+      return resp_take_value(to_session_map(session));
   } else if (g_strcmp0(m, "mediaInformationSession") == 0) {
-    auto session = ffmpegkit::MediaInformationSession::create(
-        fl_to_string_list(lookup(args, "arguments")),
-        [self](std::shared_ptr<ffmpegkit::MediaInformationSession> s) {
-          emit_session(self, s);
-        },
-        [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
-    return resp_take_value(to_session_map(session));
+      auto session = ffmpegkit::MediaInformationSession::create(fl_to_string_list(lookup(args, "arguments")), [self](std::shared_ptr<ffmpegkit::MediaInformationSession> s) { emit_session(self, s); }, [self](std::shared_ptr<ffmpegkit::Log> log) { emit_log(self, log); });
+      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+          (*self->shutdown_sessions)[session->getSessionId()] = session;
+      return resp_take_value(to_session_map(session));
 
-    // -- FFmpeg statistics accessors -----------------------------------------
+      // -- FFmpeg statistics accessors -----------------------------------------
   } else if (g_strcmp0(m, "ffmpegSessionGetAllStatistics") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFmpeg())
-      return resp_error("NOT_FFMPEG_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto ffmpeg_session =
-        std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-    return resp_take_value(to_statistics_list_value(
-        ffmpeg_session->getAllStatisticsWithTimeout(resolve_timeout(args))));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFmpeg())
+          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                  "type.");
+      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+      return resp_take_value(to_statistics_list_value(ffmpeg_session->getAllStatisticsWithTimeout(resolve_timeout(args))));
   } else if (g_strcmp0(m, "ffmpegSessionGetStatistics") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFmpeg())
-      return resp_error("NOT_FFMPEG_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto ffmpeg_session =
-        std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-    return resp_take_value(
-        to_statistics_list_value(ffmpeg_session->getStatistics()));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFmpeg())
+          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                  "type.");
+      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+      return resp_take_value(to_statistics_list_value(ffmpeg_session->getStatistics()));
 
-    // -- Media information ----------------------------------------------------
+      // -- Media information ----------------------------------------------------
   } else if (g_strcmp0(m, "getMediaInformation") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isMediaInformation())
-      return resp_error("NOT_MEDIA_INFORMATION_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto media_information_session =
-        std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-    return resp_take_value(to_media_information_map(
-        media_information_session->getMediaInformation()));
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isMediaInformation())
+          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                             "type.");
+      auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+      return resp_take_value(to_media_information_map(media_information_session->getMediaInformation()));
   } else if (g_strcmp0(m, "mediaInformationJsonParserFrom") == 0) {
-    const gchar* json = get_string_argument(args, "ffprobeJsonOutput");
-    try {
-      auto media_information =
-          ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
-      return resp_take_value(to_media_information_map(media_information));
-    } catch (const std::exception&) {
-      return resp_null();
-    }
+      const gchar *json = get_string_argument(args, "ffprobeJsonOutput");
+      try {
+          auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
+          return resp_take_value(to_media_information_map(media_information));
+      } catch (const std::exception &) {
+          return resp_null();
+      }
   } else if (g_strcmp0(m, "mediaInformationJsonParserFromWithError") == 0) {
-    const gchar* json = get_string_argument(args, "ffprobeJsonOutput");
-    try {
-      auto media_information =
-          ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
-      return resp_take_value(to_media_information_map(media_information));
-    } catch (const std::exception&) {
-      return resp_error("PARSE_FAILED",
-                        "Parsing MediaInformation failed with JSON error.");
-    }
+      const gchar *json = get_string_argument(args, "ffprobeJsonOutput");
+      try {
+          auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
+          return resp_take_value(to_media_information_map(media_information));
+      } catch (const std::exception &) {
+          return resp_error("PARSE_FAILED", "Parsing MediaInformation failed with JSON error.");
+      }
 
-    // -- Redirection / logging toggles ---------------------------------------
+      // -- Redirection / logging toggles ---------------------------------------
   } else if (g_strcmp0(m, "enableRedirection") == 0) {
-    self->logs_enabled = TRUE;
-    self->statistics_enabled = TRUE;
-    ffmpegkit::FFmpegKitConfig::enableRedirection();
-    return resp_null();
+      self->logs_enabled = TRUE;
+      self->statistics_enabled = TRUE;
+      ffmpegkit::FFmpegKitConfig::enableRedirection();
+      return resp_null();
   } else if (g_strcmp0(m, "disableRedirection") == 0) {
-    ffmpegkit::FFmpegKitConfig::disableRedirection();
-    return resp_null();
+      ffmpegkit::FFmpegKitConfig::disableRedirection();
+      return resp_null();
   } else if (g_strcmp0(m, "enableLogs") == 0) {
-    self->logs_enabled = TRUE;
-    return resp_null();
+      self->logs_enabled = TRUE;
+      return resp_null();
   } else if (g_strcmp0(m, "disableLogs") == 0) {
-    self->logs_enabled = FALSE;
-    return resp_null();
+      self->logs_enabled = FALSE;
+      return resp_null();
   } else if (g_strcmp0(m, "enableStatistics") == 0) {
-    self->statistics_enabled = TRUE;
-    return resp_null();
+      self->statistics_enabled = TRUE;
+      return resp_null();
   } else if (g_strcmp0(m, "disableStatistics") == 0) {
-    self->statistics_enabled = FALSE;
-    return resp_null();
+      self->statistics_enabled = FALSE;
+      return resp_null();
 
-    // -- Fontconfig -----------------------------------------------------------
+      // -- Fontconfig -----------------------------------------------------------
   } else if (g_strcmp0(m, "setFontconfigConfigurationPath") == 0) {
-    const gchar* path = get_string_argument(args, "path");
-    if (path != nullptr)
-      ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(path);
-    return resp_null();
+      const gchar *path = get_string_argument(args, "path");
+      if (path != nullptr)
+          ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(path);
+      return resp_null();
   } else if (g_strcmp0(m, "setFontDirectory") == 0) {
-    const gchar* dir = get_string_argument(args, "fontDirectory");
-    ffmpegkit::FFmpegKitConfig::setFontDirectory(
-        dir ? dir : "", fl_to_string_map(lookup(args, "fontNameMap")));
-    return resp_null();
+      const gchar *dir = get_string_argument(args, "fontDirectory");
+      ffmpegkit::FFmpegKitConfig::setFontDirectory(dir ? dir : "", fl_to_string_map(lookup(args, "fontNameMap")));
+      return resp_null();
   } else if (g_strcmp0(m, "setFontDirectoryList") == 0) {
-    ffmpegkit::FFmpegKitConfig::setFontDirectoryList(
-        fl_to_string_list(lookup(args, "fontDirectoryList")),
-        fl_to_string_map(lookup(args, "fontNameMap")));
-    return resp_null();
+      ffmpegkit::FFmpegKitConfig::setFontDirectoryList(fl_to_string_list(lookup(args, "fontDirectoryList")), fl_to_string_map(lookup(args, "fontNameMap")));
+      return resp_null();
 
-    // -- Pipes ----------------------------------------------------------------
+      // -- Pipes ----------------------------------------------------------------
   } else if (g_strcmp0(m, "registerNewFFmpegPipe") == 0) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -747,7 +767,7 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
 #pragma GCC diagnostic pop
     return resp_string(pipe ? pipe->c_str() : nullptr);
   } else if (g_strcmp0(m, "closeFFmpegPipe") == 0) {
-    const gchar* pipe = get_string_argument(args, "ffmpegPipePath");
+      const gchar *pipe = get_string_argument(args, "ffmpegPipePath");
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     if (pipe != nullptr) ffmpegkit::FFmpegKitConfig::closeFFmpegPipe(pipe);
@@ -756,18 +776,18 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
 
     // -- Environment / signals ------------------------------------------------
   } else if (g_strcmp0(m, "setEnvironmentVariable") == 0) {
-    const gchar* name = get_string_argument(args, "variableName");
-    const gchar* value = get_string_argument(args, "variableValue");
-    if (name != nullptr && value != nullptr)
-      ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(name, value);
-    return resp_null();
+      const gchar *name = get_string_argument(args, "variableName");
+      const gchar *value = get_string_argument(args, "variableValue");
+      if (name != nullptr && value != nullptr)
+          ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(name, value);
+      return resp_null();
   } else if (g_strcmp0(m, "ignoreSignal") == 0) {
-    gboolean found = FALSE;
-    int64_t idx = get_int_argument(args, "signal", &found);
-    if (!found || idx < 0 || idx > 4)
-      return resp_error("INVALID_SIGNAL", "Signal value not supported.");
-    ffmpegkit::Signal signal_value;
-    switch (idx) {
+      gboolean found = FALSE;
+      int64_t idx = get_int_argument(args, "signal", &found);
+      if (!found || idx < 0 || idx > 4)
+          return resp_error("INVALID_SIGNAL", "Signal value not supported.");
+      ffmpegkit::Signal signal_value;
+      switch (idx) {
       case 0: signal_value = ffmpegkit::SignalInt; break;
       case 1: signal_value = ffmpegkit::SignalQuit; break;
       case 2: signal_value = ffmpegkit::SignalPipe; break;
@@ -779,399 +799,363 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
 
     // -- Synchronous (background) execution -----------------------------------
   } else if (g_strcmp0(m, "ffmpegSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFmpeg())
-      return resp_error("NOT_FFMPEG_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto ffmpeg_session =
-        std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-    g_object_ref(call);
-    std::thread([call, ffmpeg_session]() {
-      ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
-      respond_later(call, resp_null());
-    }).detach();
-    return nullptr;
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFmpeg())
+          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                  "type.");
+      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+      g_object_ref(call);
+      std::thread([call, ffmpeg_session]() {
+          ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
+          respond_later(call, resp_null());
+      }).detach();
+      return nullptr;
   } else if (g_strcmp0(m, "ffprobeSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFprobe())
-      return resp_error("NOT_FFPROBE_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto ffprobe_session =
-        std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
-    g_object_ref(call);
-    std::thread([call, ffprobe_session]() {
-      ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
-      respond_later(call, resp_null());
-    }).detach();
-    return nullptr;
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFprobe())
+          return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
+                                                   "type.");
+      auto ffprobe_session = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
+      g_object_ref(call);
+      std::thread([call, ffprobe_session]() {
+          ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
+          respond_later(call, resp_null());
+      }).detach();
+      return nullptr;
   } else if (g_strcmp0(m, "mediaInformationSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isMediaInformation())
-      return resp_error("NOT_MEDIA_INFORMATION_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    auto media_information_session =
-        std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-    int timeout = resolve_timeout(args);
-    g_object_ref(call);
-    std::thread([call, media_information_session, timeout]() {
-      ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(
-          media_information_session, timeout);
-      respond_later(call, resp_null());
-    }).detach();
-    return nullptr;
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isMediaInformation())
+          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                             "type.");
+      auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+      int timeout = resolve_timeout(args);
+      g_object_ref(call);
+      std::thread([call, media_information_session, timeout]() {
+          ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(media_information_session, timeout);
+          respond_later(call, resp_null());
+      }).detach();
+      return nullptr;
 
-    // -- Asynchronous execution (returns immediately) -------------------------
+      // -- Asynchronous execution (returns immediately) -------------------------
   } else if (g_strcmp0(m, "asyncFFmpegSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFmpeg())
-      return resp_error("NOT_FFMPEG_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(
-        std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
-    return resp_null();
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFmpeg())
+          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                  "type.");
+      ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(std::static_pointer_cast<ffmpegkit::FFmpegSession>(session));
+      return resp_null();
   } else if (g_strcmp0(m, "asyncFFprobeSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isFFprobe())
-      return resp_error("NOT_FFPROBE_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(
-        std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
-    return resp_null();
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isFFprobe())
+          return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
+                                                   "type.");
+      ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(std::static_pointer_cast<ffmpegkit::FFprobeSession>(session));
+      return resp_null();
   } else if (g_strcmp0(m, "asyncMediaInformationSessionExecute") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    if (!session->isMediaInformation())
-      return resp_error("NOT_MEDIA_INFORMATION_SESSION",
-                        "A session is found but it does not have the correct "
-                        "type.");
-    ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(
-        std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session),
-        resolve_timeout(args));
-    return resp_null();
+      auto session = get_session(self, args);
+      if (session == nullptr)
+          return resp_session_not_found();
+      if (!session->isMediaInformation())
+          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                             "type.");
+      ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session), resolve_timeout(args));
+      return resp_null();
 
-    // -- Log level / history / redirection strategy --------------------------
+      // -- Log level / history / redirection strategy --------------------------
   } else if (g_strcmp0(m, "getLogLevel") == 0) {
-    return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogLevel()));
+      return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogLevel()));
   } else if (g_strcmp0(m, "setLogLevel") == 0) {
-    gboolean found = FALSE;
-    int64_t level = get_int_argument(args, "level", &found);
-    if (found)
-      ffmpegkit::FFmpegKitConfig::setLogLevel(
-          static_cast<ffmpegkit::Level>(level));
-    return resp_null();
+      gboolean found = FALSE;
+      int64_t level = get_int_argument(args, "level", &found);
+      if (found)
+          ffmpegkit::FFmpegKitConfig::setLogLevel(static_cast<ffmpegkit::Level>(level));
+      return resp_null();
   } else if (g_strcmp0(m, "getSessionHistorySize") == 0) {
-    return resp_int(ffmpegkit::FFmpegKitConfig::getSessionHistorySize());
+      return resp_int(ffmpegkit::FFmpegKitConfig::getSessionHistorySize());
   } else if (g_strcmp0(m, "setSessionHistorySize") == 0) {
-    gboolean found = FALSE;
-    int64_t size = get_int_argument(args, "sessionHistorySize", &found);
-    if (found)
-      ffmpegkit::FFmpegKitConfig::setSessionHistorySize(static_cast<int>(size));
-    return resp_null();
+      gboolean found = FALSE;
+      int64_t size = get_int_argument(args, "sessionHistorySize", &found);
+      if (found)
+          ffmpegkit::FFmpegKitConfig::setSessionHistorySize(static_cast<int>(size));
+      return resp_null();
   } else if (g_strcmp0(m, "getLogRedirectionStrategy") == 0) {
-    return resp_int(static_cast<int>(
-        ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy()));
+      return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy()));
   } else if (g_strcmp0(m, "setLogRedirectionStrategy") == 0) {
-    gboolean found = FALSE;
-    int64_t strategy = get_int_argument(args, "strategy", &found);
-    if (!found || strategy < 0 || strategy > 4)
-      return resp_error("INVALID_LOG_REDIRECTION_STRATEGY",
-                        "Log redirection strategy value not supported.");
-    ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(
-        static_cast<ffmpegkit::LogRedirectionStrategy>(strategy));
-    return resp_null();
+      gboolean found = FALSE;
+      int64_t strategy = get_int_argument(args, "strategy", &found);
+      if (!found || strategy < 0 || strategy > 4)
+          return resp_error("INVALID_LOG_REDIRECTION_STRATEGY", "Log redirection strategy value not supported.");
+      ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(static_cast<ffmpegkit::LogRedirectionStrategy>(strategy));
+      return resp_null();
   } else if (g_strcmp0(m, "messagesInTransmit") == 0) {
-    gboolean found = FALSE;
-    int64_t id = get_int_argument(args, "sessionId", &found);
-    return resp_int(
-        ffmpegkit::FFmpegKitConfig::messagesInTransmit(static_cast<long>(id)));
+      gboolean found = FALSE;
+      int64_t id = get_int_argument(args, "sessionId", &found);
+      return resp_int(ffmpegkit::FFmpegKitConfig::messagesInTransmit(static_cast<long>(id)));
   } else if (g_strcmp0(m, "printLoadConfirmation") == 0) {
-    static gboolean logged = FALSE;
-    if (!logged) {
-      logged = TRUE;
-      const std::string packageName = ffmpegkit::Packages::getPackageName();
-      const std::string packageNamePart =
-          packageName.empty() ? "" : packageName + "-";
-      g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.",
-                packageNamePart.c_str(),
-                FFMPEG_KIT_PLATFORM_NAME,
-                ffmpegkit::ArchDetect::getArch().c_str(),
-                FFMPEG_KIT_LIBRARY_VERSION);
-    }
-    return resp_null();
+      static gboolean logged = FALSE;
+      if (!logged) {
+          logged = TRUE;
+          const std::string packageName = ffmpegkit::Packages::getPackageName();
+          const std::string packageNamePart = packageName.empty() ? "" : packageName + "-";
+          g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart.c_str(), FFMPEG_KIT_PLATFORM_NAME, ffmpegkit::ArchDetect::getArch().c_str(), FFMPEG_KIT_LIBRARY_VERSION);
+      }
+      return resp_null();
 
-    // -- Session registry queries --------------------------------------------
+      // -- Session registry queries --------------------------------------------
   } else if (g_strcmp0(m, "getSession") == 0) {
-    auto session = get_session(args);
-    if (session == nullptr) return resp_session_not_found();
-    return resp_take_value(to_session_map(session));
+      gboolean found = FALSE;
+      auto id = get_int_argument(args, "sessionId", &found);
+      auto session = found ? ffmpegkit::FFmpegKitConfig::getSession(static_cast<long>(id)) : nullptr;
+      return resp_take_value(to_session_map(session));
   } else if (g_strcmp0(m, "getLastSession") == 0) {
-    return resp_take_value(
-        to_session_map(ffmpegkit::FFmpegKitConfig::getLastSession()));
+      return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastSession()));
   } else if (g_strcmp0(m, "getLastCompletedSession") == 0) {
-    return resp_take_value(
-        to_session_map(ffmpegkit::FFmpegKitConfig::getLastCompletedSession()));
+      return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastCompletedSession()));
   } else if (g_strcmp0(m, "getSessions") == 0) {
-    return resp_take_value(
-        to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessions()));
+      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessions()));
   } else if (g_strcmp0(m, "clearSessions") == 0) {
-    ffmpegkit::FFmpegKitConfig::clearSessions();
-    return resp_null();
+      ffmpegkit::FFmpegKitConfig::clearSessions();
+      self->shutdown_sessions->clear();
+      return resp_null();
   } else if (g_strcmp0(m, "deleteSession") == 0) {
-    gboolean found = FALSE;
-    int64_t id = get_int_argument(args, "sessionId", &found);
-    if (found)
-      ffmpegkit::FFmpegKitConfig::deleteSession(static_cast<long>(id));
-    return resp_null();
+      gboolean found = FALSE;
+      int64_t id = get_int_argument(args, "sessionId", &found);
+      if (found) {
+          ffmpegkit::FFmpegKitConfig::deleteSession(static_cast<long>(id));
+          self->shutdown_sessions->erase(static_cast<long>(id));
+      }
+      return resp_null();
   } else if (g_strcmp0(m, "getSessionsByState") == 0) {
-    gboolean found = FALSE;
-    int64_t state = get_int_argument(args, "state", &found);
-    if (!found || state < 0 || state > 3)
-      return resp_error("INVALID_SESSION_STATE",
-                        "Session state value not supported.");
-    return resp_take_value(
-        to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessionsByState(
-            static_cast<ffmpegkit::SessionState>(state))));
+      gboolean found = FALSE;
+      int64_t state = get_int_argument(args, "state", &found);
+      if (!found || state < 0 || state > 3)
+          return resp_error("INVALID_SESSION_STATE", "Session state value not supported.");
+      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessionsByState(static_cast<ffmpegkit::SessionState>(state))));
   } else if (g_strcmp0(m, "getFFmpegSessions") == 0) {
-    return resp_take_value(
-        to_session_list_value(ffmpegkit::FFmpegKit::listSessions()));
+      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKit::listSessions()));
   } else if (g_strcmp0(m, "getFFprobeSessions") == 0) {
-    return resp_take_value(
-        to_session_list_value(ffmpegkit::FFprobeKit::listFFprobeSessions()));
+      return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listFFprobeSessions()));
   } else if (g_strcmp0(m, "getMediaInformationSessions") == 0) {
-    return resp_take_value(to_session_list_value(
-        ffmpegkit::FFprobeKit::listMediaInformationSessions()));
+      return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listMediaInformationSessions()));
 
-    // -- Cancellation ---------------------------------------------------------
+      // -- Cancellation ---------------------------------------------------------
   } else if (g_strcmp0(m, "cancel") == 0) {
-    ffmpegkit::FFmpegKit::cancel();
-    return resp_null();
+      ffmpegkit::FFmpegKit::cancel();
+      return resp_null();
   } else if (g_strcmp0(m, "cancelSession") == 0) {
-    gboolean found = FALSE;
-    int64_t id = get_int_argument(args, "sessionId", &found);
-    if (found) ffmpegkit::FFmpegKit::cancel(static_cast<long>(id));
-    return resp_null();
+      gboolean found = FALSE;
+      int64_t id = get_int_argument(args, "sessionId", &found);
+      if (found)
+          ffmpegkit::FFmpegKit::cancel(static_cast<long>(id));
+      return resp_null();
 
-    // -- Packages -------------------------------------------------------------
-    // (getPackageName / getExternalLibraries handled above.)
+      // -- Packages -------------------------------------------------------------
+      // (getPackageName / getExternalLibraries handled above.)
 
-    // -- writeToPipe (background file copy) -----------------------------------
+      // -- writeToPipe (background file copy) -----------------------------------
   } else if (g_strcmp0(m, "writeToPipe") == 0) {
-    const gchar* input = get_string_argument(args, "input");
-    const gchar* pipe = get_string_argument(args, "pipe");
-    if (input == nullptr || pipe == nullptr)
-      return resp_error("INVALID_ARGUMENTS", "input and pipe are required.");
-    std::string input_path(input);
-    std::string pipe_path(pipe);
-    g_object_ref(call);
-    std::thread([call, input_path, pipe_path]() {
-      FILE* in = fopen(input_path.c_str(), "rb");
-      if (in == nullptr) {
-        respond_later(call, resp_error("COPY_FAILED", "Failed to open file."));
-        return;
-      }
-      FILE* out = fopen(pipe_path.c_str(), "wb");
-      if (out == nullptr) {
-        fclose(in);
-        respond_later(call, resp_error("COPY_FAILED", "Failed to open pipe."));
-        return;
-      }
-      char buffer[4096];
-      size_t read_bytes;
-      bool ok = true;
-      while ((read_bytes = fread(buffer, 1, sizeof(buffer), in)) > 0) {
-        if (fwrite(buffer, 1, read_bytes, out) != read_bytes) {
-          ok = false;
-          break;
-        }
-      }
-      fclose(in);
-      fclose(out);
-      respond_later(call,
-                    ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed."));
-    }).detach();
-    return nullptr;
+      const gchar *input = get_string_argument(args, "input");
+      const gchar *pipe = get_string_argument(args, "pipe");
+      if (input == nullptr || pipe == nullptr)
+          return resp_error("INVALID_ARGUMENTS", "input and pipe are required.");
+      std::string input_path(input);
+      std::string pipe_path(pipe);
+      g_object_ref(call);
+      std::thread([call, input_path, pipe_path]() {
+          FILE *in = fopen(input_path.c_str(), "rb");
+          if (in == nullptr) {
+              respond_later(call, resp_error("COPY_FAILED", "Failed to open file."));
+              return;
+          }
+          FILE *out = fopen(pipe_path.c_str(), "wb");
+          if (out == nullptr) {
+              fclose(in);
+              respond_later(call, resp_error("COPY_FAILED", "Failed to open pipe."));
+              return;
+          }
+          char buffer[4096];
+          size_t read_bytes;
+          bool ok = true;
+          while ((read_bytes = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+              if (fwrite(buffer, 1, read_bytes, out) != read_bytes) {
+                  ok = false;
+                  break;
+              }
+          }
+          fclose(in);
+          fclose(out);
+          respond_later(call, ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed."));
+      }).detach();
+      return nullptr;
 
-    // -- Android-only methods -> NOT_SUPPORTED --------------------------------
-  } else if (g_strcmp0(m, "selectDocument") == 0 ||
-             g_strcmp0(m, "getSafParameter") == 0 ||
-             g_strcmp0(m, "unregisterSafProtocolUrl") == 0 ||
-             g_strcmp0(m, "getSupportedCameraIds") == 0) {
-    return resp_not_supported();
+      // -- Android-only methods -> NOT_SUPPORTED --------------------------------
+  } else if (g_strcmp0(m, "selectDocument") == 0 || g_strcmp0(m, "getSafParameter") == 0 || g_strcmp0(m, "unregisterSafProtocolUrl") == 0 || g_strcmp0(m, "getSupportedCameraIds") == 0) {
+      return resp_not_supported();
 
-    // -- ffkit input buffer ---------------------------------------------------
+      // -- ffkit input buffer ---------------------------------------------------
   } else if (g_strcmp0(m, "inputBufferFromByteArray") == 0) {
-    const gchar* extension = get_string_argument(args, "extension");
-    auto input_buffer = ffmpegkit::FFmpegKitInputBuffer::fromByteArray(
-        fl_to_uint8_vector(lookup(args, "data")), extension ? extension : "");
-    std::string url = input_buffer->getUrl();
-    (*self->input_buffers)[url] = input_buffer;
-    return resp_string(url.c_str());
+      const gchar *extension = get_string_argument(args, "extension");
+      auto input_buffer = ffmpegkit::FFmpegKitInputBuffer::fromByteArray(fl_to_uint8_vector(lookup(args, "data")), extension ? extension : "");
+      std::string url = input_buffer->getUrl();
+      (*self->input_buffers)[url] = input_buffer;
+      return resp_string(url.c_str());
   } else if (g_strcmp0(m, "inputBufferClose") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    if (url != nullptr) {
-      auto it = self->input_buffers->find(url);
-      if (it != self->input_buffers->end()) {
-        it->second->close();
-        self->input_buffers->erase(it);
+      const gchar *url = get_string_argument(args, "url");
+      if (url != nullptr) {
+          auto it = self->input_buffers->find(url);
+          if (it != self->input_buffers->end()) {
+              it->second->close();
+              self->input_buffers->erase(it);
+          }
       }
-    }
-    return resp_null();
+      return resp_null();
 
-    // -- ffkit output buffer --------------------------------------------------
+      // -- ffkit output buffer --------------------------------------------------
   } else if (g_strcmp0(m, "outputBufferCreate") == 0) {
-    const gchar* extension = get_string_argument(args, "extension");
-    gboolean has_initial = FALSE, has_max = FALSE;
-    int64_t initial = get_int_argument(args, "initialCapacity", &has_initial);
-    int64_t max = get_int_argument(args, "maxCapacity", &has_max);
-    std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer> output_buffer;
-    if (has_initial && has_max) {
-      output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(
-          extension ? extension : "", static_cast<long>(initial),
-          static_cast<long>(max));
-    } else {
-      output_buffer =
-          ffmpegkit::FFmpegKitOutputBuffer::create(extension ? extension : "");
-    }
-    std::string url = output_buffer->getUrl();
-    (*self->output_buffers)[url] = output_buffer;
-    return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "outputBufferGetSize") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    auto it = url ? self->output_buffers->find(url)
-                  : self->output_buffers->end();
-    if (it == self->output_buffers->end())
-      return resp_error("NOT_FOUND", "Output buffer not found.");
-    return resp_int(it->second->getSize());
-  } else if (g_strcmp0(m, "outputBufferToByteArray") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    auto it = url ? self->output_buffers->find(url)
-                  : self->output_buffers->end();
-    if (it == self->output_buffers->end())
-      return resp_error("NOT_FOUND", "Output buffer not found.");
-    auto data = it->second->toByteArray();
-    if (data == nullptr) return resp_take_value(fl_value_new_uint8_list(nullptr, 0));
-    return resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
-  } else if (g_strcmp0(m, "outputBufferClose") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    if (url != nullptr) {
-      auto it = self->output_buffers->find(url);
-      if (it != self->output_buffers->end()) {
-        it->second->close();
-        self->output_buffers->erase(it);
-      }
-    }
-    return resp_null();
-
-    // -- ffkit stream input ---------------------------------------------------
-  } else if (g_strcmp0(m, "streamInputCreate") == 0) {
-    const gchar* extension = get_string_argument(args, "extension");
-    gboolean has_capacity = FALSE;
-    int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
-    std::shared_ptr<ffmpegkit::FFmpegKitStreamInput> stream_input;
-    if (has_capacity) {
-      stream_input = ffmpegkit::FFmpegKitStreamInput::create(
-          extension ? extension : "", static_cast<long>(capacity));
-    } else {
-      stream_input =
-          ffmpegkit::FFmpegKitStreamInput::create(extension ? extension : "");
-    }
-    std::string url = stream_input->getUrl();
-    (*self->stream_inputs)[url] = stream_input;
-    return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "streamInputWrite") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    auto it = url ? self->stream_inputs->find(url) : self->stream_inputs->end();
-    if (it == self->stream_inputs->end())
-      return resp_error("NOT_FOUND", "Stream input not found.");
-    auto stream_input = it->second;
-    std::vector<uint8_t> data = fl_to_uint8_vector(lookup(args, "data"));
-    gboolean has_timeout = FALSE;
-    int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-    g_object_ref(call);
-    std::thread([call, stream_input, data, has_timeout, timeout]() {
-      int written = has_timeout
-                        ? stream_input->write(data, static_cast<int>(timeout))
-                        : stream_input->write(data);
-      respond_later(call, resp_int(written));
-    }).detach();
-    return nullptr;
-  } else if (g_strcmp0(m, "streamInputCloseInput") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    if (url != nullptr) {
-      auto it = self->stream_inputs->find(url);
-      if (it != self->stream_inputs->end()) it->second->closeInput();
-    }
-    return resp_null();
-  } else if (g_strcmp0(m, "streamInputClose") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    if (url != nullptr) {
-      auto it = self->stream_inputs->find(url);
-      if (it != self->stream_inputs->end()) {
-        it->second->close();
-        self->stream_inputs->erase(it);
-      }
-    }
-    return resp_null();
-
-    // -- ffkit stream output --------------------------------------------------
-  } else if (g_strcmp0(m, "streamOutputCreate") == 0) {
-    const gchar* extension = get_string_argument(args, "extension");
-    gboolean has_capacity = FALSE;
-    int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
-    std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput> stream_output;
-    if (has_capacity) {
-      stream_output = ffmpegkit::FFmpegKitStreamOutput::create(
-          extension ? extension : "", static_cast<long>(capacity));
-    } else {
-      stream_output =
-          ffmpegkit::FFmpegKitStreamOutput::create(extension ? extension : "");
-    }
-    std::string url = stream_output->getUrl();
-    (*self->stream_outputs)[url] = stream_output;
-    return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "streamOutputRead") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    auto it = url ? self->stream_outputs->find(url)
-                  : self->stream_outputs->end();
-    if (it == self->stream_outputs->end())
-      return resp_error("NOT_FOUND", "Stream output not found.");
-    auto stream_output = it->second;
-    gboolean has_max = FALSE, has_timeout = FALSE;
-    int64_t max_bytes = get_int_argument(args, "maxBytes", &has_max);
-    int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-    g_object_ref(call);
-    std::thread([call, stream_output, max_bytes, has_timeout, timeout]() {
-      auto data = has_timeout ? stream_output->read(static_cast<int>(max_bytes),
-                                                    static_cast<int>(timeout))
-                              : stream_output->read(static_cast<int>(max_bytes));
-      if (data == nullptr) {
-        respond_later(call, resp_null());
+      const gchar *extension = get_string_argument(args, "extension");
+      gboolean has_initial = FALSE, has_max = FALSE;
+      int64_t initial = get_int_argument(args, "initialCapacity", &has_initial);
+      int64_t max = get_int_argument(args, "maxCapacity", &has_max);
+      std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer> output_buffer;
+      if (has_initial && has_max) {
+          output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension ? extension : "", static_cast<long>(initial), static_cast<long>(max));
       } else {
-        respond_later(call, resp_take_value(fl_value_new_uint8_list(
-                                data->data(), data->size())));
+          output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension ? extension : "");
       }
-    }).detach();
-    return nullptr;
+      std::string url = output_buffer->getUrl();
+      (*self->output_buffers)[url] = output_buffer;
+      return resp_string(url.c_str());
+  } else if (g_strcmp0(m, "outputBufferGetSize") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      auto it = url ? self->output_buffers->find(url) : self->output_buffers->end();
+      if (it == self->output_buffers->end())
+          return resp_error("NOT_FOUND", "Output buffer not found.");
+      return resp_int(it->second->getSize());
+  } else if (g_strcmp0(m, "outputBufferToByteArray") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      auto it = url ? self->output_buffers->find(url) : self->output_buffers->end();
+      if (it == self->output_buffers->end())
+          return resp_error("NOT_FOUND", "Output buffer not found.");
+      auto data = it->second->toByteArray();
+      if (data == nullptr)
+          return resp_take_value(fl_value_new_uint8_list(nullptr, 0));
+      return resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
+  } else if (g_strcmp0(m, "outputBufferClose") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      if (url != nullptr) {
+          auto it = self->output_buffers->find(url);
+          if (it != self->output_buffers->end()) {
+              it->second->close();
+              self->output_buffers->erase(it);
+          }
+      }
+      return resp_null();
+
+      // -- ffkit stream input ---------------------------------------------------
+  } else if (g_strcmp0(m, "streamInputCreate") == 0) {
+      const gchar *extension = get_string_argument(args, "extension");
+      gboolean has_capacity = FALSE;
+      int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
+      std::shared_ptr<ffmpegkit::FFmpegKitStreamInput> stream_input;
+      if (has_capacity) {
+          stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension ? extension : "", static_cast<long>(capacity));
+      } else {
+          stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension ? extension : "");
+      }
+      std::string url = stream_input->getUrl();
+      (*self->stream_inputs)[url] = stream_input;
+      return resp_string(url.c_str());
+  } else if (g_strcmp0(m, "streamInputWrite") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      auto it = url ? self->stream_inputs->find(url) : self->stream_inputs->end();
+      if (it == self->stream_inputs->end())
+          return resp_error("NOT_FOUND", "Stream input not found.");
+      auto stream_input = it->second;
+      std::vector<uint8_t> data = fl_to_uint8_vector(lookup(args, "data"));
+      gboolean has_timeout = FALSE;
+      int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
+      g_object_ref(call);
+      std::thread([call, stream_input, data, has_timeout, timeout]() {
+          try {
+              int written = has_timeout ? stream_input->write(data, static_cast<int>(timeout)) : stream_input->write(data);
+              respond_later(call, resp_int(written));
+          } catch (const std::exception &error) {
+              respond_later(call, resp_error("STREAM_INPUT_WRITE_FAILED", error.what()));
+          }
+      }).detach();
+      return nullptr;
+  } else if (g_strcmp0(m, "streamInputCloseInput") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      if (url != nullptr) {
+          auto it = self->stream_inputs->find(url);
+          if (it != self->stream_inputs->end())
+              it->second->closeInput();
+      }
+      return resp_null();
+  } else if (g_strcmp0(m, "streamInputClose") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      if (url != nullptr) {
+          auto it = self->stream_inputs->find(url);
+          if (it != self->stream_inputs->end()) {
+              it->second->close();
+              self->stream_inputs->erase(it);
+          }
+      }
+      return resp_null();
+
+      // -- ffkit stream output --------------------------------------------------
+  } else if (g_strcmp0(m, "streamOutputCreate") == 0) {
+      const gchar *extension = get_string_argument(args, "extension");
+      gboolean has_capacity = FALSE;
+      int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
+      std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput> stream_output;
+      if (has_capacity) {
+          stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension ? extension : "", static_cast<long>(capacity));
+      } else {
+          stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension ? extension : "");
+      }
+      std::string url = stream_output->getUrl();
+      (*self->stream_outputs)[url] = stream_output;
+      return resp_string(url.c_str());
+  } else if (g_strcmp0(m, "streamOutputRead") == 0) {
+      const gchar *url = get_string_argument(args, "url");
+      auto it = url ? self->stream_outputs->find(url) : self->stream_outputs->end();
+      if (it == self->stream_outputs->end())
+          return resp_error("NOT_FOUND", "Stream output not found.");
+      auto stream_output = it->second;
+      gboolean has_max = FALSE, has_timeout = FALSE;
+      int64_t max_bytes = get_int_argument(args, "maxBytes", &has_max);
+      int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
+      g_object_ref(call);
+      std::thread([call, stream_output, max_bytes, has_timeout, timeout]() {
+          auto data = has_timeout ? stream_output->read(static_cast<int>(max_bytes), static_cast<int>(timeout)) : stream_output->read(static_cast<int>(max_bytes));
+          if (data == nullptr) {
+              respond_later(call, resp_null());
+          } else {
+              respond_later(call, resp_take_value(fl_value_new_uint8_list(data->data(), data->size())));
+          }
+      }).detach();
+      return nullptr;
   } else if (g_strcmp0(m, "streamOutputClose") == 0) {
-    const gchar* url = get_string_argument(args, "url");
-    if (url != nullptr) {
-      auto it = self->stream_outputs->find(url);
-      if (it != self->stream_outputs->end()) {
-        it->second->close();
-        self->stream_outputs->erase(it);
+      const gchar *url = get_string_argument(args, "url");
+      if (url != nullptr) {
+          auto it = self->stream_outputs->find(url);
+          if (it != self->stream_outputs->end()) {
+              it->second->close();
+              self->stream_outputs->erase(it);
+          }
       }
-    }
-    return resp_null();
+      return resp_null();
   }
 
   return FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
@@ -1220,6 +1204,8 @@ static void ffmpeg_kit_next_flutter_plugin_dispose(GObject* object) {
   delete self->stream_inputs;
   delete self->stream_outputs;
   delete self->delete_listener;
+  delete self->shutdown_sessions;
+  self->shutdown_sessions = nullptr;
   self->input_buffers = nullptr;
   self->output_buffers = nullptr;
   self->stream_inputs = nullptr;
@@ -1235,24 +1221,17 @@ static void ffmpeg_kit_next_flutter_plugin_class_init(
 
 static void ffmpeg_kit_next_flutter_plugin_init(
     FfmpegKitNextFlutterPlugin* self) {
-  self->event_channel = nullptr;
-  self->listening = FALSE;
-  self->logs_enabled = FALSE;
-  self->statistics_enabled = FALSE;
-  self->input_buffers =
-      new std::map<std::string,
-                   std::shared_ptr<ffmpegkit::FFmpegKitInputBuffer>>();
-  self->output_buffers =
-      new std::map<std::string,
-                   std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer>>();
-  self->stream_inputs =
-      new std::map<std::string,
-                   std::shared_ptr<ffmpegkit::FFmpegKitStreamInput>>();
-  self->stream_outputs =
-      new std::map<std::string,
-                   std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput>>();
-  self->delete_listener =
-      new std::shared_ptr<ffmpegkit::SessionDeleteListener>();
+    self->retain_shutdown_sessions = FALSE;
+    self->shutdown_sessions = new std::map<long, std::shared_ptr<ffmpegkit::Session>>();
+    self->event_channel = nullptr;
+    self->listening = FALSE;
+    self->logs_enabled = FALSE;
+    self->statistics_enabled = FALSE;
+    self->input_buffers = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitInputBuffer>>();
+    self->output_buffers = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer>>();
+    self->stream_inputs = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitStreamInput>>();
+    self->stream_outputs = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput>>();
+    self->delete_listener = new std::shared_ptr<ffmpegkit::SessionDeleteListener>();
 }
 
 void f_fmpeg_kit_flutter_plugin_register_with_registrar(

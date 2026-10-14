@@ -166,6 +166,9 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     // "ffkit" protocol object registries, keyed by the generated protocol url.
     // The native objects are stateful and must be kept alive between the create
     // call and the subsequent read/write/close calls.
+    private final Map<Long, Session> shutdownSessions = new ConcurrentHashMap<>();
+    private volatile boolean retainShutdownSessions;
+
     private final Map<String, FFmpegKitInputBuffer> inputBufferRegistry = new ConcurrentHashMap<>();
     private final Map<String, FFmpegKitOutputBuffer> outputBufferRegistry = new ConcurrentHashMap<>();
     private final Map<String, FFmpegKitStreamInput> streamInputRegistry = new ConcurrentHashMap<>();
@@ -248,164 +251,184 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
         final Boolean writable = call.argument(ARGUMENT_WRITABLE);
 
         switch (call.method) {
-            case "abstractSessionGetEndTime":
-                if (sessionId != null) {
-                    abstractSessionGetEndTime(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetDuration":
-                if (sessionId != null) {
-                    abstractSessionGetDuration(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetAllLogs":
-                if (sessionId != null) {
-                    abstractSessionGetAllLogs(sessionId, waitTimeout, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetLogs":
-                if (sessionId != null) {
-                    abstractSessionGetLogs(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetAllLogsAsString":
-                if (sessionId != null) {
-                    abstractSessionGetAllLogsAsString(sessionId, waitTimeout, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetState":
-                if (sessionId != null) {
-                    abstractSessionGetState(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetReturnCode":
-                if (sessionId != null) {
-                    abstractSessionGetReturnCode(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "abstractSessionGetFailStackTrace":
-                if (sessionId != null) {
-                    abstractSessionGetFailStackTrace(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "thereAreAsynchronousMessagesInTransmit":
-                if (sessionId != null) {
-                    abstractSessionThereAreAsynchronousMessagesInTransmit(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "getArch":
-                getArch(result);
-                break;
-            case "ffmpegSession":
-                if (arguments != null) {
-                    ffmpegSession(arguments, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
-                }
-                break;
-            case "ffmpegSessionGetAllStatistics":
-                if (sessionId != null) {
-                    ffmpegSessionGetAllStatistics(sessionId, waitTimeout, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "ffmpegSessionGetStatistics":
-                if (sessionId != null) {
-                    ffmpegSessionGetStatistics(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "ffprobeSession":
-                if (arguments != null) {
-                    ffprobeSession(arguments, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
-                }
-                break;
-            case "mediaInformationSession":
-                if (arguments != null) {
-                    mediaInformationSession(arguments, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
-                }
-                break;
-            case "getMediaInformation":
-                if (sessionId != null) {
-                    getMediaInformation(sessionId, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
-                }
-                break;
-            case "mediaInformationJsonParserFrom":
-                if (ffprobeJsonOutput != null) {
-                    mediaInformationJsonParserFrom(ffprobeJsonOutput, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_FFPROBE_JSON_OUTPUT", "Invalid ffprobe json output.");
-                }
-                break;
-            case "mediaInformationJsonParserFromWithError":
-                if (ffprobeJsonOutput != null) {
-                    mediaInformationJsonParserFromWithError(ffprobeJsonOutput, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_FFPROBE_JSON_OUTPUT", "Invalid ffprobe json output.");
-                }
-                break;
-            case "enableRedirection":
-                enableRedirection(result);
-                break;
-            case "disableRedirection":
-                disableRedirection(result);
-                break;
-            case "enableLogs":
-                enableLogs(result);
-                break;
-            case "disableLogs":
-                disableLogs(result);
-                break;
-            case "enableStatistics":
-                enableStatistics(result);
-                break;
-            case "disableStatistics":
-                disableStatistics(result);
-                break;
-            case "setFontconfigConfigurationPath":
-                final String path = call.argument("path");
-                if (path != null) {
-                    setFontconfigConfigurationPath(path, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_PATH", "Invalid path.");
-                }
-                break;
-            case "setFontDirectory": {
-                final String fontDirectory = call.argument("fontDirectory");
-                final Map<String, String> fontNameMap = call.argument("fontNameMap");
-                if (fontDirectory != null) {
-                    setFontDirectory(fontDirectory, fontNameMap, result);
-                } else {
-                    resultHandler.errorAsync(result, "INVALID_FONT_DIRECTORY", "Invalid font directory.");
-                }
+        case "shutdown":
+            if (waitTimeout == null) {
+                resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "waitTimeout is required.");
                 break;
             }
+            retainShutdownSessions = true;
+            for (Session session : FFmpegKitConfig.getSessions()) {
+                shutdownSessions.put(session.getSessionId(), session);
+            }
+            new Thread(() -> {
+                try {
+                    resultHandler.successAsync(result, FFmpegKitConfig.shutdown(waitTimeout));
+                } catch (Exception error) {
+                    resultHandler.errorAsync(result, "SHUTDOWN_FAILED", error.getMessage());
+                }
+            }, "ffmpeg-kit-flutter-shutdown").start();
+            break;
+        case "isShutdown":
+            resultHandler.successAsync(result, FFmpegKitConfig.isShutdown());
+            break;
+        case "abstractSessionGetEndTime":
+            if (sessionId != null) {
+                abstractSessionGetEndTime(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetDuration":
+            if (sessionId != null) {
+                abstractSessionGetDuration(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetAllLogs":
+            if (sessionId != null) {
+                abstractSessionGetAllLogs(sessionId, waitTimeout, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetLogs":
+            if (sessionId != null) {
+                abstractSessionGetLogs(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetAllLogsAsString":
+            if (sessionId != null) {
+                abstractSessionGetAllLogsAsString(sessionId, waitTimeout, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetState":
+            if (sessionId != null) {
+                abstractSessionGetState(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetReturnCode":
+            if (sessionId != null) {
+                abstractSessionGetReturnCode(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "abstractSessionGetFailStackTrace":
+            if (sessionId != null) {
+                abstractSessionGetFailStackTrace(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "thereAreAsynchronousMessagesInTransmit":
+            if (sessionId != null) {
+                abstractSessionThereAreAsynchronousMessagesInTransmit(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "getArch":
+            getArch(result);
+            break;
+        case "ffmpegSession":
+            if (arguments != null) {
+                ffmpegSession(arguments, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
+            }
+            break;
+        case "ffmpegSessionGetAllStatistics":
+            if (sessionId != null) {
+                ffmpegSessionGetAllStatistics(sessionId, waitTimeout, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "ffmpegSessionGetStatistics":
+            if (sessionId != null) {
+                ffmpegSessionGetStatistics(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "ffprobeSession":
+            if (arguments != null) {
+                ffprobeSession(arguments, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
+            }
+            break;
+        case "mediaInformationSession":
+            if (arguments != null) {
+                mediaInformationSession(arguments, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_ARGUMENTS", "Invalid arguments array.");
+            }
+            break;
+        case "getMediaInformation":
+            if (sessionId != null) {
+                getMediaInformation(sessionId, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
+            }
+            break;
+        case "mediaInformationJsonParserFrom":
+            if (ffprobeJsonOutput != null) {
+                mediaInformationJsonParserFrom(ffprobeJsonOutput, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_FFPROBE_JSON_OUTPUT", "Invalid ffprobe json output.");
+            }
+            break;
+        case "mediaInformationJsonParserFromWithError":
+            if (ffprobeJsonOutput != null) {
+                mediaInformationJsonParserFromWithError(ffprobeJsonOutput, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_FFPROBE_JSON_OUTPUT", "Invalid ffprobe json output.");
+            }
+            break;
+        case "enableRedirection":
+            enableRedirection(result);
+            break;
+        case "disableRedirection":
+            disableRedirection(result);
+            break;
+        case "enableLogs":
+            enableLogs(result);
+            break;
+        case "disableLogs":
+            disableLogs(result);
+            break;
+        case "enableStatistics":
+            enableStatistics(result);
+            break;
+        case "disableStatistics":
+            disableStatistics(result);
+            break;
+        case "setFontconfigConfigurationPath":
+            final String path = call.argument("path");
+            if (path != null) {
+                setFontconfigConfigurationPath(path, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_PATH", "Invalid path.");
+            }
+            break;
+        case "setFontDirectory": {
+            final String fontDirectory = call.argument("fontDirectory");
+            final Map<String, String> fontNameMap = call.argument("fontNameMap");
+            if (fontDirectory != null) {
+                setFontDirectory(fontDirectory, fontNameMap, result);
+            } else {
+                resultHandler.errorAsync(result, "INVALID_FONT_DIRECTORY", "Invalid font directory.");
+            }
+            break;
+        }
             case "setFontDirectoryList": {
                 final List<String> fontDirectoryList = call.argument("fontDirectoryList");
                 final Map<String, String> fontNameMap = call.argument("fontNameMap");
@@ -807,6 +830,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void uninit() {
+        shutdownSessions.clear();
         unregisterSessionDeleteListener();
         uninitMethodChannel();
         uninitEventChannel();
@@ -896,10 +920,21 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
         }
     }
 
+    private Session findSession(long id) {
+        Session session = FFmpegKitConfig.getSession(id);
+        return session != null ? session : shutdownSessions.get(id);
+    }
+
+    private void retainSessionForShutdown(Session session) {
+        if (retainShutdownSessions || FFmpegKitConfig.isShutdown()) {
+            shutdownSessions.put(session.getSessionId(), session);
+        }
+    }
+
     // AbstractSession
 
     protected void abstractSessionGetEndTime(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -913,7 +948,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetDuration(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -922,7 +957,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetAllLogs(@NonNull final Integer sessionId, @Nullable final Integer waitTimeout, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -938,7 +973,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetLogs(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -948,7 +983,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetAllLogsAsString(@NonNull final Integer sessionId, @Nullable final Integer waitTimeout, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -964,7 +999,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetState(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -973,7 +1008,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetReturnCode(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -987,7 +1022,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionGetFailStackTrace(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -996,7 +1031,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void abstractSessionThereAreAsynchronousMessagesInTransmit(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1014,11 +1049,12 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
     protected void ffmpegSession(@NonNull final List<String> arguments, @NonNull final Result result) {
         final FFmpegSession session = FFmpegSession.create(arguments.toArray(new String[0]), this::emitSession, this::emitLogIfEnabled, this::emitStatisticsIfEnabled, LogRedirectionStrategy.NEVER_PRINT_LOGS);
+        retainSessionForShutdown(session);
         resultHandler.successAsync(result, toMap(session));
     }
 
     protected void ffmpegSessionGetAllStatistics(@NonNull final Integer sessionId, @Nullable final Integer waitTimeout, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1038,7 +1074,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void ffmpegSessionGetStatistics(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1055,6 +1091,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
     protected void ffprobeSession(@NonNull final List<String> arguments, @NonNull final Result result) {
         final FFprobeSession session = FFprobeSession.create(arguments.toArray(new String[0]), this::emitSession, this::emitLogIfEnabled, LogRedirectionStrategy.NEVER_PRINT_LOGS);
+        retainSessionForShutdown(session);
         resultHandler.successAsync(result, toMap(session));
     }
 
@@ -1062,11 +1099,12 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
     protected void mediaInformationSession(@NonNull final List<String> arguments, @NonNull final Result result) {
         final MediaInformationSession session = MediaInformationSession.create(arguments.toArray(new String[0]), this::emitSession, this::emitLogIfEnabled);
+        retainSessionForShutdown(session);
         resultHandler.successAsync(result, toMap(session));
     }
 
     protected void getMediaInformation(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1229,7 +1267,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void ffmpegSessionExecute(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1243,7 +1281,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void ffprobeSessionExecute(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1257,7 +1295,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void mediaInformationSessionExecute(@NonNull final Integer sessionId, @Nullable final Integer waitTimeout, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1277,7 +1315,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void asyncFFmpegSessionExecute(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1291,7 +1329,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void asyncFFprobeSessionExecute(@NonNull final Integer sessionId, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1305,7 +1343,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     }
 
     protected void asyncMediaInformationSessionExecute(@NonNull final Integer sessionId, @Nullable final Integer waitTimeout, @NonNull final Result result) {
-        final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
+        final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
         } else {
@@ -1354,11 +1392,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
     protected void getSession(@NonNull final Integer sessionId, @NonNull final Result result) {
         final Session session = FFmpegKitConfig.getSession(sessionId.longValue());
-        if (session == null) {
-            resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
-        } else {
-            resultHandler.successAsync(result, toMap(session));
-        }
+        resultHandler.successAsync(result, session == null ? null : toMap(session));
     }
 
     protected void getLastSession(@NonNull final Result result) {
@@ -1377,11 +1411,13 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
 
     protected void clearSessions(@NonNull final Result result) {
         FFmpegKitConfig.clearSessions();
+        shutdownSessions.clear();
         resultHandler.successAsync(result, null);
     }
 
     protected void deleteSession(@NonNull final Number sessionId, @NonNull final Result result) {
         FFmpegKitConfig.deleteSession(sessionId.longValue());
+        shutdownSessions.remove(sessionId.longValue());
         resultHandler.successAsync(result, null);
     }
 

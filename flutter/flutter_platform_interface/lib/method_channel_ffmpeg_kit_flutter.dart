@@ -123,6 +123,29 @@ class MethodChannelFFmpegKit extends FFmpegKitPlatform {
   // FFmpegKitConfig
 
   @override
+  Future<bool> ffmpegKitConfigShutdown(int waitTimeout) async {
+    RangeError.checkValueInInterval(
+        waitTimeout, -2147483648, 2147483647, 'waitTimeout');
+    final result = await _channel
+        .invokeMethod<bool>('shutdown', {'waitTimeout': waitTimeout});
+    if (result == null) {
+      throw PlatformException(
+          code: 'INVALID_RESPONSE', message: 'Missing shutdown result.');
+    }
+    return result;
+  }
+
+  @override
+  Future<bool> ffmpegKitConfigIsShutdown() async {
+    final result = await _channel.invokeMethod<bool>('isShutdown');
+    if (result == null) {
+      throw PlatformException(
+          code: 'INVALID_RESPONSE', message: 'Missing shutdown state.');
+    }
+    return result;
+  }
+
+  @override
   Future<void> ffmpegKitConfigEnableRedirection() async =>
       _channel.invokeMethod<void>('enableRedirection');
 

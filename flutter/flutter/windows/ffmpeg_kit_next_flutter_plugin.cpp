@@ -402,6 +402,8 @@ struct NativeState : std::enable_shared_from_this<NativeState> {
   std::mutex mutex;
   std::map<std::string, Resource> resources;
   std::set<long> sessions;
+  bool retain_shutdown_sessions = false;
+  std::map<long, std::shared_ptr<ffmpegkit::Session>> shutdown_sessions;
   std::vector<std::shared_ptr<PendingResponse>> pending_responses;
   std::shared_ptr<ffmpegkit::SessionDeleteListener> delete_listener;
 
@@ -480,36 +482,38 @@ private:
   std::weak_ptr<NativeState> state_;
 };
 
-std::shared_ptr<ffmpegkit::Session> GetSession(const Arguments &args) {
-  auto session = Config::getSession(args.Int("sessionId"));
-  if (!session)
-    throw ChannelError("SESSION_NOT_FOUND", "Session not found.");
-  return session;
+std::shared_ptr<ffmpegkit::Session> GetSession(const std::shared_ptr<NativeState> &state, const Arguments &args) {
+    auto session = Config::getSession(args.Int("sessionId"));
+    if (!session) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        auto found = state->shutdown_sessions.find(args.Int("sessionId"));
+        if (found != state->shutdown_sessions.end())
+            session = found->second;
+    }
+    if (!session)
+        throw ChannelError("SESSION_NOT_FOUND", "Session not found.");
+    return session;
 }
 
-std::shared_ptr<ffmpegkit::FFmpegSession>
-GetFFmpegSession(const Arguments &args) {
-  auto session = GetSession(args);
-  if (!session->isFFmpeg())
-    throw ChannelError("NOT_FFMPEG_SESSION", "Expected FFmpeg session.");
-  return std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+std::shared_ptr<ffmpegkit::FFmpegSession> GetFFmpegSession(const std::shared_ptr<NativeState> &state, const Arguments &args) {
+    auto session = GetSession(state, args);
+    if (!session->isFFmpeg())
+        throw ChannelError("NOT_FFMPEG_SESSION", "Expected FFmpeg session.");
+    return std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
 }
 
-std::shared_ptr<ffmpegkit::FFprobeSession>
-GetFFprobeSession(const Arguments &args) {
-  auto session = GetSession(args);
-  if (!session->isFFprobe())
-    throw ChannelError("NOT_FFPROBE_SESSION", "Expected FFprobe session.");
-  return std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
+std::shared_ptr<ffmpegkit::FFprobeSession> GetFFprobeSession(const std::shared_ptr<NativeState> &state, const Arguments &args) {
+    auto session = GetSession(state, args);
+    if (!session->isFFprobe())
+        throw ChannelError("NOT_FFPROBE_SESSION", "Expected FFprobe session.");
+    return std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
 }
 
-std::shared_ptr<ffmpegkit::MediaInformationSession>
-GetMediaSession(const Arguments &args) {
-  auto session = GetSession(args);
-  if (!session->isMediaInformation())
-    throw ChannelError("NOT_MEDIA_INFORMATION_SESSION",
-                       "Expected media information session.");
-  return std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+std::shared_ptr<ffmpegkit::MediaInformationSession> GetMediaSession(const std::shared_ptr<NativeState> &state, const Arguments &args) {
+    auto session = GetSession(state, args);
+    if (!session->isMediaInformation())
+        throw ChannelError("NOT_MEDIA_INFORMATION_SESSION", "Expected media information session.");
+    return std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
 }
 
 Value BytesResult(const std::shared_ptr<std::vector<uint8_t>> &bytes) {
@@ -524,6 +528,23 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
       DefaultTimeoutForAsynchronousMessagesInTransmit;
   const int wait = args.Int("waitTimeout", default_timeout, false);
   const int timeout = wait > 0 ? wait : default_timeout;
+  if (method == "shutdown") {
+      const int budget = args.Int("waitTimeout");
+      {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          state->retain_shutdown_sessions = true;
+      }
+      auto sessions = Config::getSessions();
+      {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if (sessions)
+              for (const auto &session : *sessions)
+                  state->shutdown_sessions[session->getSessionId()] = session;
+      }
+      return Value(Config::shutdown(budget));
+  }
+  if (method == "isShutdown")
+      return Value(Config::isShutdown());
   if (method == "getArch")
     return Value(ffmpegkit::ArchDetect::getArch());
   if (method == "getPlatform")
@@ -596,41 +617,42 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
     else
       session =
           ffmpegkit::MediaInformationSession::create(arguments, complete, log);
-    state->sessions.insert(session->getSessionId());
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->sessions.insert(session->getSessionId());
+        if (state->retain_shutdown_sessions || Config::isShutdown())
+            state->shutdown_sessions[session->getSessionId()] = session;
+    }
     return SessionValue(session);
   }
   if (method == "abstractSessionGetEndTime") {
-    const auto end = Milliseconds(GetSession(args)->getEndTime());
-    return end ? Value(end) : Value();
+      const auto end = Milliseconds(GetSession(state, args)->getEndTime());
+      return end ? Value(end) : Value();
   }
   if (method == "abstractSessionGetDuration")
-    return Value(static_cast<int64_t>(GetSession(args)->getDuration()));
+      return Value(static_cast<int64_t>(GetSession(state, args)->getDuration()));
   if (method == "abstractSessionGetAllLogs")
-    return ListValue(GetSession(args)->getAllLogsWithTimeout(timeout),
-                     LogValue);
+      return ListValue(GetSession(state, args)->getAllLogsWithTimeout(timeout), LogValue);
   if (method == "abstractSessionGetLogs")
-    return ListValue(GetSession(args)->getLogs(), LogValue);
+      return ListValue(GetSession(state, args)->getLogs(), LogValue);
   if (method == "abstractSessionGetAllLogsAsString")
-    return Value(
-        Utf8(GetSession(args)->getAllLogsAsStringWithTimeout(timeout)));
+      return Value(Utf8(GetSession(state, args)->getAllLogsAsStringWithTimeout(timeout)));
   if (method == "abstractSessionGetState")
-    return Value(static_cast<int>(GetSession(args)->getState()));
+      return Value(static_cast<int>(GetSession(state, args)->getState()));
   if (method == "abstractSessionGetReturnCode") {
-    const auto code = GetSession(args)->getReturnCode();
-    return code ? Value(code->getValue()) : Value();
+      const auto code = GetSession(state, args)->getReturnCode();
+      return code ? Value(code->getValue()) : Value();
   }
   if (method == "abstractSessionGetFailStackTrace")
-    return Value(Utf8(GetSession(args)->getFailStackTrace()));
+      return Value(Utf8(GetSession(state, args)->getFailStackTrace()));
   if (method == "thereAreAsynchronousMessagesInTransmit")
-    return Value(GetSession(args)->thereAreAsynchronousMessagesInTransmit());
+      return Value(GetSession(state, args)->thereAreAsynchronousMessagesInTransmit());
   if (method == "ffmpegSessionGetAllStatistics")
-    return ListValue(
-        GetFFmpegSession(args)->getAllStatisticsWithTimeout(timeout),
-        StatisticsValue);
+      return ListValue(GetFFmpegSession(state, args)->getAllStatisticsWithTimeout(timeout), StatisticsValue);
   if (method == "ffmpegSessionGetStatistics")
-    return ListValue(GetFFmpegSession(args)->getStatistics(), StatisticsValue);
+      return ListValue(GetFFmpegSession(state, args)->getStatistics(), StatisticsValue);
   if (method == "getMediaInformation")
-    return MediaValue(GetMediaSession(args)->getMediaInformation());
+      return MediaValue(GetMediaSession(state, args)->getMediaInformation());
   if (method == "mediaInformationJsonParserFrom")
     return MediaValue(ffmpegkit::MediaInformationJsonParser::from(
         args.String("ffprobeJsonOutput")));
@@ -645,28 +667,28 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
     }
   }
   if (method == "ffmpegSessionExecute") {
-    Config::ffmpegExecute(GetFFmpegSession(args));
-    return Value();
+      Config::ffmpegExecute(GetFFmpegSession(state, args));
+      return Value();
   }
   if (method == "ffprobeSessionExecute") {
-    Config::ffprobeExecute(GetFFprobeSession(args));
-    return Value();
+      Config::ffprobeExecute(GetFFprobeSession(state, args));
+      return Value();
   }
   if (method == "mediaInformationSessionExecute") {
-    Config::getMediaInformationExecute(GetMediaSession(args), timeout);
-    return Value();
+      Config::getMediaInformationExecute(GetMediaSession(state, args), timeout);
+      return Value();
   }
   if (method == "asyncFFmpegSessionExecute") {
-    Config::asyncFFmpegExecute(GetFFmpegSession(args));
-    return Value();
+      Config::asyncFFmpegExecute(GetFFmpegSession(state, args));
+      return Value();
   }
   if (method == "asyncFFprobeSessionExecute") {
-    Config::asyncFFprobeExecute(GetFFprobeSession(args));
-    return Value();
+      Config::asyncFFprobeExecute(GetFFprobeSession(state, args));
+      return Value();
   }
   if (method == "asyncMediaInformationSessionExecute") {
-    Config::asyncGetMediaInformationExecute(GetMediaSession(args), timeout);
-    return Value();
+      Config::asyncGetMediaInformationExecute(GetMediaSession(state, args), timeout);
+      return Value();
   }
   if (method == "enableRedirection") {
     state->logs = true;
@@ -772,10 +794,14 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
   }
   if (method == "clearSessions") {
     Config::clearSessions();
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->shutdown_sessions.clear();
     return Value();
   }
   if (method == "deleteSession") {
     Config::deleteSession(args.Int("sessionId"));
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->shutdown_sessions.erase(args.Int("sessionId"));
     return Value();
   }
   if (method == "cancel") {
@@ -865,9 +891,11 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
     const auto stream =
         state->FindResource<ffmpegkit::FFmpegKitStreamInput>(args);
     const auto bytes = args.Bytes("data");
-    return Value(args.Find("timeoutMs")
-                     ? stream->write(bytes, args.Int("timeoutMs"))
-                     : stream->write(bytes));
+    try {
+        return Value(args.Find("timeoutMs") ? stream->write(bytes, args.Int("timeoutMs")) : stream->write(bytes));
+    } catch (const std::exception &error) {
+        throw ChannelError("STREAM_INPUT_WRITE_FAILED", error.what());
+    }
   }
   if (method == "streamInputCloseInput") {
     state->FindResource<ffmpegkit::FFmpegKitStreamInput>(args)->closeInput();
@@ -956,15 +984,7 @@ public:
           };
           // These calls can block on FFmpeg or stream I/O and must not run on
           // the Flutter platform thread.
-          static const std::set<std::string> background{
-              "ffmpegSessionExecute",
-              "ffprobeSessionExecute",
-              "mediaInformationSessionExecute",
-              "abstractSessionGetAllLogs",
-              "abstractSessionGetAllLogsAsString",
-              "ffmpegSessionGetAllStatistics",
-              "streamInputWrite",
-              "streamOutputRead"};
+          static const std::set<std::string> background{"shutdown", "ffmpegSessionExecute", "ffprobeSessionExecute", "mediaInformationSessionExecute", "abstractSessionGetAllLogs", "abstractSessionGetAllLogsAsString", "ffmpegSessionGetAllStatistics", "streamInputWrite", "streamOutputRead"};
           if (background.count(method)) {
             try {
               std::thread([run = std::move(run)] { run(true); }).detach();
