@@ -140,8 +140,7 @@ inline void serializeValue(const Value &value, std::string &out) {
         break;
     case Value::Type::Int: {
         char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "%lld",
-                      static_cast<long long>(*value.getInt()));
+        std::snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(*value.getInt()));
         out += buffer;
         break;
     }
@@ -252,8 +251,7 @@ class Parser {
     /** Moves past one or more decimal digits; false when there is none. */
     bool acceptDigits() {
         const size_t start = _position;
-        while (_position < _text.size() && _text[_position] >= '0' &&
-               _text[_position] <= '9') {
+        while (_position < _text.size() && _text[_position] >= '0' && _text[_position] <= '9') {
             _position++;
         }
         return _position > start;
@@ -356,9 +354,7 @@ class Parser {
                 if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
                     // A high surrogate is only valid when its low surrogate
                     // follows; the pair encodes a single codepoint.
-                    if (_position + 1 >= _text.size() ||
-                        _text[_position] != '\\' ||
-                        _text[_position + 1] != 'u') {
+                    if (_position + 1 >= _text.size() || _text[_position] != '\\' || _text[_position + 1] != 'u') {
                         return false;
                     }
                     _position += 2;
@@ -366,8 +362,7 @@ class Parser {
                     if (!parseHex4(low) || low < 0xdc00 || low > 0xdfff) {
                         return false;
                     }
-                    codepoint =
-                        0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
                 } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
                     // A low surrogate is only valid after a high surrogate
                     return false;
@@ -634,6 +629,30 @@ void setError(const char *message) {
     threadErrorSet = true;
 }
 
+/*
+ * Consumer code - a callback, a session delete listener or a free function -
+ * runs with an error slot of its own: what its own ffk_* calls leave there is
+ * dropped when it returns, and the slot of the code around it is put back.
+ * Consumer code can run inside an entry point, as the complete callbacks of an
+ * asynchronous execution after shutdown do, and must not change what that
+ * entry point reports.
+ */
+class ConsumerErrorScope {
+  public:
+    ConsumerErrorScope() : savedError(std::move(threadError)), savedSet(threadErrorSet) {
+        threadError.clear();
+        threadErrorSet = false;
+    }
+    ~ConsumerErrorScope() {
+        threadError = std::move(savedError);
+        threadErrorSet = savedSet;
+    }
+
+  private:
+    std::string savedError;
+    bool savedSet;
+};
+
 /* ------------------------------------------------------------------------ */
 /* Allocation                                                                */
 /* ------------------------------------------------------------------------ */
@@ -759,8 +778,7 @@ std::string toText(const char *value, const char *what) {
         return std::string();
     }
     if (!isValidUtf8(value)) {
-        throw std::invalid_argument(std::string("The ") + what +
-                                    " is not valid UTF-8.");
+        throw std::invalid_argument(std::string("The ") + what + " is not valid UTF-8.");
     }
     return std::string(value);
 }
@@ -800,8 +818,7 @@ internal::SessionState toSessionState(const int value) {
     case internal::SessionStateCompleted:
         return static_cast<internal::SessionState>(value);
     }
-    throw std::invalid_argument("The state " + std::to_string(value) +
-                                " is not a session state.");
+    throw std::invalid_argument("The state " + std::to_string(value) + " is not a session state.");
 }
 
 /** Converts a log redirection strategy. */
@@ -814,8 +831,7 @@ internal::LogRedirectionStrategy toLogRedirectionStrategy(const int value) {
     case internal::LogRedirectionStrategyNeverPrintLogs:
         return static_cast<internal::LogRedirectionStrategy>(value);
     }
-    throw std::invalid_argument("The strategy " + std::to_string(value) +
-                                " is not a log redirection strategy.");
+    throw std::invalid_argument("The strategy " + std::to_string(value) + " is not a log redirection strategy.");
 }
 
 /**
@@ -824,11 +840,7 @@ internal::LogRedirectionStrategy toLogRedirectionStrategy(const int value) {
  * which is what the C++ create functions without the parameter use. Anything
  * else has to be a log redirection strategy.
  */
-internal::LogRedirectionStrategy toStrategy(const int value) {
-    return value == useConfiguredStrategy
-               ? internal::FFmpegKitConfig::getLogRedirectionStrategy()
-               : toLogRedirectionStrategy(value);
-}
+internal::LogRedirectionStrategy toStrategy(const int value) { return value == useConfiguredStrategy ? internal::FFmpegKitConfig::getLogRedirectionStrategy() : toLogRedirectionStrategy(value); }
 
 /** Converts a signal: one of the signals that the library can ignore. */
 internal::Signal toSignal(const int value) {
@@ -840,8 +852,7 @@ internal::Signal toSignal(const int value) {
     case internal::SignalXcpu:
         return static_cast<internal::Signal>(value);
     }
-    throw std::invalid_argument("The signal " + std::to_string(value) +
-                                " cannot be ignored.");
+    throw std::invalid_argument("The signal " + std::to_string(value) + " cannot be ignored.");
 }
 
 /**
@@ -857,25 +868,19 @@ bool isPropertyKey(const char *key) {
  * and a NULL entry is an empty text. `what` names one entry in the message of
  * an entry that is not valid UTF-8.
  */
-std::list<std::string> toArgumentList(const char *const *arguments,
-                                      const size_t argumentCount,
-                                      const char *what = "Argument") {
+std::list<std::string> toArgumentList(const char *const *arguments, const size_t argumentCount, const char *what = "Argument") {
     std::list<std::string> list;
     for (size_t index = 0; index < argumentCount; index++) {
         const char *argument = arguments == nullptr ? nullptr : arguments[index];
         if (argument != nullptr && !isValidUtf8(argument)) {
-            throw std::invalid_argument(std::string(what) + " " +
-                                        std::to_string(index) +
-                                        " is not valid UTF-8.");
+            throw std::invalid_argument(std::string(what) + " " + std::to_string(index) + " is not valid UTF-8.");
         }
         list.push_back(argument == nullptr ? std::string() : std::string(argument));
     }
     return list;
 }
 
-std::map<std::string, std::string> toStringMap(const char *const *keys,
-                                               const char *const *values,
-                                               const size_t count) {
+std::map<std::string, std::string> toStringMap(const char *const *keys, const char *const *values, const size_t count) {
     std::map<std::string, std::string> mapping;
     for (size_t index = 0; index < count; index++) {
         const char *key = keys == nullptr ? nullptr : keys[index];
@@ -884,21 +889,14 @@ std::map<std::string, std::string> toStringMap(const char *const *keys,
             continue;
         }
         if (!isValidUtf8(key) || (value != nullptr && !isValidUtf8(value))) {
-            throw std::invalid_argument("Mapping entry " + std::to_string(index) +
-                                        " is not valid UTF-8.");
+            throw std::invalid_argument("Mapping entry " + std::to_string(index) + " is not valid UTF-8.");
         }
         mapping[key] = value == nullptr ? std::string() : std::string(value);
     }
     return mapping;
 }
 
-int64_t toEpochMilliseconds(
-    const std::chrono::time_point<std::chrono::system_clock> &value) {
-    return static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            value.time_since_epoch())
-            .count());
-}
+int64_t toEpochMilliseconds(const std::chrono::time_point<std::chrono::system_clock> &value) { return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(value.time_since_epoch()).count()); }
 
 /** Serializes a value into JSON text, or returns NULL when there is none. */
 char *toJson(const std::shared_ptr<ffmpegkit::json::Value> &value) {
@@ -959,7 +957,10 @@ std::shared_ptr<void> adoptUserData(void *userData, ffk_free_cb freeUserData) {
         // Nothing to release: the consumer keeps ownership of the cookie.
         return std::shared_ptr<void>(userData, [](void *) {});
     }
-    return std::shared_ptr<void>(userData, freeUserData);
+    return std::shared_ptr<void>(userData, [freeUserData](void *data) {
+        ConsumerErrorScope scope;
+        freeUserData(data);
+    });
 }
 
 /*
@@ -976,6 +977,7 @@ struct LogCallbackAdapter {
     void operator()(const std::shared_ptr<internal::Log> log) const {
         std::unique_ptr<FFKLog> handle(new FFKLog());
         handle->value = log;
+        ConsumerErrorScope scope;
         try {
             callback(handle.get(), userData);
         } catch (...) {
@@ -992,6 +994,7 @@ struct StatisticsCallbackAdapter {
     void operator()(const std::shared_ptr<internal::Statistics> statistics) const {
         std::unique_ptr<FFKStatistics> handle(new FFKStatistics());
         handle->value = statistics;
+        ConsumerErrorScope scope;
         try {
             callback(handle.get(), userData);
         } catch (...) {
@@ -1007,6 +1010,7 @@ template <typename SessionType> struct SessionCallbackAdapter {
     void operator()(const std::shared_ptr<SessionType> session) const {
         std::unique_ptr<FFKSession> handle(new FFKSession());
         handle->value = session;
+        ConsumerErrorScope scope;
         try {
             callback(handle.get(), userData);
         } catch (...) {
@@ -1014,15 +1018,11 @@ template <typename SessionType> struct SessionCallbackAdapter {
     }
 };
 
-using FFmpegSessionCallbackAdapter =
-    SessionCallbackAdapter<internal::FFmpegSession>;
-using FFprobeSessionCallbackAdapter =
-    SessionCallbackAdapter<internal::FFprobeSession>;
-using MediaInformationSessionCallbackAdapter =
-    SessionCallbackAdapter<internal::MediaInformationSession>;
+using FFmpegSessionCallbackAdapter = SessionCallbackAdapter<internal::FFmpegSession>;
+using FFprobeSessionCallbackAdapter = SessionCallbackAdapter<internal::FFprobeSession>;
+using MediaInformationSessionCallbackAdapter = SessionCallbackAdapter<internal::MediaInformationSession>;
 
-internal::LogCallback makeLogCallback(ffk_log_cb callback, void *userData,
-                                      ffk_free_cb freeUserData) {
+internal::LogCallback makeLogCallback(ffk_log_cb callback, void *userData, ffk_free_cb freeUserData) {
     if (callback == nullptr) {
         // Releasing an unused cookie right away keeps the contract simple
         adoptUserData(userData, freeUserData);
@@ -1035,9 +1035,7 @@ internal::LogCallback makeLogCallback(ffk_log_cb callback, void *userData,
     return internal::LogCallback(adapter);
 }
 
-internal::StatisticsCallback makeStatisticsCallback(ffk_statistics_cb callback,
-                                                    void *userData,
-                                                    ffk_free_cb freeUserData) {
+internal::StatisticsCallback makeStatisticsCallback(ffk_statistics_cb callback, void *userData, ffk_free_cb freeUserData) {
     if (callback == nullptr) {
         adoptUserData(userData, freeUserData);
         return internal::StatisticsCallback();
@@ -1049,9 +1047,7 @@ internal::StatisticsCallback makeStatisticsCallback(ffk_statistics_cb callback,
     return internal::StatisticsCallback(adapter);
 }
 
-template <typename SessionType, typename CallbackType>
-CallbackType makeSessionCallback(ffk_session_cb callback, void *userData,
-                                 ffk_free_cb freeUserData) {
+template <typename SessionType, typename CallbackType> CallbackType makeSessionCallback(ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
     if (callback == nullptr) {
         adoptUserData(userData, freeUserData);
         return CallbackType();
@@ -1067,9 +1063,7 @@ CallbackType makeSessionCallback(ffk_session_cb callback, void *userData,
  * Reads the C function pointer and cookie back out of a std::function, when
  * that function wraps one of the adapters above.
  */
-template <typename AdapterType, typename FunctionType, typename CallbackType>
-int readCallback(const FunctionType &function, CallbackType *callback,
-                 void **userData) {
+template <typename AdapterType, typename FunctionType, typename CallbackType> int readCallback(const FunctionType &function, CallbackType *callback, void **userData) {
     if (!function) {
         return 0;
     }
@@ -1098,12 +1092,10 @@ int readCallback(const FunctionType &function, CallbackType *callback,
  */
 class SessionDeleteListenerAdapter : public internal::SessionDeleteListener {
   public:
-    SessionDeleteListenerAdapter(ffk_session_delete_cb callback, void *userData,
-                                 ffk_free_cb freeUserData)
-        : _callback{callback}, _userData{userData},
-          _userDataOwner{adoptUserData(userData, freeUserData)} {}
+    SessionDeleteListenerAdapter(ffk_session_delete_cb callback, void *userData, ffk_free_cb freeUserData) : _callback{callback}, _userData{userData}, _userDataOwner{adoptUserData(userData, freeUserData)} {}
 
     void sessionDeleted(const long sessionId) override {
+        ConsumerErrorScope scope;
         try {
             _callback(sessionId, _userData);
         } catch (...) {
@@ -1121,8 +1113,7 @@ std::mutex &sessionDeleteListenerMutex() {
     return mutex;
 }
 
-std::map<long, std::shared_ptr<SessionDeleteListenerAdapter>> &
-sessionDeleteListeners() {
+std::map<long, std::shared_ptr<SessionDeleteListenerAdapter>> &sessionDeleteListeners() {
     // Never destroyed: the adapters own consumer cookies, and releasing them
     // during static destruction at process exit could call into consumer code
     // that is already gone.
@@ -1188,8 +1179,7 @@ FFK_DEFINE_VALUE_LIST(ffk_string_list, FFKStringList)
 FFK_DEFINE_HANDLE_LIST(ffk_session_list, FFKSessionList, FFKSession)
 FFK_DEFINE_HANDLE_LIST(ffk_log_list, FFKLogList, FFKLog)
 FFK_DEFINE_HANDLE_LIST(ffk_statistics_list, FFKStatisticsList, FFKStatistics)
-FFK_DEFINE_HANDLE_LIST(ffk_stream_information_list, FFKStreamInformationList,
-                       FFKStreamInformation)
+FFK_DEFINE_HANDLE_LIST(ffk_stream_information_list, FFKStreamInformationList, FFKStreamInformation)
 FFK_DEFINE_HANDLE_LIST(ffk_chapter_list, FFKChapterList, FFKChapter)
 
 char *ffk_string_list_get(const FFKStringList *list, const size_t index) {
@@ -1205,13 +1195,8 @@ char *ffk_string_list_get(const FFKStringList *list, const size_t index) {
 /* Log                                                                       */
 /* ------------------------------------------------------------------------ */
 
-FFKLog *ffk_log_create(const long sessionId, const int level,
-                       const char *message) {
-    return guard([&]() -> FFKLog * {
-        return makeHandle<FFKLog>(std::make_shared<internal::Log>(
-            sessionId, static_cast<internal::Level>(level),
-            toText(message, "message").c_str()));
-    });
+FFKLog *ffk_log_create(const long sessionId, const int level, const char *message) {
+    return guard([&]() -> FFKLog * { return makeHandle<FFKLog>(std::make_shared<internal::Log>(sessionId, static_cast<internal::Level>(level), toText(message, "message").c_str())); });
 }
 
 void ffk_log_free(FFKLog *log) { delete log; }
@@ -1238,17 +1223,8 @@ char *ffk_log_get_message(const FFKLog *log) {
 /* Statistics                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFKStatistics *ffk_statistics_create(const long sessionId,
-                                     const int videoFrameNumber,
-                                     const float videoFps,
-                                     const float videoQuality,
-                                     const int64_t size, const double time,
-                                     const double bitrate, const double speed) {
-    return guard([&]() -> FFKStatistics * {
-        return makeHandle<FFKStatistics>(std::make_shared<internal::Statistics>(
-            sessionId, videoFrameNumber, videoFps, videoQuality, size, time,
-            bitrate, speed));
-    });
+FFKStatistics *ffk_statistics_create(const long sessionId, const int videoFrameNumber, const float videoFps, const float videoQuality, const int64_t size, const double time, const double bitrate, const double speed) {
+    return guard([&]() -> FFKStatistics * { return makeHandle<FFKStatistics>(std::make_shared<internal::Statistics>(sessionId, videoFrameNumber, videoFps, videoQuality, size, time, bitrate, speed)); });
 }
 
 void ffk_statistics_free(FFKStatistics *statistics) { delete statistics; }
@@ -1274,80 +1250,48 @@ FFK_DEFINE_STATISTICS_GETTER(speed, double, getSpeed)
 /* Session                                                                   */
 /* ------------------------------------------------------------------------ */
 
-FFKSession *ffk_abstract_session_create(const char *const *arguments,
-                                        const size_t argumentCount,
-                                        ffk_log_cb logCallback,
-                                        void *logUserData, ffk_free_cb logFree,
-                                        const int logRedirectionStrategy) {
+FFKSession *ffk_abstract_session_create(const char *const *arguments, const size_t argumentCount, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, const int logRedirectionStrategy) {
     return guard([&]() -> FFKSession * {
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
         const auto strategy = toStrategy(logRedirectionStrategy);
-        return makeHandle<FFKSession>(std::make_shared<internal::AbstractSession>(
-            toArgumentList(arguments, argumentCount), log, strategy));
+        return makeHandle<FFKSession>(std::make_shared<internal::AbstractSession>(toArgumentList(arguments, argumentCount), log, strategy));
     });
 }
 
-FFKSession *ffk_ffmpeg_session_create(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree, ffk_statistics_cb statisticsCallback,
-    void *statisticsUserData, ffk_free_cb statisticsFree,
-    const int logRedirectionStrategy) {
+FFKSession *ffk_ffmpeg_session_create(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, ffk_statistics_cb statisticsCallback,
+                                      void *statisticsUserData, ffk_free_cb statisticsFree, const int logRedirectionStrategy) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFmpegSession,
-                                internal::FFmpegSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFmpegSession, internal::FFmpegSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
-        const auto statistics = makeStatisticsCallback(
-            statisticsCallback, statisticsUserData, statisticsFree);
+        const auto statistics = makeStatisticsCallback(statisticsCallback, statisticsUserData, statisticsFree);
         const auto argumentList = toArgumentList(arguments, argumentCount);
 
-        return makeHandle<FFKSession>(internal::FFmpegSession::create(
-            argumentList, complete, log, statistics,
-            toStrategy(logRedirectionStrategy)));
+        return makeHandle<FFKSession>(internal::FFmpegSession::create(argumentList, complete, log, statistics, toStrategy(logRedirectionStrategy)));
     });
 }
 
-FFKSession *ffk_ffprobe_session_create(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree, const int logRedirectionStrategy) {
+FFKSession *ffk_ffprobe_session_create(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, const int logRedirectionStrategy) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFprobeSession,
-                                internal::FFprobeSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFprobeSession, internal::FFprobeSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
         const auto argumentList = toArgumentList(arguments, argumentCount);
 
-        return makeHandle<FFKSession>(internal::FFprobeSession::create(
-            argumentList, complete, log, toStrategy(logRedirectionStrategy)));
+        return makeHandle<FFKSession>(internal::FFprobeSession::create(argumentList, complete, log, toStrategy(logRedirectionStrategy)));
     });
 }
 
-FFKSession *ffk_media_information_session_create(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree) {
+FFKSession *ffk_media_information_session_create(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::MediaInformationSession,
-                                internal::MediaInformationSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::MediaInformationSession, internal::MediaInformationSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
         const auto argumentList = toArgumentList(arguments, argumentCount);
-        return makeHandle<FFKSession>(internal::MediaInformationSession::create(
-            argumentList, complete, log));
+        return makeHandle<FFKSession>(internal::MediaInformationSession::create(argumentList, complete, log));
     });
 }
 
@@ -1366,27 +1310,15 @@ long ffk_session_get_session_id(const FFKSession *session) {
 }
 
 int64_t ffk_session_get_create_time(const FFKSession *session) {
-    return guard([&]() -> int64_t {
-        return session == nullptr
-                   ? 0
-                   : toEpochMilliseconds(session->value->getCreateTime());
-    });
+    return guard([&]() -> int64_t { return session == nullptr ? 0 : toEpochMilliseconds(session->value->getCreateTime()); });
 }
 
 int64_t ffk_session_get_start_time(const FFKSession *session) {
-    return guard([&]() -> int64_t {
-        return session == nullptr
-                   ? 0
-                   : toEpochMilliseconds(session->value->getStartTime());
-    });
+    return guard([&]() -> int64_t { return session == nullptr ? 0 : toEpochMilliseconds(session->value->getStartTime()); });
 }
 
 int64_t ffk_session_get_end_time(const FFKSession *session) {
-    return guard([&]() -> int64_t {
-        return session == nullptr
-                   ? 0
-                   : toEpochMilliseconds(session->value->getEndTime());
-    });
+    return guard([&]() -> int64_t { return session == nullptr ? 0 : toEpochMilliseconds(session->value->getEndTime()); });
 }
 
 long ffk_session_get_duration(const FFKSession *session) {
@@ -1405,20 +1337,15 @@ FFKStringList *ffk_session_get_arguments(const FFKSession *session) {
 }
 
 char *ffk_session_get_command(const FFKSession *session) {
-    return guard([&]() -> char * {
-        return session == nullptr ? nullptr
-                                  : duplicateString(session->value->getCommand());
-    });
+    return guard([&]() -> char * { return session == nullptr ? nullptr : duplicateString(session->value->getCommand()); });
 }
 
-FFKLogList *ffk_session_get_all_logs_with_timeout(const FFKSession *session,
-                                                  const int waitTimeout) {
+FFKLogList *ffk_session_get_all_logs_with_timeout(const FFKSession *session, const int waitTimeout) {
     return guard([&]() -> FFKLogList * {
         if (session == nullptr) {
             return nullptr;
         }
-        return makeList<FFKLogList>(
-            session->value->getAllLogsWithTimeout(waitTimeout));
+        return makeList<FFKLogList>(session->value->getAllLogsWithTimeout(waitTimeout));
     });
 }
 
@@ -1440,45 +1367,24 @@ FFKLogList *ffk_session_get_logs(const FFKSession *session) {
     });
 }
 
-char *ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session,
-                                                      const int waitTimeout) {
-    return guard([&]() -> char * {
-        return session == nullptr
-                   ? nullptr
-                   : duplicateString(
-                         session->value->getAllLogsAsStringWithTimeout(
-                             waitTimeout));
-    });
+char *ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session, const int waitTimeout) {
+    return guard([&]() -> char * { return session == nullptr ? nullptr : duplicateString(session->value->getAllLogsAsStringWithTimeout(waitTimeout)); });
 }
 
 char *ffk_session_get_all_logs_as_string(const FFKSession *session) {
-    return guard([&]() -> char * {
-        return session == nullptr
-                   ? nullptr
-                   : duplicateString(session->value->getAllLogsAsString());
-    });
+    return guard([&]() -> char * { return session == nullptr ? nullptr : duplicateString(session->value->getAllLogsAsString()); });
 }
 
 char *ffk_session_get_logs_as_string(const FFKSession *session) {
-    return guard([&]() -> char * {
-        return session == nullptr
-                   ? nullptr
-                   : duplicateString(session->value->getLogsAsString());
-    });
+    return guard([&]() -> char * { return session == nullptr ? nullptr : duplicateString(session->value->getLogsAsString()); });
 }
 
 char *ffk_session_get_output(const FFKSession *session) {
-    return guard([&]() -> char * {
-        return session == nullptr ? nullptr
-                                  : duplicateString(session->value->getOutput());
-    });
+    return guard([&]() -> char * { return session == nullptr ? nullptr : duplicateString(session->value->getOutput()); });
 }
 
 int ffk_session_get_state(const FFKSession *session) {
-    return guard([&]() -> int {
-        return session == nullptr ? 0
-                                  : static_cast<int>(session->value->getState());
-    });
+    return guard([&]() -> int { return session == nullptr ? 0 : static_cast<int>(session->value->getState()); });
 }
 
 int ffk_session_get_return_code(const FFKSession *session, int *value) {
@@ -1502,8 +1408,7 @@ char *ffk_session_get_fail_stack_trace(const FFKSession *session) {
         // The C++ API answers an empty string until the session fails; the C
         // API answers NULL, so that it can tell "not failed" from "failed
         // without a reason"
-        if (session == nullptr ||
-            session->value->getState() != internal::SessionStateFailed) {
+        if (session == nullptr || session->value->getState() != internal::SessionStateFailed) {
             return nullptr;
         }
         return duplicateString(session->value->getFailStackTrace());
@@ -1511,25 +1416,14 @@ char *ffk_session_get_fail_stack_trace(const FFKSession *session) {
 }
 
 int ffk_session_get_log_redirection_strategy(const FFKSession *session) {
-    return guard([&]() -> int {
-        return session == nullptr
-                   ? 0
-                   : static_cast<int>(session->value->getLogRedirectionStrategy());
-    });
+    return guard([&]() -> int { return session == nullptr ? 0 : static_cast<int>(session->value->getLogRedirectionStrategy()); });
 }
 
-int ffk_session_there_are_asynchronous_messages_in_transmit(
-    const FFKSession *session) {
-    return guard([&]() -> int {
-        return session != nullptr &&
-                       session->value->thereAreAsynchronousMessagesInTransmit()
-                   ? 1
-                   : 0;
-    });
+int ffk_session_there_are_asynchronous_messages_in_transmit(const FFKSession *session) {
+    return guard([&]() -> int { return session != nullptr && session->value->thereAreAsynchronousMessagesInTransmit() ? 1 : 0; });
 }
 
-void ffk_session_wait_for_asynchronous_messages_in_transmit(
-    const FFKSession *session, const int timeout) {
+void ffk_session_wait_for_asynchronous_messages_in_transmit(const FFKSession *session, const int timeout) {
     guard([&]() {
         const auto abstractSession = sessionAs<internal::AbstractSession>(session);
         if (abstractSession != nullptr) {
@@ -1538,15 +1432,12 @@ void ffk_session_wait_for_asynchronous_messages_in_transmit(
     });
 }
 
-void ffk_session_add_log(FFKSession *session, const long logSessionId,
-                         const int level, const char *message) {
+void ffk_session_add_log(FFKSession *session, const long logSessionId, const int level, const char *message) {
     guard([&]() {
         if (session == nullptr) {
             return;
         }
-        session->value->addLog(std::make_shared<internal::Log>(
-            logSessionId, static_cast<internal::Level>(level),
-            toText(message, "message").c_str()));
+        session->value->addLog(std::make_shared<internal::Log>(logSessionId, static_cast<internal::Level>(level), toText(message, "message").c_str()));
     });
 }
 
@@ -1561,8 +1452,7 @@ void ffk_session_start_running(FFKSession *session) {
 void ffk_session_complete(FFKSession *session, const int returnCode) {
     guard([&]() {
         if (session != nullptr) {
-            session->value->complete(
-                std::make_shared<internal::ReturnCode>(returnCode));
+            session->value->complete(std::make_shared<internal::ReturnCode>(returnCode));
         }
     });
 }
@@ -1601,37 +1491,28 @@ void ffk_session_cancel(FFKSession *session) {
     });
 }
 
-int ffk_session_get_log_callback(const FFKSession *session,
-                                 ffk_log_cb *callback, void **userData) {
+int ffk_session_get_log_callback(const FFKSession *session, ffk_log_cb *callback, void **userData) {
     return guard([&]() -> int {
         if (session == nullptr) {
             return 0;
         }
-        return readCallback<LogCallbackAdapter>(session->value->getLogCallback(),
-                                                callback, userData);
+        return readCallback<LogCallbackAdapter>(session->value->getLogCallback(), callback, userData);
     });
 }
 
-int ffk_session_get_complete_callback(const FFKSession *session,
-                                      ffk_session_cb *callback,
-                                      void **userData) {
+int ffk_session_get_complete_callback(const FFKSession *session, ffk_session_cb *callback, void **userData) {
     return guard([&]() -> int {
         if (session == nullptr) {
             return 0;
         }
         if (const auto ffmpegSession = sessionAs<internal::FFmpegSession>(session)) {
-            return readCallback<FFmpegSessionCallbackAdapter>(
-                ffmpegSession->getCompleteCallback(), callback, userData);
+            return readCallback<FFmpegSessionCallbackAdapter>(ffmpegSession->getCompleteCallback(), callback, userData);
         }
         if (const auto ffprobeSession = sessionAs<internal::FFprobeSession>(session)) {
-            return readCallback<FFprobeSessionCallbackAdapter>(
-                ffprobeSession->getCompleteCallback(), callback, userData);
+            return readCallback<FFprobeSessionCallbackAdapter>(ffprobeSession->getCompleteCallback(), callback, userData);
         }
-        if (const auto mediaInformationSession =
-                sessionAs<internal::MediaInformationSession>(session)) {
-            return readCallback<MediaInformationSessionCallbackAdapter>(
-                mediaInformationSession->getCompleteCallback(), callback,
-                userData);
+        if (const auto mediaInformationSession = sessionAs<internal::MediaInformationSession>(session)) {
+            return readCallback<MediaInformationSessionCallbackAdapter>(mediaInformationSession->getCompleteCallback(), callback, userData);
         }
         return 0;
     });
@@ -1639,16 +1520,13 @@ int ffk_session_get_complete_callback(const FFKSession *session,
 
 /* ---- FFmpeg session specific -------------------------------------------- */
 
-FFKStatisticsList *
-ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session,
-                                                   const int waitTimeout) {
+FFKStatisticsList *ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session, const int waitTimeout) {
     return guard([&]() -> FFKStatisticsList * {
         const auto ffmpegSession = sessionAs<internal::FFmpegSession>(session);
         if (ffmpegSession == nullptr) {
             return nullptr;
         }
-        return makeList<FFKStatisticsList>(
-            ffmpegSession->getAllStatisticsWithTimeout(waitTimeout));
+        return makeList<FFKStatisticsList>(ffmpegSession->getAllStatisticsWithTimeout(waitTimeout));
     });
 }
 
@@ -1672,20 +1550,17 @@ FFKStatisticsList *ffk_ffmpeg_session_get_statistics(FFKSession *session) {
     });
 }
 
-FFKStatistics *
-ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session) {
+FFKStatistics *ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session) {
     return guard([&]() -> FFKStatistics * {
         const auto ffmpegSession = sessionAs<internal::FFmpegSession>(session);
         if (ffmpegSession == nullptr) {
             return nullptr;
         }
-        return makeHandle<FFKStatistics>(
-            ffmpegSession->getLastReceivedStatistics());
+        return makeHandle<FFKStatistics>(ffmpegSession->getLastReceivedStatistics());
     });
 }
 
-void ffk_ffmpeg_session_add_statistics(FFKSession *session,
-                                       const FFKStatistics *statistics) {
+void ffk_ffmpeg_session_add_statistics(FFKSession *session, const FFKStatistics *statistics) {
     guard([&]() {
         const auto ffmpegSession = sessionAs<internal::FFmpegSession>(session);
         if (ffmpegSession == nullptr || statistics == nullptr) {
@@ -1695,46 +1570,35 @@ void ffk_ffmpeg_session_add_statistics(FFKSession *session,
     });
 }
 
-int ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session,
-                                               ffk_statistics_cb *callback,
-                                               void **userData) {
+int ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session, ffk_statistics_cb *callback, void **userData) {
     return guard([&]() -> int {
         const auto ffmpegSession = sessionAs<internal::FFmpegSession>(session);
         if (ffmpegSession == nullptr) {
             return 0;
         }
-        return readCallback<StatisticsCallbackAdapter>(
-            ffmpegSession->getStatisticsCallback(), callback, userData);
+        return readCallback<StatisticsCallbackAdapter>(ffmpegSession->getStatisticsCallback(), callback, userData);
     });
 }
 
 /* ---- media information session specific --------------------------------- */
 
-FFKMediaInformation *
-ffk_media_information_session_get_media_information(FFKSession *session) {
+FFKMediaInformation *ffk_media_information_session_get_media_information(FFKSession *session) {
     return guard([&]() -> FFKMediaInformation * {
-        const auto mediaInformationSession =
-            sessionAs<internal::MediaInformationSession>(session);
+        const auto mediaInformationSession = sessionAs<internal::MediaInformationSession>(session);
         if (mediaInformationSession == nullptr) {
             return nullptr;
         }
-        return makeHandle<FFKMediaInformation>(
-            mediaInformationSession->getMediaInformation());
+        return makeHandle<FFKMediaInformation>(mediaInformationSession->getMediaInformation());
     });
 }
 
-void ffk_media_information_session_set_media_information(
-    FFKSession *session, FFKMediaInformation *mediaInformation) {
+void ffk_media_information_session_set_media_information(FFKSession *session, FFKMediaInformation *mediaInformation) {
     guard([&]() {
-        const auto mediaInformationSession =
-            sessionAs<internal::MediaInformationSession>(session);
+        const auto mediaInformationSession = sessionAs<internal::MediaInformationSession>(session);
         if (mediaInformationSession == nullptr) {
             return;
         }
-        mediaInformationSession->setMediaInformation(
-            mediaInformation == nullptr
-                ? std::shared_ptr<internal::MediaInformation>()
-                : mediaInformation->value);
+        mediaInformationSession->setMediaInformation(mediaInformation == nullptr ? std::shared_ptr<internal::MediaInformation>() : mediaInformation->value);
     });
 }
 
@@ -1819,39 +1683,24 @@ std::shared_ptr<ffmpegkit::json::Value> parseJson(const char *json) {
 } // namespace
 
 FFKChapter *ffk_chapter_create(const char *valueJson) {
-    return guard([&]() -> FFKChapter * {
-        return makeHandle<FFKChapter>(
-            std::make_shared<internal::Chapter>(parseJson(valueJson)));
-    });
+    return guard([&]() -> FFKChapter * { return makeHandle<FFKChapter>(std::make_shared<internal::Chapter>(parseJson(valueJson))); });
 }
 
 FFKStreamInformation *ffk_stream_information_create(const char *valueJson) {
-    return guard([&]() -> FFKStreamInformation * {
-        return makeHandle<FFKStreamInformation>(
-            std::make_shared<internal::StreamInformation>(parseJson(valueJson)));
-    });
+    return guard([&]() -> FFKStreamInformation * { return makeHandle<FFKStreamInformation>(std::make_shared<internal::StreamInformation>(parseJson(valueJson))); });
 }
 
-FFKMediaInformation *ffk_media_information_create(
-    const char *valueJson, const char *const *streamJson,
-    const size_t streamCount, const char *const *chapterJson,
-    const size_t chapterCount) {
+FFKMediaInformation *ffk_media_information_create(const char *valueJson, const char *const *streamJson, const size_t streamCount, const char *const *chapterJson, const size_t chapterCount) {
     return guard([&]() -> FFKMediaInformation * {
-        auto streams = std::make_shared<
-            std::vector<std::shared_ptr<internal::StreamInformation>>>();
+        auto streams = std::make_shared<std::vector<std::shared_ptr<internal::StreamInformation>>>();
         for (size_t index = 0; index < streamCount; index++) {
-            streams->push_back(std::make_shared<internal::StreamInformation>(
-                parseJson(streamJson == nullptr ? nullptr : streamJson[index])));
+            streams->push_back(std::make_shared<internal::StreamInformation>(parseJson(streamJson == nullptr ? nullptr : streamJson[index])));
         }
-        auto chapters =
-            std::make_shared<std::vector<std::shared_ptr<internal::Chapter>>>();
+        auto chapters = std::make_shared<std::vector<std::shared_ptr<internal::Chapter>>>();
         for (size_t index = 0; index < chapterCount; index++) {
-            chapters->push_back(std::make_shared<internal::Chapter>(parseJson(
-                chapterJson == nullptr ? nullptr : chapterJson[index])));
+            chapters->push_back(std::make_shared<internal::Chapter>(parseJson(chapterJson == nullptr ? nullptr : chapterJson[index])));
         }
-        return makeHandle<FFKMediaInformation>(
-            std::make_shared<internal::MediaInformation>(parseJson(valueJson),
-                                                         streams, chapters));
+        return makeHandle<FFKMediaInformation>(std::make_shared<internal::MediaInformation>(parseJson(valueJson), streams, chapters));
     });
 }
 
@@ -1859,19 +1708,16 @@ FFK_DEFINE_PROPERTY_ACCESSORS(ffk_chapter, FFKChapter)
 FFK_DEFINE_PROPERTY_ACCESSORS(ffk_stream_information, FFKStreamInformation)
 FFK_DEFINE_PROPERTY_ACCESSORS(ffk_media_information, FFKMediaInformation)
 
-FFKStreamInformationList *
-ffk_media_information_get_streams(FFKMediaInformation *mediaInformation) {
+FFKStreamInformationList *ffk_media_information_get_streams(FFKMediaInformation *mediaInformation) {
     return guard([&]() -> FFKStreamInformationList * {
         if (mediaInformation == nullptr) {
             return nullptr;
         }
-        return makeList<FFKStreamInformationList>(
-            mediaInformation->value->getStreams());
+        return makeList<FFKStreamInformationList>(mediaInformation->value->getStreams());
     });
 }
 
-FFKChapterList *
-ffk_media_information_get_chapters(FFKMediaInformation *mediaInformation) {
+FFKChapterList *ffk_media_information_get_chapters(FFKMediaInformation *mediaInformation) {
     return guard([&]() -> FFKChapterList * {
         if (mediaInformation == nullptr) {
             return nullptr;
@@ -1880,14 +1726,12 @@ ffk_media_information_get_chapters(FFKMediaInformation *mediaInformation) {
     });
 }
 
-int ffk_media_information_get_number_format_property(
-    FFKMediaInformation *mediaInformation, const char *key, int64_t *value) {
+int ffk_media_information_get_number_format_property(FFKMediaInformation *mediaInformation, const char *key, int64_t *value) {
     return guard([&]() -> int {
         if (mediaInformation == nullptr || !isPropertyKey(key)) {
             return 0;
         }
-        const auto property =
-            mediaInformation->value->getNumberFormatProperty(key);
+        const auto property = mediaInformation->value->getNumberFormatProperty(key);
         if (property == nullptr) {
             return 0;
         }
@@ -1898,19 +1742,16 @@ int ffk_media_information_get_number_format_property(
     });
 }
 
-char *ffk_media_information_get_string_format_property(
-    FFKMediaInformation *mediaInformation, const char *key) {
+char *ffk_media_information_get_string_format_property(FFKMediaInformation *mediaInformation, const char *key) {
     return guard([&]() -> char * {
         if (mediaInformation == nullptr || !isPropertyKey(key)) {
             return nullptr;
         }
-        return duplicateString(
-            mediaInformation->value->getStringFormatProperty(key));
+        return duplicateString(mediaInformation->value->getStringFormatProperty(key));
     });
 }
 
-char *ffk_media_information_get_format_property_json(
-    FFKMediaInformation *mediaInformation, const char *key) {
+char *ffk_media_information_get_format_property_json(FFKMediaInformation *mediaInformation, const char *key) {
     return guard([&]() -> char * {
         if (mediaInformation == nullptr || !isPropertyKey(key)) {
             return nullptr;
@@ -1919,8 +1760,7 @@ char *ffk_media_information_get_format_property_json(
     });
 }
 
-char *ffk_media_information_get_format_properties_json(
-    FFKMediaInformation *mediaInformation) {
+char *ffk_media_information_get_format_properties_json(FFKMediaInformation *mediaInformation) {
     return guard([&]() -> char * {
         if (mediaInformation == nullptr) {
             return nullptr;
@@ -1929,8 +1769,7 @@ char *ffk_media_information_get_format_properties_json(
     });
 }
 
-FFKMediaInformation *
-ffk_media_information_parser_from(const char *ffprobeJsonOutput) {
+FFKMediaInformation *ffk_media_information_parser_from(const char *ffprobeJsonOutput) {
     return guard([&]() -> FFKMediaInformation * {
         // Not MediaInformationJsonParser::from(): when it fails it prints a
         // message to the standard output. This one is silent and leaves the
@@ -1940,16 +1779,14 @@ ffk_media_information_parser_from(const char *ffprobeJsonOutput) {
             return nullptr;
         }
         try {
-            return makeHandle<FFKMediaInformation>(
-                internal::MediaInformationJsonParser::fromWithError(text));
+            return makeHandle<FFKMediaInformation>(internal::MediaInformationJsonParser::fromWithError(text));
         } catch (const std::exception &) {
             return nullptr;
         }
     });
 }
 
-FFKMediaInformation *
-ffk_media_information_parser_from_with_error(const char *ffprobeJsonOutput) {
+FFKMediaInformation *ffk_media_information_parser_from_with_error(const char *ffprobeJsonOutput) {
     return guard([&]() -> FFKMediaInformation * {
         // The message names the failure the same way on every platform; the
         // reason after it is the parser's own and platform specific
@@ -1957,8 +1794,7 @@ ffk_media_information_parser_from_with_error(const char *ffprobeJsonOutput) {
         std::string problem = "the text is not valid UTF-8";
         if (isValidUtf8(text)) {
             try {
-                return makeHandle<FFKMediaInformation>(
-                    internal::MediaInformationJsonParser::fromWithError(text));
+                return makeHandle<FFKMediaInformation>(internal::MediaInformationJsonParser::fromWithError(text));
             } catch (const std::exception &exception) {
                 problem = exception.what();
             }
@@ -1972,64 +1808,37 @@ ffk_media_information_parser_from_with_error(const char *ffprobeJsonOutput) {
 /* FFmpegKit                                                                 */
 /* ------------------------------------------------------------------------ */
 
-FFKSession *ffk_ffmpegkit_execute_with_arguments(const char *const *arguments,
-                                                 const size_t argumentCount) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(internal::FFmpegKit::executeWithArguments(
-            toArgumentList(arguments, argumentCount)));
-    });
+FFKSession *ffk_ffmpegkit_execute_with_arguments(const char *const *arguments, const size_t argumentCount) {
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFmpegKit::executeWithArguments(toArgumentList(arguments, argumentCount))); });
 }
 
-FFKSession *ffk_ffmpegkit_execute_with_arguments_async(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree, ffk_statistics_cb statisticsCallback,
-    void *statisticsUserData, ffk_free_cb statisticsFree) {
+FFKSession *ffk_ffmpegkit_execute_with_arguments_async(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, ffk_statistics_cb statisticsCallback,
+                                                       void *statisticsUserData, ffk_free_cb statisticsFree) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFmpegSession,
-                                internal::FFmpegSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFmpegSession, internal::FFmpegSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
-        const auto statistics = makeStatisticsCallback(
-            statisticsCallback, statisticsUserData, statisticsFree);
+        const auto statistics = makeStatisticsCallback(statisticsCallback, statisticsUserData, statisticsFree);
 
-        return makeHandle<FFKSession>(
-            internal::FFmpegKit::executeWithArgumentsAsync(
-                toArgumentList(arguments, argumentCount), complete, log,
-                statistics));
+        return makeHandle<FFKSession>(internal::FFmpegKit::executeWithArgumentsAsync(toArgumentList(arguments, argumentCount), complete, log, statistics));
     });
 }
 
 FFKSession *ffk_ffmpegkit_execute(const char *command) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFmpegKit::execute(toText(command, "command")));
-    });
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFmpegKit::execute(toText(command, "command"))); });
 }
 
-FFKSession *ffk_ffmpegkit_execute_async(
-    const char *command, ffk_session_cb completeCallback,
-    void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback,
-    void *logUserData, ffk_free_cb logFree,
-    ffk_statistics_cb statisticsCallback, void *statisticsUserData,
-    ffk_free_cb statisticsFree) {
+FFKSession *ffk_ffmpegkit_execute_async(const char *command, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, ffk_statistics_cb statisticsCallback, void *statisticsUserData,
+                                        ffk_free_cb statisticsFree) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFmpegSession,
-                                internal::FFmpegSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFmpegSession, internal::FFmpegSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
-        const auto statistics = makeStatisticsCallback(
-            statisticsCallback, statisticsUserData, statisticsFree);
+        const auto statistics = makeStatisticsCallback(statisticsCallback, statisticsUserData, statisticsFree);
 
-        return makeHandle<FFKSession>(internal::FFmpegKit::executeAsync(
-            toText(command, "command"), complete, log, statistics));
+        return makeHandle<FFKSession>(internal::FFmpegKit::executeAsync(toText(command, "command"), complete, log, statistics));
     });
 }
 
@@ -2049,158 +1858,86 @@ FFKSessionList *ffk_ffmpegkit_list_sessions(void) {
 /* FFprobeKit                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFKSession *ffk_ffprobekit_execute_with_arguments(const char *const *arguments,
-                                                  const size_t argumentCount) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(internal::FFprobeKit::executeWithArguments(
-            toArgumentList(arguments, argumentCount)));
-    });
+FFKSession *ffk_ffprobekit_execute_with_arguments(const char *const *arguments, const size_t argumentCount) {
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFprobeKit::executeWithArguments(toArgumentList(arguments, argumentCount))); });
 }
 
-FFKSession *ffk_ffprobekit_execute_with_arguments_async(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree) {
+FFKSession *ffk_ffprobekit_execute_with_arguments_async(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFprobeSession,
-                                internal::FFprobeSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFprobeSession, internal::FFprobeSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
 
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::executeWithArgumentsAsync(
-                toArgumentList(arguments, argumentCount), complete, log));
+        return makeHandle<FFKSession>(internal::FFprobeKit::executeWithArgumentsAsync(toArgumentList(arguments, argumentCount), complete, log));
     });
 }
 
 FFKSession *ffk_ffprobekit_execute(const char *command) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::execute(toText(command, "command")));
-    });
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFprobeKit::execute(toText(command, "command"))); });
 }
 
-FFKSession *ffk_ffprobekit_execute_async(const char *command,
-                                         ffk_session_cb completeCallback,
-                                         void *completeUserData,
-                                         ffk_free_cb completeFree,
-                                         ffk_log_cb logCallback,
-                                         void *logUserData,
-                                         ffk_free_cb logFree) {
+FFKSession *ffk_ffprobekit_execute_async(const char *command, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::FFprobeSession,
-                                internal::FFprobeSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::FFprobeSession, internal::FFprobeSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
 
-        return makeHandle<FFKSession>(internal::FFprobeKit::executeAsync(
-            toText(command, "command"), complete, log));
+        return makeHandle<FFKSession>(internal::FFprobeKit::executeAsync(toText(command, "command"), complete, log));
     });
 }
 
-FFKSession *ffk_ffprobekit_get_media_information(const char *path,
-                                                 const int waitTimeout) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformation(
-            toText(path, "path"), waitTimeout));
-    });
+FFKSession *ffk_ffprobekit_get_media_information(const char *path, const int waitTimeout) {
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformation(toText(path, "path"), waitTimeout)); });
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_async(
-    const char *path, ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree, const int waitTimeout) {
+FFKSession *ffk_ffprobekit_get_media_information_async(const char *path, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, const int waitTimeout) {
     return guard([&]() -> FFKSession * {
         // The callbacks come first: the library owns their cookies from here on,
         // so nothing that can throw may run before they are adopted
-        const auto complete =
-            makeSessionCallback<internal::MediaInformationSession,
-                                internal::MediaInformationSessionCompleteCallback>(
-                completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::MediaInformationSession, internal::MediaInformationSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
 
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::getMediaInformationAsync(
-                toText(path, "path"), complete, log, waitTimeout));
+        return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformationAsync(toText(path, "path"), complete, log, waitTimeout));
     });
 }
 
-FFKSession *
-ffk_ffprobekit_get_media_information_from_command(const char *command) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::getMediaInformationFromCommand(
-                toText(command, "command")));
-    });
+FFKSession *ffk_ffprobekit_get_media_information_from_command(const char *command) {
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformationFromCommand(toText(command, "command"))); });
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_async(
-    const char *command, ffk_session_cb completeCallback,
-    void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback,
-    void *logUserData, ffk_free_cb logFree, const int waitTimeout) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command_async(const char *command, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree, const int waitTimeout) {
     return guard([&]() -> FFKSession * {
         // Adopt callback cookies before converting input that may throw.
-        const auto complete = makeSessionCallback<
-            internal::MediaInformationSession,
-            internal::MediaInformationSessionCompleteCallback>(
-            completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::MediaInformationSession, internal::MediaInformationSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
 
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::getMediaInformationFromCommandAsync(
-                toText(command, "command"), complete, log, waitTimeout));
+        return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformationFromCommandAsync(toText(command, "command"), complete, log, waitTimeout));
     });
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(
-    const char *const *arguments, const size_t argumentCount,
-    const int waitTimeout) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::getMediaInformationFromCommandArguments(
-                toArgumentList(arguments, argumentCount), waitTimeout));
-    });
+FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(const char *const *arguments, const size_t argumentCount, const int waitTimeout) {
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformationFromCommandArguments(toArgumentList(arguments, argumentCount), waitTimeout)); });
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments_async(
-    const char *const *arguments, const size_t argumentCount,
-    ffk_session_cb completeCallback, void *completeUserData,
-    ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData,
-    ffk_free_cb logFree, const int waitTimeout) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments_async(const char *const *arguments, const size_t argumentCount, ffk_session_cb completeCallback, void *completeUserData, ffk_free_cb completeFree, ffk_log_cb logCallback, void *logUserData, ffk_free_cb logFree,
+                                                                              const int waitTimeout) {
     return guard([&]() -> FFKSession * {
         // Adopt callback cookies before converting input that may throw.
-        const auto complete = makeSessionCallback<
-            internal::MediaInformationSession,
-            internal::MediaInformationSessionCompleteCallback>(
-            completeCallback, completeUserData, completeFree);
+        const auto complete = makeSessionCallback<internal::MediaInformationSession, internal::MediaInformationSessionCompleteCallback>(completeCallback, completeUserData, completeFree);
         const auto log = makeLogCallback(logCallback, logUserData, logFree);
 
-        return makeHandle<FFKSession>(
-            internal::FFprobeKit::getMediaInformationFromCommandArgumentsAsync(
-                toArgumentList(arguments, argumentCount), complete, log,
-                waitTimeout));
+        return makeHandle<FFKSession>(internal::FFprobeKit::getMediaInformationFromCommandArgumentsAsync(toArgumentList(arguments, argumentCount), complete, log, waitTimeout));
     });
 }
 
 FFKSessionList *ffk_ffprobekit_list_ffprobe_sessions(void) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFprobeKit::listFFprobeSessions());
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFprobeKit::listFFprobeSessions()); });
 }
 
 FFKSessionList *ffk_ffprobekit_list_media_information_sessions(void) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFprobeKit::listMediaInformationSessions());
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFprobeKit::listMediaInformationSessions()); });
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2215,6 +1952,14 @@ void ffk_config_disable_redirection(void) {
     guard([&]() { internal::FFmpegKitConfig::disableRedirection(); });
 }
 
+int ffk_config_shutdown(int timeout_ms) {
+    return guard([&]() -> int { return internal::FFmpegKitConfig::shutdown(timeout_ms) ? 1 : 0; });
+}
+
+int ffk_config_is_shutdown(void) {
+    return guard([&]() -> int { return internal::FFmpegKitConfig::isShutdown() ? 1 : 0; });
+}
+
 int ffk_config_set_fontconfig_configuration_path(const char *path) {
     return guard([&]() -> int {
         std::string text;
@@ -2225,28 +1970,12 @@ int ffk_config_set_fontconfig_configuration_path(const char *path) {
     });
 }
 
-void ffk_config_set_font_directory(const char *fontDirectoryPath,
-                                   const char *const *mappingKeys,
-                                   const char *const *mappingValues,
-                                   const size_t mappingCount) {
-    guard([&]() {
-        internal::FFmpegKitConfig::setFontDirectory(
-            toText(fontDirectoryPath, "font directory path"),
-            toStringMap(mappingKeys, mappingValues, mappingCount));
-    });
+void ffk_config_set_font_directory(const char *fontDirectoryPath, const char *const *mappingKeys, const char *const *mappingValues, const size_t mappingCount) {
+    guard([&]() { internal::FFmpegKitConfig::setFontDirectory(toText(fontDirectoryPath, "font directory path"), toStringMap(mappingKeys, mappingValues, mappingCount)); });
 }
 
-void ffk_config_set_font_directory_list(const char *const *fontDirectories,
-                                        const size_t fontDirectoryCount,
-                                        const char *const *mappingKeys,
-                                        const char *const *mappingValues,
-                                        const size_t mappingCount) {
-    guard([&]() {
-        internal::FFmpegKitConfig::setFontDirectoryList(
-            toArgumentList(fontDirectories, fontDirectoryCount,
-                           "Font directory"),
-            toStringMap(mappingKeys, mappingValues, mappingCount));
-    });
+void ffk_config_set_font_directory_list(const char *const *fontDirectories, const size_t fontDirectoryCount, const char *const *mappingKeys, const char *const *mappingValues, const size_t mappingCount) {
+    guard([&]() { internal::FFmpegKitConfig::setFontDirectoryList(toArgumentList(fontDirectories, fontDirectoryCount, "Font directory"), toStringMap(mappingKeys, mappingValues, mappingCount)); });
 }
 
 // Named pipes are deprecated but still work on Linux. The C API keeps exposing
@@ -2257,33 +1986,24 @@ void ffk_config_set_font_directory_list(const char *const *fontDirectories,
 char *ffk_config_register_new_ffmpeg_pipe(void) {
     return guard([&]() -> char * {
         // Creates the pipe with mkfifo, or returns nullptr when that fails
-        return duplicateString(
-            internal::FFmpegKitConfig::registerNewFFmpegPipe());
+        return duplicateString(internal::FFmpegKitConfig::registerNewFFmpegPipe());
     });
 }
 
 void ffk_config_close_ffmpeg_pipe(const char *ffmpegPipePath) {
-    guard([&]() {
-        internal::FFmpegKitConfig::closeFFmpegPipe(
-            toText(ffmpegPipePath, "pipe path"));
-    });
+    guard([&]() { internal::FFmpegKitConfig::closeFFmpegPipe(toText(ffmpegPipePath, "pipe path")); });
 }
 
 #pragma GCC diagnostic pop
 
-long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data,
-                                                const size_t size) {
+long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data, const size_t size) {
     return guard([&]() -> long {
         return internal::FFmpegKitConfig::registerFFmpegKitInputBuffer(data, size);
     });
 }
 
-long ffk_config_register_ffmpegkit_output_buffer(const long initialCapacity,
-                                                 const long maxCapacity) {
-    return guard([&]() -> long {
-        return internal::FFmpegKitConfig::registerFFmpegKitOutputBuffer(
-            initialCapacity, maxCapacity);
-    });
+long ffk_config_register_ffmpegkit_output_buffer(const long initialCapacity, const long maxCapacity) {
+    return guard([&]() -> long { return internal::FFmpegKitConfig::registerFFmpegKitOutputBuffer(initialCapacity, maxCapacity); });
 }
 
 long ffk_config_get_ffmpegkit_buffer_size(const long bufferId) {
@@ -2292,11 +2012,9 @@ long ffk_config_get_ffmpegkit_buffer_size(const long bufferId) {
     });
 }
 
-int ffk_config_get_ffmpegkit_output_buffer(const long bufferId, uint8_t **data,
-                                           size_t *size) {
+int ffk_config_get_ffmpegkit_output_buffer(const long bufferId, uint8_t **data, size_t *size) {
     return guard([&]() -> int {
-        const auto buffer =
-            internal::FFmpegKitConfig::getFFmpegKitOutputBuffer(bufferId);
+        const auto buffer = internal::FFmpegKitConfig::getFFmpegKitOutputBuffer(bufferId);
         if (buffer == nullptr) {
             return 0;
         }
@@ -2320,21 +2038,13 @@ long ffk_config_register_ffmpegkit_stream(const long capacity, const int type) {
     });
 }
 
-int ffk_config_write_ffmpegkit_stream(const long streamId, const uint8_t *data,
-                                      const size_t length,
-                                      const int timeoutMs) {
-    return guard([&]() -> int {
-        return internal::FFmpegKitConfig::writeFFmpegKitStream(streamId, data,
-                                                               length, timeoutMs);
-    });
+int ffk_config_write_ffmpegkit_stream(const long streamId, const uint8_t *data, const size_t length, const int timeoutMs) {
+    return guard([&]() -> int { return internal::FFmpegKitConfig::writeFFmpegKitStream(streamId, data, length, timeoutMs); });
 }
 
-int ffk_config_read_ffmpegkit_stream(const long streamId, const int maxBytes,
-                                     const int timeoutMs, uint8_t **data,
-                                     size_t *size) {
+int ffk_config_read_ffmpegkit_stream(const long streamId, const int maxBytes, const int timeoutMs, uint8_t **data, size_t *size) {
     return guard([&]() -> int {
-        const auto buffer = internal::FFmpegKitConfig::readFFmpegKitStream(
-            streamId, maxBytes, timeoutMs);
+        const auto buffer = internal::FFmpegKitConfig::readFFmpegKitStream(streamId, maxBytes, timeoutMs);
         if (buffer == nullptr) {
             return 0;
         }
@@ -2358,13 +2068,8 @@ void ffk_config_unregister_ffmpegkit_stream(const long streamId) {
     guard([&]() { internal::FFmpegKitConfig::unregisterFFmpegKitStream(streamId); });
 }
 
-char *ffk_protocol_build_url(const char *protocol, const long id,
-                             const char *extension) {
-    return guard([&]() -> char * {
-        return duplicateString(internal::buildFFmpegKitUrl(
-            toText(protocol, "protocol"), id,
-            toText(extension, "extension")));
-    });
+char *ffk_protocol_build_url(const char *protocol, const long id, const char *extension) {
+    return guard([&]() -> char * { return duplicateString(internal::buildFFmpegKitUrl(toText(protocol, "protocol"), id, toText(extension, "extension"))); });
 }
 
 char *ffk_config_get_ffmpeg_version(void) {
@@ -2397,13 +2102,11 @@ char *ffk_config_get_build_date(void) {
     });
 }
 
-int ffk_config_set_environment_variable(const char *variableName,
-                                        const char *variableValue) {
+int ffk_config_set_environment_variable(const char *variableName, const char *variableValue) {
     return guard([&]() -> int {
         std::string name;
         std::string value;
-        if (!toTextOrFail(variableName, "variable name", name) ||
-            !toTextOrFail(variableValue, "variable value", value)) {
+        if (!toTextOrFail(variableName, "variable name", name) || !toTextOrFail(variableValue, "variable value", value)) {
             return -1;
         }
         return internal::FFmpegKitConfig::setEnvironmentVariable(name, value);
@@ -2434,14 +2137,11 @@ void ffk_config_ffprobe_execute(FFKSession *session) {
     });
 }
 
-void ffk_config_get_media_information_execute(FFKSession *session,
-                                              const int waitTimeout) {
+void ffk_config_get_media_information_execute(FFKSession *session, const int waitTimeout) {
     guard([&]() {
-        const auto mediaInformationSession =
-            sessionAs<internal::MediaInformationSession>(session);
+        const auto mediaInformationSession = sessionAs<internal::MediaInformationSession>(session);
         if (mediaInformationSession != nullptr) {
-            internal::FFmpegKitConfig::getMediaInformationExecute(
-                mediaInformationSession, waitTimeout);
+            internal::FFmpegKitConfig::getMediaInformationExecute(mediaInformationSession, waitTimeout);
         }
     });
 }
@@ -2464,92 +2164,45 @@ void ffk_config_async_ffprobe_execute(FFKSession *session) {
     });
 }
 
-void ffk_config_async_get_media_information_execute(FFKSession *session,
-                                                    const int waitTimeout) {
+void ffk_config_async_get_media_information_execute(FFKSession *session, const int waitTimeout) {
     guard([&]() {
-        const auto mediaInformationSession =
-            sessionAs<internal::MediaInformationSession>(session);
+        const auto mediaInformationSession = sessionAs<internal::MediaInformationSession>(session);
         if (mediaInformationSession != nullptr) {
-            internal::FFmpegKitConfig::asyncGetMediaInformationExecute(
-                mediaInformationSession, waitTimeout);
+            internal::FFmpegKitConfig::asyncGetMediaInformationExecute(mediaInformationSession, waitTimeout);
         }
     });
 }
 
-void ffk_config_enable_log_callback(ffk_log_cb callback, void *userData,
-                                    ffk_free_cb freeUserData) {
-    guard([&]() {
-        internal::FFmpegKitConfig::enableLogCallback(
-            makeLogCallback(callback, userData, freeUserData));
-    });
+void ffk_config_enable_log_callback(ffk_log_cb callback, void *userData, ffk_free_cb freeUserData) {
+    guard([&]() { internal::FFmpegKitConfig::enableLogCallback(makeLogCallback(callback, userData, freeUserData)); });
 }
 
-void ffk_config_enable_statistics_callback(ffk_statistics_cb callback,
-                                           void *userData,
-                                           ffk_free_cb freeUserData) {
-    guard([&]() {
-        internal::FFmpegKitConfig::enableStatisticsCallback(
-            makeStatisticsCallback(callback, userData, freeUserData));
-    });
+void ffk_config_enable_statistics_callback(ffk_statistics_cb callback, void *userData, ffk_free_cb freeUserData) {
+    guard([&]() { internal::FFmpegKitConfig::enableStatisticsCallback(makeStatisticsCallback(callback, userData, freeUserData)); });
 }
 
-void ffk_config_enable_ffmpeg_session_complete_callback(
-    ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
-    guard([&]() {
-        internal::FFmpegKitConfig::enableFFmpegSessionCompleteCallback(
-            makeSessionCallback<internal::FFmpegSession,
-                                internal::FFmpegSessionCompleteCallback>(
-                callback, userData, freeUserData));
-    });
+void ffk_config_enable_ffmpeg_session_complete_callback(ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
+    guard([&]() { internal::FFmpegKitConfig::enableFFmpegSessionCompleteCallback(makeSessionCallback<internal::FFmpegSession, internal::FFmpegSessionCompleteCallback>(callback, userData, freeUserData)); });
 }
 
-int ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback,
-                                                    void **userData) {
-    return guard([&]() -> int {
-        return readCallback<FFmpegSessionCallbackAdapter>(
-            internal::FFmpegKitConfig::getFFmpegSessionCompleteCallback(),
-            callback, userData);
-    });
+int ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback, void **userData) {
+    return guard([&]() -> int { return readCallback<FFmpegSessionCallbackAdapter>(internal::FFmpegKitConfig::getFFmpegSessionCompleteCallback(), callback, userData); });
 }
 
-void ffk_config_enable_ffprobe_session_complete_callback(
-    ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
-    guard([&]() {
-        internal::FFmpegKitConfig::enableFFprobeSessionCompleteCallback(
-            makeSessionCallback<internal::FFprobeSession,
-                                internal::FFprobeSessionCompleteCallback>(
-                callback, userData, freeUserData));
-    });
+void ffk_config_enable_ffprobe_session_complete_callback(ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
+    guard([&]() { internal::FFmpegKitConfig::enableFFprobeSessionCompleteCallback(makeSessionCallback<internal::FFprobeSession, internal::FFprobeSessionCompleteCallback>(callback, userData, freeUserData)); });
 }
 
-int ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback,
-                                                     void **userData) {
-    return guard([&]() -> int {
-        return readCallback<FFprobeSessionCallbackAdapter>(
-            internal::FFmpegKitConfig::getFFprobeSessionCompleteCallback(),
-            callback, userData);
-    });
+int ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback, void **userData) {
+    return guard([&]() -> int { return readCallback<FFprobeSessionCallbackAdapter>(internal::FFmpegKitConfig::getFFprobeSessionCompleteCallback(), callback, userData); });
 }
 
-void ffk_config_enable_media_information_session_complete_callback(
-    ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
-    guard([&]() {
-        internal::FFmpegKitConfig::enableMediaInformationSessionCompleteCallback(
-            makeSessionCallback<
-                internal::MediaInformationSession,
-                internal::MediaInformationSessionCompleteCallback>(
-                callback, userData, freeUserData));
-    });
+void ffk_config_enable_media_information_session_complete_callback(ffk_session_cb callback, void *userData, ffk_free_cb freeUserData) {
+    guard([&]() { internal::FFmpegKitConfig::enableMediaInformationSessionCompleteCallback(makeSessionCallback<internal::MediaInformationSession, internal::MediaInformationSessionCompleteCallback>(callback, userData, freeUserData)); });
 }
 
-int ffk_config_get_media_information_session_complete_callback(
-    ffk_session_cb *callback, void **userData) {
-    return guard([&]() -> int {
-        return readCallback<MediaInformationSessionCallbackAdapter>(
-            internal::FFmpegKitConfig::
-                getMediaInformationSessionCompleteCallback(),
-            callback, userData);
-    });
+int ffk_config_get_media_information_session_complete_callback(ffk_session_cb *callback, void **userData) {
+    return guard([&]() -> int { return readCallback<MediaInformationSessionCallbackAdapter>(internal::FFmpegKitConfig::getMediaInformationSessionCompleteCallback(), callback, userData); });
 }
 
 int ffk_config_get_log_level(void) {
@@ -2559,22 +2212,15 @@ int ffk_config_get_log_level(void) {
 }
 
 void ffk_config_set_log_level(const int level) {
-    guard([&]() {
-        internal::FFmpegKitConfig::setLogLevel(
-            static_cast<internal::Level>(level));
-    });
+    guard([&]() { internal::FFmpegKitConfig::setLogLevel(static_cast<internal::Level>(level)); });
 }
 
 char *ffk_config_log_level_to_string(const int level) {
-    return guard([&]() -> char * {
-        return duplicateString(internal::FFmpegKitConfig::logLevelToString(
-            static_cast<internal::Level>(level)));
-    });
+    return guard([&]() -> char * { return duplicateString(internal::FFmpegKitConfig::logLevelToString(static_cast<internal::Level>(level))); });
 }
 
 int ffk_config_get_session_history_size(void) {
-    return guard(
-        [&]() -> int { return internal::FFmpegKitConfig::getSessionHistorySize(); });
+    return guard([&]() -> int { return internal::FFmpegKitConfig::getSessionHistorySize(); });
 }
 
 void ffk_config_set_session_history_size(const int sessionHistorySize) {
@@ -2584,26 +2230,20 @@ void ffk_config_set_session_history_size(const int sessionHistorySize) {
 }
 
 FFKSession *ffk_config_get_session(const long sessionId) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFmpegKitConfig::getSession(sessionId));
-    });
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFmpegKitConfig::getSession(sessionId)); });
 }
 
 void ffk_config_delete_session(const long sessionId) {
     guard([&]() { internal::FFmpegKitConfig::deleteSession(sessionId); });
 }
 
-long ffk_config_add_session_delete_listener(ffk_session_delete_cb callback,
-                                            void *userData,
-                                            ffk_free_cb freeUserData) {
+long ffk_config_add_session_delete_listener(ffk_session_delete_cb callback, void *userData, ffk_free_cb freeUserData) {
     return guard([&]() -> long {
         if (callback == nullptr) {
             adoptUserData(userData, freeUserData);
             return 0;
         }
-        auto listener = std::make_shared<SessionDeleteListenerAdapter>(
-            callback, userData, freeUserData);
+        auto listener = std::make_shared<SessionDeleteListenerAdapter>(callback, userData, freeUserData);
         internal::FFmpegKitConfig::addSessionDeleteListener(listener);
 
         std::lock_guard<std::mutex> lock(sessionDeleteListenerMutex());
@@ -2636,10 +2276,7 @@ FFKSession *ffk_config_get_last_session(void) {
 }
 
 FFKSession *ffk_config_get_last_completed_session(void) {
-    return guard([&]() -> FFKSession * {
-        return makeHandle<FFKSession>(
-            internal::FFmpegKitConfig::getLastCompletedSession());
-    });
+    return guard([&]() -> FFKSession * { return makeHandle<FFKSession>(internal::FFmpegKitConfig::getLastCompletedSession()); });
 }
 
 FFKSessionList *ffk_config_get_sessions(void) {
@@ -2653,46 +2290,27 @@ void ffk_config_clear_sessions(void) {
 }
 
 FFKSessionList *ffk_config_get_ffmpeg_sessions(void) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFmpegKitConfig::getFFmpegSessions());
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFmpegKitConfig::getFFmpegSessions()); });
 }
 
 FFKSessionList *ffk_config_get_ffprobe_sessions(void) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFmpegKitConfig::getFFprobeSessions());
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFmpegKitConfig::getFFprobeSessions()); });
 }
 
 FFKSessionList *ffk_config_get_media_information_sessions(void) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFmpegKitConfig::getMediaInformationSessions());
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFmpegKitConfig::getMediaInformationSessions()); });
 }
 
 FFKSessionList *ffk_config_get_sessions_by_state(const int state) {
-    return guard([&]() -> FFKSessionList * {
-        return makeList<FFKSessionList>(
-            internal::FFmpegKitConfig::getSessionsByState(
-                toSessionState(state)));
-    });
+    return guard([&]() -> FFKSessionList * { return makeList<FFKSessionList>(internal::FFmpegKitConfig::getSessionsByState(toSessionState(state))); });
 }
 
 int ffk_config_get_log_redirection_strategy(void) {
-    return guard([&]() -> int {
-        return static_cast<int>(
-            internal::FFmpegKitConfig::getLogRedirectionStrategy());
-    });
+    return guard([&]() -> int { return static_cast<int>(internal::FFmpegKitConfig::getLogRedirectionStrategy()); });
 }
 
 void ffk_config_set_log_redirection_strategy(const int strategy) {
-    guard([&]() {
-        internal::FFmpegKitConfig::setLogRedirectionStrategy(
-            toLogRedirectionStrategy(strategy));
-    });
+    guard([&]() { internal::FFmpegKitConfig::setLogRedirectionStrategy(toLogRedirectionStrategy(strategy)); });
 }
 
 int ffk_config_messages_in_transmit(const long sessionId) {
@@ -2702,29 +2320,22 @@ int ffk_config_messages_in_transmit(const long sessionId) {
 }
 
 char *ffk_config_session_state_to_string(const int state) {
-    return guard([&]() -> char * {
-        return duplicateString(internal::FFmpegKitConfig::sessionStateToString(
-            toSessionState(state)));
-    });
+    return guard([&]() -> char * { return duplicateString(internal::FFmpegKitConfig::sessionStateToString(toSessionState(state))); });
 }
 
 FFKStringList *ffk_config_parse_arguments(const char *command) {
     return guard([&]() -> FFKStringList * {
         std::unique_ptr<FFKStringList> list(new FFKStringList());
-        const auto arguments = internal::FFmpegKitConfig::parseArguments(
-            toText(command, "command"));
+        const auto arguments = internal::FFmpegKitConfig::parseArguments(toText(command, "command"));
         list->items.assign(arguments.begin(), arguments.end());
         return list.release();
     });
 }
 
-char *ffk_config_arguments_to_string(const char *const *arguments,
-                                     const size_t argumentCount) {
+char *ffk_config_arguments_to_string(const char *const *arguments, const size_t argumentCount) {
     return guard([&]() -> char * {
-        auto list = std::make_shared<std::list<std::string>>(
-            toArgumentList(arguments, argumentCount));
-        return duplicateString(
-            internal::FFmpegKitConfig::argumentsToString(list));
+        auto list = std::make_shared<std::list<std::string>>(toArgumentList(arguments, argumentCount));
+        return duplicateString(internal::FFmpegKitConfig::argumentsToString(list));
     });
 }
 
