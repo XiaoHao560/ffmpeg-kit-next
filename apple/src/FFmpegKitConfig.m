@@ -81,8 +81,7 @@ static StatisticsCallback statisticsCallback;
  */
 static FFmpegSessionCompleteCallback ffmpegSessionCompleteCallback;
 static FFprobeSessionCompleteCallback ffprobeSessionCompleteCallback;
-static MediaInformationSessionCompleteCallback
-    mediaInformationSessionCompleteCallback;
+static MediaInformationSessionCompleteCallback mediaInformationSessionCompleteCallback;
 
 /**
  * Guards the five global callbacks above. A consumer can replace them from any
@@ -111,6 +110,27 @@ static atomic_int redirectionGenerationId;
 static NSRecursiveLock *lock;
 static dispatch_semaphore_t semaphore;
 static NSMutableArray *callbackDataArray;
+
+/** One-way shutdown state, guarded by executionCondition for admission. */
+typedef NS_ENUM(int, LibraryState) { LibraryRunning, LibraryTerminating, LibraryTerminated };
+static atomic_int shutdownState;
+static NSCondition *executionCondition;
+/** Running executions, including their completion callbacks and cleanup. */
+static int pendingExecutions;
+/** Submitted async blocks that have not started; only waited for during grace. */
+static int queuedExecutionCount;
+static int activeDeliveryLoops;
+static int activeCallbacks;
+static BOOL queuedMessagesDiscarded;
+static BOOL shutdownCleanupPending;
+static NSDate *shutdownGraceDeadline;
+/** A shutdown inside library work must not wait for its own thread. */
+static __thread int libraryWorkDepth = 0;
+
+static BOOL beginCallback(BOOL completion);
+static void endCallback(void);
+/** Fail reason of every session that shutdown does not let run. */
+static NSString *const ShutdownReason = @"FFmpegKit has been shut down";
 
 /** Fields that control the handling of SIGNALs */
 volatile int handleSIGQUIT = 1;
@@ -144,10 +164,8 @@ static int64_t ffkit_max_alloc_size(void) {
 #endif
 }
 
-static int ffkit_int64_add_overflow(int64_t left, int64_t right,
-                                    int64_t *result) {
-    if ((right > 0 && left > INT64_MAX - right) ||
-        (right < 0 && left < INT64_MIN - right)) {
+static int ffkit_int64_add_overflow(int64_t left, int64_t right, int64_t *result) {
+    if ((right > 0 && left > INT64_MAX - right) || (right < 0 && left < INT64_MIN - right)) {
         return 1;
     }
 
@@ -207,24 +225,13 @@ static atomic_llong ffkitNextResourceId = 1;
 #ifdef USES_FFMPEG_KIT_PROTOCOLS
 typedef int (*ffkit_local_protocol_open_function)(int64_t, int, void **);
 typedef int (*ffkit_local_protocol_read_function)(void *, unsigned char *, int);
-typedef int (*ffkit_local_protocol_write_function)(void *, const unsigned char *,
-                                                   int);
+typedef int (*ffkit_local_protocol_write_function)(void *, const unsigned char *, int);
 typedef int64_t (*ffkit_local_protocol_seek_function)(void *, int64_t, int);
 typedef int (*ffkit_local_protocol_close_function)(void *);
 
-extern void av_set_ffkitmem_functions(
-    ffkit_local_protocol_open_function open_function,
-    ffkit_local_protocol_read_function read_function,
-    ffkit_local_protocol_write_function write_function,
-    ffkit_local_protocol_seek_function seek_function,
-    ffkit_local_protocol_close_function close_function);
+extern void av_set_ffkitmem_functions(ffkit_local_protocol_open_function open_function, ffkit_local_protocol_read_function read_function, ffkit_local_protocol_write_function write_function, ffkit_local_protocol_seek_function seek_function, ffkit_local_protocol_close_function close_function);
 
-extern void av_set_ffkitstream_functions(
-    ffkit_local_protocol_open_function open_function,
-    ffkit_local_protocol_read_function read_function,
-    ffkit_local_protocol_write_function write_function,
-    ffkit_local_protocol_seek_function seek_function,
-    ffkit_local_protocol_close_function close_function);
+extern void av_set_ffkitstream_functions(ffkit_local_protocol_open_function open_function, ffkit_local_protocol_read_function read_function, ffkit_local_protocol_write_function write_function, ffkit_local_protocol_seek_function seek_function, ffkit_local_protocol_close_function close_function);
 #endif
 
 /** Forward declaration for function defined in fftools/ffmpeg.c */
@@ -248,9 +255,7 @@ NSArray *deleteExpiredSessionsLocked(NSMutableArray *retiredSessions) {
             // Hold the session until the caller has unlocked the history.
             [retiredSessions addObject:first];
             [sessionHistoryList removeObjectAtIndex:0];
-            [sessionHistoryMap
-                removeObjectForKey:[NSNumber
-                                       numberWithLong:sessionId]];
+            [sessionHistoryMap removeObjectForKey:[NSNumber numberWithLong:sessionId]];
             [deletedSessionIds addObject:[NSNumber numberWithLong:sessionId]];
         }
     }
@@ -263,13 +268,14 @@ void notifySessionDeleted(long sessionId) {
     NSArray *listeners = [sessionDeleteListeners allObjects];
     [sessionDeleteListenerLock unlock];
 
-    for (int i = 0; i < [listeners count]; i++) {
+    for (int i = 0; i < [listeners count] && beginCallback(NO); i++) {
         id<SessionDeleteListener> listener = [listeners objectAtIndex:i];
         @try {
             [listener sessionDeleted:sessionId];
         } @catch (NSException *exception) {
-            NSLog(@"Exception thrown inside session delete listener. %@",
-                  [exception callStackSymbols]);
+            NSLog(@"Exception thrown inside session delete listener. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
         }
     }
 }
@@ -282,8 +288,7 @@ void notifySessionsDeleted(NSArray *sessionIds) {
 }
 
 void addSessionToSessionHistory(id<Session> session) {
-    NSNumber *sessionIdNumber =
-        [NSNumber numberWithLong:[session getSessionId]];
+    NSNumber *sessionIdNumber = [NSNumber numberWithLong:[session getSessionId]];
     NSArray *deletedSessionIds = @[];
     NSMutableArray *retiredSessions = [[NSMutableArray alloc] init];
 
@@ -293,7 +298,7 @@ void addSessionToSessionHistory(id<Session> session) {
      * ASYNC SESSIONS CALL THIS METHOD TWICE
      * THIS CHECK PREVENTS ADDING THE SAME SESSION AGAIN
      */
-    if ([sessionHistoryMap objectForKey:sessionIdNumber] == nil) {
+    if (atomic_load(&shutdownState) == LibraryRunning && [sessionHistoryMap objectForKey:sessionIdNumber] == nil) {
         [sessionHistoryMap setObject:session forKey:sessionIdNumber];
         [sessionHistoryList addObject:session];
         deletedSessionIds = deleteExpiredSessionsLocked(retiredSessions);
@@ -328,9 +333,7 @@ void addSessionToSessionHistory(id<Session> session) {
     double _statisticsSpeed;    // statistics speed
 }
 
-- (instancetype)init:(long)sessionId
-            logLevel:(int)logLevel
-                data:(AVBPrint *)data {
+- (instancetype)init:(long)sessionId logLevel:(int)logLevel data:(AVBPrint *)data {
     self = [super init];
     if (self) {
         _type = LogType;
@@ -343,14 +346,7 @@ void addSessionToSessionHistory(id<Session> session) {
     return self;
 }
 
-- (instancetype)init:(long)sessionId
-    videoFrameNumber:(int)videoFrameNumber
-                 fps:(float)videoFps
-             quality:(float)videoQuality
-                size:(int64_t)size
-                time:(double)time
-             bitrate:(double)bitrate
-               speed:(double)speed {
+- (instancetype)init:(long)sessionId videoFrameNumber:(int)videoFrameNumber fps:(float)videoFps quality:(float)videoQuality size:(int64_t)size time:(double)time bitrate:(double)bitrate speed:(double)speed {
     self = [super init];
     if (self) {
         _type = StatisticsType;
@@ -418,11 +414,7 @@ void addSessionToSessionHistory(id<Session> session) {
  *
  * @param milliSeconds wait time in milliseconds
  */
-void callbackWait(int milliSeconds) {
-    dispatch_semaphore_wait(
-        semaphore, dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(milliSeconds * NSEC_PER_MSEC)));
-}
+void callbackWait(int milliSeconds) { dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(milliSeconds * NSEC_PER_MSEC))); }
 
 /**
  * Notifies threads waiting on callback semaphore.
@@ -454,9 +446,7 @@ static const char *avutil_log_get_level_str(int level) {
     }
 }
 
-static void avutil_log_format_line(void *avcl, int level, const char *fmt,
-                                   va_list vl, AVBPrint part[4],
-                                   int *print_prefix) {
+static void avutil_log_format_line(void *avcl, int level, const char *fmt, va_list vl, AVBPrint part[4], int *print_prefix) {
     int flags = av_log_get_flags();
     AVClass *avc = avcl ? *(AVClass **)avcl : NULL;
     av_bprint_init(part + 0, 0, 1);
@@ -466,11 +456,9 @@ static void avutil_log_format_line(void *avcl, int level, const char *fmt,
 
     if (*print_prefix && avc) {
         if (avc->parent_log_context_offset) {
-            AVClass **parent = *(AVClass ***)(((uint8_t *)avcl) +
-                                              avc->parent_log_context_offset);
+            AVClass **parent = *(AVClass ***)(((uint8_t *)avcl) + avc->parent_log_context_offset);
             if (parent && *parent) {
-                av_bprintf(part + 0, "[%s @ %p] ", (*parent)->item_name(parent),
-                           parent);
+                av_bprintf(part + 0, "[%s @ %p] ", (*parent)->item_name(parent), parent);
             }
         }
         av_bprintf(part + 1, "[%s @ %p] ", avc->item_name(avcl), avcl);
@@ -482,9 +470,7 @@ static void avutil_log_format_line(void *avcl, int level, const char *fmt,
     av_vbprintf(part + 3, fmt, vl);
 
     if (*part[0].str || *part[1].str || *part[2].str || *part[3].str) {
-        char lastc = part[3].len && part[3].len <= part[3].size
-                         ? part[3].str[part[3].len - 1]
-                         : 0;
+        char lastc = part[3].len && part[3].len <= part[3].size ? part[3].str[part[3].len - 1] : 0;
         *print_prefix = lastc == '\n' || lastc == '\r';
     }
 }
@@ -498,51 +484,46 @@ static void avutil_log_sanitize(uint8_t *line) {
 }
 
 /**
+ * Queues a message for the delivery loop and counts it as in transit for its
+ * session. The count is raised before the lock is released, so the discard at
+ * shutdown cannot reset it before it is raised. After shutdown the message is
+ * dropped.
+ */
+static void enqueueCallbackData(CallbackData *callbackData) {
+    [lock lock];
+    if (atomic_load(&shutdownState) != LibraryRunning) {
+        [lock unlock];
+        if ([callbackData getType] == LogType) {
+            av_bprint_finalize([callbackData getLogData], NULL);
+        }
+        return;
+    }
+    [callbackDataArray addObject:callbackData];
+    atomic_fetch_add(&sessionInTransitMessageCountMap[[callbackData getSessionId] % SESSION_MAP_SIZE], 1);
+    [lock unlock];
+
+    callbackNotify();
+}
+
+/**
  * Adds log data to the end of callback data list.
  *
  * @param level log level
  * @param data log data
  */
 void logCallbackDataAdd(int level, AVBPrint *data) {
-    CallbackData *callbackData = [[CallbackData alloc] init:globalSessionId
-                                                   logLevel:level
-                                                       data:data];
+    CallbackData *callbackData = [[CallbackData alloc] init:globalSessionId logLevel:level data:data];
 
-    [lock lock];
-    [callbackDataArray addObject:callbackData];
-    [lock unlock];
-
-    callbackNotify();
-
-    atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
+    enqueueCallbackData(callbackData);
 }
 
 /**
  * Adds statistics data to the end of callback data list.
  */
-void statisticsCallbackDataAdd(int frameNumber, float fps, float quality,
-                               int64_t size, double time, double bitrate,
-                               double speed) {
-    CallbackData *callbackData = [[CallbackData alloc] init:globalSessionId
-                                           videoFrameNumber:frameNumber
-                                                        fps:fps
-                                                    quality:quality
-                                                       size:size
-                                                       time:time
-                                                    bitrate:bitrate
-                                                      speed:speed];
+void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) {
+    CallbackData *callbackData = [[CallbackData alloc] init:globalSessionId videoFrameNumber:frameNumber fps:fps quality:quality size:size time:time bitrate:bitrate speed:speed];
 
-    [lock lock];
-    [callbackDataArray addObject:callbackData];
-    [lock unlock];
-
-    callbackNotify();
-
-    atomic_fetch_add(
-        &sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE],
-        1);
+    enqueueCallbackData(callbackData);
 }
 
 /**
@@ -627,13 +608,100 @@ int cancelRequested(long sessionId) {
  *
  * @param sessionId session id
  */
-void resetMessagesInTransmit(long sessionId) {
-    atomic_store(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE],
-                 0);
+void resetMessagesInTransmit(long sessionId) { atomic_store(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 0); }
+
+/**
+ * Counts an execution unless shutdown was requested.
+ *
+ * @return 1 when the execution may run, 0 when it has to be rejected
+ */
+static int beginExecution(void) {
+    [executionCondition lock];
+    const BOOL accepted = atomic_load(&shutdownState) == LibraryRunning;
+    if (accepted) {
+        pendingExecutions++;
+        libraryWorkDepth++;
+    }
+    [executionCondition unlock];
+    return accepted;
 }
 
-static int ffkit_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mutex,
-                           int timeoutMs) {
+static void endExecution(void) {
+    [executionCondition lock];
+    pendingExecutions--;
+    [executionCondition broadcast];
+    [executionCondition unlock];
+    libraryWorkDepth--;
+}
+
+/** Admit a callback atomically with shutdown; it remains counted until return. */
+static BOOL beginCallback(BOOL completion) {
+    [executionCondition lock];
+    const LibraryState state = atomic_load(&shutdownState);
+    const BOOL allowed = state == LibraryRunning || (completion && state == LibraryTerminating && [shutdownGraceDeadline timeIntervalSinceNow] > 0);
+    if (allowed) {
+        activeCallbacks++;
+        libraryWorkDepth++;
+    }
+    [executionCondition unlock];
+    return allowed;
+}
+
+static void endCallback(void) {
+    [executionCondition lock];
+    activeCallbacks--;
+    [executionCondition broadcast];
+    [executionCondition unlock];
+    libraryWorkDepth--;
+}
+
+/**
+ * Fails a session that shutdown does not let run. The exception is raised so
+ * that it carries a call stack, and the reason is in its user info, which is
+ * what fail: writes into the fail stack trace.
+ */
+static void rejectSession(id<Session> session) {
+    NSException *failure = nil;
+    @try {
+        @throw [NSException exceptionWithName:@"FFmpegKitShutdown" reason:ShutdownReason userInfo:@{@"error" : ShutdownReason}];
+    } @catch (NSException *raised) {
+        failure = raised;
+    }
+    [session fail:failure];
+}
+
+/**
+ * Drops the messages waiting for delivery and resets the in-transit counts,
+ * once, after shutdown, when no delivery loop is left that could be between
+ * taking a message and lowering its count. Called by shutdown and by every
+ * delivery loop on its way out (loopExited YES). A leaving loop stops being
+ * counted here, together with the discard, so a shutdown that waits for the
+ * loops finds the queue already empty.
+ */
+static void discardQueuedMessagesWhenIdle(BOOL loopExited) {
+    [lock lock];
+    [executionCondition lock];
+    if (loopExited) {
+        activeDeliveryLoops--;
+    }
+    if ((atomic_load(&shutdownState) != LibraryRunning) && activeDeliveryLoops == 0 && !queuedMessagesDiscarded) {
+        queuedMessagesDiscarded = YES;
+        for (CallbackData *callbackData in callbackDataArray) {
+            if ([callbackData getType] == LogType) {
+                av_bprint_finalize([callbackData getLogData], NULL);
+            }
+        }
+        [callbackDataArray removeAllObjects];
+        for (int i = 0; i < SESSION_MAP_SIZE; i++) {
+            atomic_store(&sessionInTransitMessageCountMap[i], 0);
+        }
+    }
+    [executionCondition broadcast];
+    [executionCondition unlock];
+    [lock unlock];
+}
+
+static int ffkit_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mutex, int timeoutMs) {
     if (timeoutMs < 0) {
         return pthread_cond_wait(condition, mutex);
     }
@@ -733,9 +801,7 @@ static int ffkit_memory_open(int64_t id, int flags, void **opaque) {
     resource = ffkit_memory_find_locked(id);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->unregistered ||
-            ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) ||
-            (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
+        if (resource->unregistered || ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) || (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
             pthread_mutex_unlock(&resource->mutex);
             pthread_mutex_unlock(&ffkitMemoryRegistryMutex);
             return AVERROR(ENOENT);
@@ -793,8 +859,7 @@ static int ffkit_memory_read(void *opaque, unsigned char *buf, int size) {
     return bytesToRead;
 }
 
-static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource,
-                                        int64_t requiredCapacity) {
+static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource, int64_t requiredCapacity) {
     int64_t newCapacity;
     uint8_t *newData;
 
@@ -806,8 +871,7 @@ static int ffkit_memory_ensure_capacity(FFKitMemoryResource *resource,
         return AVERROR(ENOSPC);
     }
 
-    newCapacity = resource->capacity > 0 ? resource->capacity
-                                         : FFKIT_DEFAULT_OUTPUT_CAPACITY;
+    newCapacity = resource->capacity > 0 ? resource->capacity : FFKIT_DEFAULT_OUTPUT_CAPACITY;
     while (newCapacity < requiredCapacity) {
         if (newCapacity > resource->maxCapacity / 2) {
             newCapacity = resource->maxCapacity;
@@ -855,8 +919,7 @@ static int ffkit_memory_write(void *opaque, const unsigned char *buf, int size) 
     }
 
     if (handle->position > resource->size) {
-        memset(resource->data + resource->size, 0,
-               handle->position - resource->size);
+        memset(resource->data + resource->size, 0, handle->position - resource->size);
     }
 
     memcpy(resource->data + handle->position, buf, size);
@@ -949,9 +1012,7 @@ static int ffkit_stream_open(int64_t id, int flags, void **opaque) {
     resource = ffkit_stream_find_locked(id);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->unregistered ||
-            ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) ||
-            (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
+        if (resource->unregistered || ((flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_OUTPUT) || (!(flags & AVIO_FLAG_WRITE) && resource->type != FFKIT_RESOURCE_INPUT)) {
             pthread_mutex_unlock(&resource->mutex);
             pthread_mutex_unlock(&ffkitStreamRegistryMutex);
             return AVERROR(ENOENT);
@@ -979,9 +1040,7 @@ static int ffkit_stream_open(int64_t id, int flags, void **opaque) {
     return 0;
 }
 
-static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
-                                    const uint8_t *buf, int size,
-                                    int timeoutMs) {
+static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t *buf, int size, int timeoutMs) {
     int written = 0;
 
     if (resource == NULL || buf == NULL || size < 0) {
@@ -990,11 +1049,8 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
 
     pthread_mutex_lock(&resource->mutex);
     while (written < size) {
-        while (resource->size == resource->capacity && !resource->closed &&
-               !resource->writeClosed) {
-            int waitRc =
-                ffkit_cond_wait(&resource->canWrite, &resource->mutex,
-                                timeoutMs);
+        while (resource->size == resource->capacity && !resource->closed && !resource->writeClosed) {
+            int waitRc = ffkit_cond_wait(&resource->canWrite, &resource->mutex, timeoutMs);
             if (waitRc == ETIMEDOUT) {
                 pthread_mutex_unlock(&resource->mutex);
                 return written;
@@ -1008,13 +1064,10 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
 
         int64_t freeSize = resource->capacity - resource->size;
         int chunkSize = (int)FFMIN((int64_t)(size - written), freeSize);
-        chunkSize =
-            (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->writePosition);
+        chunkSize = (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->writePosition);
 
-        memcpy(resource->data + resource->writePosition, buf + written,
-               chunkSize);
-        resource->writePosition =
-            (resource->writePosition + chunkSize) % resource->capacity;
+        memcpy(resource->data + resource->writePosition, buf + written, chunkSize);
+        resource->writePosition = (resource->writePosition + chunkSize) % resource->capacity;
         resource->size += chunkSize;
         written += chunkSize;
         pthread_cond_broadcast(&resource->canRead);
@@ -1024,9 +1077,7 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource,
     return written;
 }
 
-static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
-                                   int size, int timeoutMs, int *timedOut,
-                                   int *eof) {
+static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, int size, int timeoutMs, int *timedOut, int *eof) {
     int bytesRead = 0;
 
     if (timedOut != NULL) {
@@ -1042,8 +1093,7 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
 
     pthread_mutex_lock(&resource->mutex);
     while (resource->size == 0 && !resource->writeClosed && !resource->closed) {
-        int waitRc =
-            ffkit_cond_wait(&resource->canRead, &resource->mutex, timeoutMs);
+        int waitRc = ffkit_cond_wait(&resource->canRead, &resource->mutex, timeoutMs);
         if (waitRc == ETIMEDOUT) {
             if (timedOut != NULL) {
                 *timedOut = 1;
@@ -1068,13 +1118,10 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf,
 
     while (bytesRead < size && resource->size > 0) {
         int chunkSize = (int)FFMIN((int64_t)(size - bytesRead), resource->size);
-        chunkSize =
-            (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->readPosition);
+        chunkSize = (int)FFMIN((int64_t)chunkSize, resource->capacity - resource->readPosition);
 
-        memcpy(buf + bytesRead, resource->data + resource->readPosition,
-               chunkSize);
-        resource->readPosition =
-            (resource->readPosition + chunkSize) % resource->capacity;
+        memcpy(buf + bytesRead, resource->data + resource->readPosition, chunkSize);
+        resource->readPosition = (resource->readPosition + chunkSize) % resource->capacity;
         resource->size -= chunkSize;
         bytesRead += chunkSize;
         pthread_cond_broadcast(&resource->canWrite);
@@ -1144,6 +1191,28 @@ static int ffkit_stream_close(void *opaque) {
     return 0;
 }
 
+/**
+ * Closes every registered stream and wakes the threads that wait on one.
+ * Shutdown uses it to stop sessions blocked reading or writing a stream, which
+ * cancel cannot interrupt. An output stream is also ended for writing, as when
+ * ffmpeg closes it, so its reader drains what is buffered and then gets the end
+ * of the stream. Closed alone, it would get no chunk, which reads as a timeout.
+ */
+static void ffkit_stream_close_all(void) {
+    pthread_mutex_lock(&ffkitStreamRegistryMutex);
+    for (FFKitStreamResource *resource = ffkitStreamResources; resource != NULL; resource = resource->next) {
+        pthread_mutex_lock(&resource->mutex);
+        resource->closed = 1;
+        if (resource->type == FFKIT_RESOURCE_OUTPUT) {
+            resource->writeClosed = 1;
+        }
+        pthread_cond_broadcast(&resource->canRead);
+        pthread_cond_broadcast(&resource->canWrite);
+        pthread_mutex_unlock(&resource->mutex);
+    }
+    pthread_mutex_unlock(&ffkitStreamRegistryMutex);
+}
+
 /*
  * FFmpegKitNext per-session log "duties".
  *
@@ -1179,8 +1248,7 @@ static void run_duties(void *ptr, int level, const char *format, va_list vargs) 
  * @param format format string
  * @param vargs arguments
  */
-void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
-                                     va_list vargs) {
+void ffmpegkit_log_callback_function(void *ptr, int level, const char *format, va_list vargs) {
     AVBPrint fullLine;
     AVBPrint part[4];
     int print_prefix = 1;
@@ -1197,8 +1265,7 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
     int activeLogLevel = av_log_get_level();
 
     // LevelAVLogStdErr logs are always redirected
-    if ((activeLogLevel == LevelAVLogQuiet && level != LevelAVLogStdErr) ||
-        (level > activeLogLevel)) {
+    if ((activeLogLevel == LevelAVLogQuiet && level != LevelAVLogStdErr) || (level > activeLogLevel)) {
         return;
     }
 
@@ -1211,8 +1278,7 @@ void ffmpegkit_log_callback_function(void *ptr, int level, const char *format,
     avutil_log_sanitize(part[3].str);
 
     // COMBINE ALL 4 LOG PARTS
-    av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str,
-               part[3].str);
+    av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
 
     if (fullLine.len > 0) {
         logCallbackDataAdd(level, &fullLine);
@@ -1232,8 +1298,7 @@ int ffmpegkit_redirection_enabled(void) { return redirectionEnabled; }
  * Reproduces stock ffmpeg logging (stderr) while still running the per-session
  * duties, so -report / -show_log keep working even with redirection off.
  */
-static void ffmpegkit_log_callback_default(void *ptr, int level,
-                                           const char *format, va_list vargs) {
+static void ffmpegkit_log_callback_default(void *ptr, int level, const char *format, va_list vargs) {
     va_list copy;
 
     va_copy(copy, vargs);
@@ -1254,26 +1319,18 @@ static void ffmpegkit_log_callback_default(void *ptr, int level,
  * @param bitrate output bit rate in kbits/s
  * @param speed processing speed = processed duration / operation duration
  */
-void ffmpegkit_statistics_callback_function(int frameNumber, float fps,
-                                            float quality, int64_t size,
-                                            double time, double bitrate,
-                                            double speed) {
-    statisticsCallbackDataAdd(frameNumber, fps, quality, size, time, bitrate,
-                              speed);
-}
+void ffmpegkit_statistics_callback_function(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) { statisticsCallbackDataAdd(frameNumber, fps, quality, size, time, bitrate, speed); }
 
 void process_log(long sessionId, int levelValue, AVBPrint *logMessage) {
     const int activeLogLevel = configuredLogLevel;
 
     // LevelAVLogStdErr logs are always redirected
-    if ((activeLogLevel == LevelAVLogQuiet && levelValue != LevelAVLogStdErr) ||
-        (levelValue > activeLogLevel)) {
+    if ((activeLogLevel == LevelAVLogQuiet && levelValue != LevelAVLogStdErr) || (levelValue > activeLogLevel)) {
         // LOG NEITHER PRINTED NOR FORWARDED
         return;
     }
 
-    NSString *message = [NSString stringWithCString:logMessage->str
-                                           encoding:NSUTF8StringEncoding];
+    NSString *message = [NSString stringWithCString:logMessage->str encoding:NSUTF8StringEncoding];
     if (message == nil) {
         // WE DROP LOGS THAT WE CANNOT DISPLAY
         return;
@@ -1281,8 +1338,7 @@ void process_log(long sessionId, int levelValue, AVBPrint *logMessage) {
     Log *log = [[Log alloc] init:sessionId:levelValue:message];
     BOOL globalCallbackDefined = false;
     BOOL sessionCallbackDefined = false;
-    LogRedirectionStrategy activeLogRedirectionStrategy =
-        globalLogRedirectionStrategy;
+    LogRedirectionStrategy activeLogRedirectionStrategy = globalLogRedirectionStrategy;
 
     id<Session> session = [FFmpegKitConfig getSession:sessionId];
     if (session != nil) {
@@ -1290,15 +1346,16 @@ void process_log(long sessionId, int levelValue, AVBPrint *logMessage) {
         [session addLog:log];
 
         LogCallback sessionLogCallback = [session getLogCallback];
-        if (sessionLogCallback != nil) {
+        if (sessionLogCallback != nil && beginCallback(NO)) {
             sessionCallbackDefined = TRUE;
 
             @try {
                 // NOTIFY SESSION CALLBACK DEFINED
                 sessionLogCallback(log);
             } @catch (NSException *exception) {
-                NSLog(@"Exception thrown inside session log callback. %@",
-                      [exception callStackSymbols]);
+                NSLog(@"Exception thrown inside session log callback. %@", [exception callStackSymbols]);
+            } @finally {
+                endCallback();
             }
         }
     }
@@ -1306,15 +1363,16 @@ void process_log(long sessionId, int levelValue, AVBPrint *logMessage) {
     [globalCallbackLock lock];
     LogCallback globalLogCallback = logCallback;
     [globalCallbackLock unlock];
-    if (globalLogCallback != nil) {
+    if (globalLogCallback != nil && beginCallback(NO)) {
         globalCallbackDefined = TRUE;
 
         @try {
             // NOTIFY GLOBAL CALLBACK DEFINED
             globalLogCallback(log);
         } @catch (NSException *exception) {
-            NSLog(@"Exception thrown inside global log callback. %@",
-                  [exception callStackSymbols]);
+            NSLog(@"Exception thrown inside global log callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
         }
     }
 
@@ -1349,40 +1407,28 @@ void process_log(long sessionId, int levelValue, AVBPrint *logMessage) {
         break;
     default:
         // WRITE TO NSLOG
-        NSLog(@"%@: %@", [FFmpegKitConfig logLevelToString:levelValue],
-              [NSString stringWithCString:logMessage->str
-                                 encoding:NSUTF8StringEncoding]);
+        NSLog(@"%@: %@", [FFmpegKitConfig logLevelToString:levelValue], [NSString stringWithCString:logMessage->str encoding:NSUTF8StringEncoding]);
         break;
     }
 }
 
-void process_statistics(long sessionId, int videoFrameNumber, float videoFps,
-                        float videoQuality, long size, double time,
-                        double bitrate, double speed) {
+void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, long size, double time, double bitrate, double speed) {
 
-    Statistics *statistics = [[Statistics alloc] init:sessionId
-                                     videoFrameNumber:videoFrameNumber
-                                             videoFps:videoFps
-                                         videoQuality:videoQuality
-                                                 size:size
-                                                 time:time
-                                              bitrate:bitrate
-                                                speed:speed];
+    Statistics *statistics = [[Statistics alloc] init:sessionId videoFrameNumber:videoFrameNumber videoFps:videoFps videoQuality:videoQuality size:size time:time bitrate:bitrate speed:speed];
 
     id<Session> session = [FFmpegKitConfig getSession:sessionId];
     if (session != nil && [session isFFmpeg]) {
         FFmpegSession *ffmpegSession = (FFmpegSession *)session;
         [ffmpegSession addStatistics:statistics];
 
-        StatisticsCallback sessionStatisticsCallback =
-            [ffmpegSession getStatisticsCallback];
-        if (sessionStatisticsCallback != nil) {
+        StatisticsCallback sessionStatisticsCallback = [ffmpegSession getStatisticsCallback];
+        if (sessionStatisticsCallback != nil && beginCallback(NO)) {
             @try {
                 sessionStatisticsCallback(statistics);
             } @catch (NSException *exception) {
-                NSLog(
-                    @"Exception thrown inside session statistics callback. %@",
-                    [exception callStackSymbols]);
+                NSLog(@"Exception thrown inside session statistics callback. %@", [exception callStackSymbols]);
+            } @finally {
+                endCallback();
             }
         }
     }
@@ -1390,12 +1436,13 @@ void process_statistics(long sessionId, int videoFrameNumber, float videoFps,
     [globalCallbackLock lock];
     StatisticsCallback globalStatisticsCallback = statisticsCallback;
     [globalCallbackLock unlock];
-    if (globalStatisticsCallback != nil) {
+    if (globalStatisticsCallback != nil && beginCallback(NO)) {
         @try {
             globalStatisticsCallback(statistics);
         } @catch (NSException *exception) {
-            NSLog(@"Exception thrown inside global statistics callback. %@",
-                  [exception callStackSymbols]);
+            NSLog(@"Exception thrown inside global statistics callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
         }
     }
 }
@@ -1411,14 +1458,14 @@ void process_statistics(long sessionId, int videoFrameNumber, float videoFps,
  * loop ends when that redirection is switched off, or replaced by a newer one.
  */
 void callbackBlockFunction(int generationId) {
+    libraryWorkDepth++;
+
     int activeLogLevel = configuredLogLevel;
-    if ((activeLogLevel != LevelAVLogQuiet) &&
-        (LevelAVLogDebug <= activeLogLevel)) {
+    if ((activeLogLevel != LevelAVLogQuiet) && (LevelAVLogDebug <= activeLogLevel)) {
         NSLog(@"Async callback block started.\n");
     }
 
-    while (redirectionEnabled &&
-           generationId == atomic_load(&redirectionGenerationId)) {
+    while (redirectionEnabled && generationId == atomic_load(&redirectionGenerationId)) {
         @autoreleasepool {
             @try {
 
@@ -1426,26 +1473,14 @@ void callbackBlockFunction(int generationId) {
                 if (callbackData != nil) {
 
                     if ([callbackData getType] == LogType) {
-                        process_log([callbackData getSessionId],
-                                    [callbackData getLogLevel],
-                                    [callbackData getLogData]);
+                        process_log([callbackData getSessionId], [callbackData getLogLevel], [callbackData getLogData]);
                         av_bprint_finalize([callbackData getLogData], NULL);
                     } else {
-                        process_statistics(
-                            [callbackData getSessionId],
-                            [callbackData getStatisticsFrameNumber],
-                            [callbackData getStatisticsFps],
-                            [callbackData getStatisticsQuality],
-                            [callbackData getStatisticsSize],
-                            [callbackData getStatisticsTime],
-                            [callbackData getStatisticsBitrate],
-                            [callbackData getStatisticsSpeed]);
+                        process_statistics([callbackData getSessionId], [callbackData getStatisticsFrameNumber], [callbackData getStatisticsFps], [callbackData getStatisticsQuality], [callbackData getStatisticsSize], [callbackData getStatisticsTime], [callbackData getStatisticsBitrate],
+                                           [callbackData getStatisticsSpeed]);
                     }
 
-                    atomic_fetch_sub(
-                        &sessionInTransitMessageCountMap[
-                            [callbackData getSessionId] % SESSION_MAP_SIZE],
-                        1);
+                    atomic_fetch_sub(&sessionInTransitMessageCountMap[[callbackData getSessionId] % SESSION_MAP_SIZE], 1);
 
                 } else {
                     callbackWait(100);
@@ -1453,10 +1488,8 @@ void callbackBlockFunction(int generationId) {
 
             } @catch (NSException *exception) {
                 activeLogLevel = configuredLogLevel;
-                if ((activeLogLevel != LevelAVLogQuiet) &&
-                    (LevelAVLogWarning <= activeLogLevel)) {
-                    NSLog(@"Async callback block received error: %@n\n",
-                          exception);
+                if ((activeLogLevel != LevelAVLogQuiet) && (LevelAVLogWarning <= activeLogLevel)) {
+                    NSLog(@"Async callback block received error: %@n\n", exception);
                     NSLog(@"%@", [exception callStackSymbols]);
                 }
             }
@@ -1464,10 +1497,15 @@ void callbackBlockFunction(int generationId) {
     }
 
     activeLogLevel = configuredLogLevel;
-    if ((activeLogLevel != LevelAVLogQuiet) &&
-        (LevelAVLogDebug <= activeLogLevel)) {
+    if ((activeLogLevel != LevelAVLogQuiet) && (LevelAVLogDebug <= activeLogLevel)) {
         NSLog(@"Async callback block stopped.\n");
     }
+
+    libraryWorkDepth--;
+
+    // THE LOOP STOPS BEING COUNTED; AFTER SHUTDOWN THE LAST ONE DROPS WHAT IS
+    // LEFT IN THE QUEUE
+    discardQueuedMessagesWhenIdle(YES);
 }
 
 int executeFFmpeg(long sessionId, NSArray *arguments) {
@@ -1476,15 +1514,13 @@ int executeFFmpeg(long sessionId, NSArray *arguments) {
     // SETS DEFAULT LOG LEVEL BEFORE STARTING A NEW RUN
     av_log_set_level(configuredLogLevel);
 
-    char **commandCharPArray =
-        (char **)av_malloc(sizeof(char *) * ([arguments count] + 2));
+    char **commandCharPArray = (char **)av_malloc(sizeof(char *) * ([arguments count] + 2));
 
     /* PRESERVE USAGE FORMAT
      *
      * ffmpeg <arguments>
      */
-    commandCharPArray[0] =
-        (char *)av_malloc(sizeof(char) * ([LIB_NAME length] + 1));
+    commandCharPArray[0] = (char *)av_malloc(sizeof(char) * ([LIB_NAME length] + 1));
     strcpy(commandCharPArray[0], [LIB_NAME UTF8String]);
 
     // PREPARE ARRAY ELEMENTS
@@ -1497,6 +1533,12 @@ int executeFFmpeg(long sessionId, NSArray *arguments) {
     // REGISTER THE ID BEFORE STARTING THE SESSION
     globalSessionId = sessionId;
     registerSessionId(sessionId);
+
+    // A SHUTDOWN THAT CANCELLED ALL SESSIONS JUST BEFORE THIS ONE REGISTERED
+    // STILL STOPS IT
+    if (atomic_load(&shutdownState) != LibraryRunning) {
+        cancelSession(sessionId);
+    }
 
     resetMessagesInTransmit(sessionId);
 
@@ -1519,15 +1561,13 @@ int executeFFprobeToBuffer(long sessionId, NSArray *arguments, AVBPrint *outputB
     // SETS DEFAULT LOG LEVEL BEFORE STARTING A NEW RUN
     av_log_set_level(configuredLogLevel);
 
-    char **commandCharPArray =
-        (char **)av_malloc(sizeof(char *) * ([arguments count] + 2));
+    char **commandCharPArray = (char **)av_malloc(sizeof(char *) * ([arguments count] + 2));
 
     /* PRESERVE USAGE FORMAT
      *
      * ffprobe <arguments>
      */
-    commandCharPArray[0] =
-        (char *)av_malloc(sizeof(char) * ([LIB_NAME length] + 1));
+    commandCharPArray[0] = (char *)av_malloc(sizeof(char) * ([LIB_NAME length] + 1));
     strcpy(commandCharPArray[0], [LIB_NAME UTF8String]);
 
     // PREPARE ARRAY ELEMENTS
@@ -1550,8 +1590,7 @@ int executeFFprobeToBuffer(long sessionId, NSArray *arguments, AVBPrint *outputB
     ffprobe_set_media_information_buffer(outputBuffer);
 
     // RUN
-    int returnCode =
-        ffprobe_execute(([arguments count] + 1), commandCharPArray);
+    int returnCode = ffprobe_execute(([arguments count] + 1), commandCharPArray);
 
     ffprobe_set_media_information_buffer(NULL);
 
@@ -1567,6 +1606,190 @@ int executeFFprobeToBuffer(long sessionId, NSArray *arguments, AVBPrint *outputB
 
 int executeFFprobe(long sessionId, NSArray *arguments) {
     return executeFFprobeToBuffer(sessionId, arguments, NULL);
+}
+
+@interface FFmpegKitConfig ()
++ (void)runFFmpegSession:(FFmpegSession *)ffmpegSession;
++ (void)runFFprobeSession:(FFprobeSession *)ffprobeSession;
++ (void)runMediaInformationSession:(MediaInformationSession *)mediaInformationSession withTimeout:(int)waitTimeout;
+@end
+
+/** Calls the session's complete callback, then the global one. */
+static void notifyFFmpegSessionComplete(FFmpegSession *ffmpegSession) {
+    FFmpegSessionCompleteCallback completeCallback = [ffmpegSession getCompleteCallback];
+    if (completeCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(ffmpegSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside session complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+
+    FFmpegSessionCompleteCallback globalFFmpegSessionCompleteCallback = [FFmpegKitConfig getFFmpegSessionCompleteCallback];
+    if (globalFFmpegSessionCompleteCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalFFmpegSessionCompleteCallback(ffmpegSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside global complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+}
+
+/** Calls the session's complete callback, then the global one. */
+static void notifyFFprobeSessionComplete(FFprobeSession *ffprobeSession) {
+    FFprobeSessionCompleteCallback completeCallback = [ffprobeSession getCompleteCallback];
+    if (completeCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(ffprobeSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside session complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+
+    FFprobeSessionCompleteCallback globalFFprobeSessionCompleteCallback = [FFmpegKitConfig getFFprobeSessionCompleteCallback];
+    if (globalFFprobeSessionCompleteCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalFFprobeSessionCompleteCallback(ffprobeSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside global complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+}
+
+/** Calls the session's complete callback, then the global one. */
+static void notifyMediaInformationSessionComplete(MediaInformationSession *mediaInformationSession) {
+    MediaInformationSessionCompleteCallback completeCallback = [mediaInformationSession getCompleteCallback];
+    if (completeCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            completeCallback(mediaInformationSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside session complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+
+    MediaInformationSessionCompleteCallback globalMediaInformationSessionCompleteCallback = [FFmpegKitConfig getMediaInformationSessionCompleteCallback];
+    if (globalMediaInformationSessionCompleteCallback != nil && beginCallback(YES)) {
+        @try {
+            // NOTIFY SESSION CALLBACK DEFINED
+            globalMediaInformationSessionCompleteCallback(mediaInformationSession);
+        } @catch (NSException *exception) {
+            NSLog(@"Exception thrown inside global complete callback. %@", [exception callStackSymbols]);
+        } @finally {
+            endCallback();
+        }
+    }
+}
+
+/** Calls the complete callbacks of a session of any type. */
+static void notifySessionComplete(id<Session> session) {
+    if ([session isFFmpeg]) {
+        notifyFFmpegSessionComplete((FFmpegSession *)session);
+    } else if ([session isFFprobe]) {
+        notifyFFprobeSessionComplete((FFprobeSession *)session);
+    } else if ([session isMediaInformation]) {
+        notifyMediaInformationSessionComplete((MediaInformationSession *)session);
+    }
+}
+
+/** Shared async flow. Queued blocks remain on the caller's dispatch queue. */
+static void submitAsyncExecution(id<Session> session, dispatch_queue_t queue, void (^execute)(id<Session>)) {
+    if (session == nil) {
+        return;
+    }
+    [executionCondition lock];
+    const BOOL accepted = atomic_load(&shutdownState) == LibraryRunning;
+    if (accepted) {
+        queuedExecutionCount++;
+    }
+    [executionCondition unlock];
+    if (!accepted) {
+        // New submissions after shutdown fail without completion callbacks.
+        rejectSession(session);
+        return;
+    }
+
+    __block id<Session> heldSession = session;
+    dispatch_async(queue, ^{
+      [executionCondition lock];
+      queuedExecutionCount--;
+      const LibraryState state = atomic_load(&shutdownState);
+      const BOOL counted = state != LibraryTerminated;
+      if (counted) {
+          pendingExecutions++;
+          libraryWorkDepth++;
+      }
+      [executionCondition broadcast];
+      [executionCondition unlock];
+
+      @try {
+          @autoreleasepool {
+              if (state == LibraryRunning) {
+                  execute(heldSession);
+              } else {
+                  rejectSession(heldSession);
+              }
+              if (counted) {
+                  notifySessionComplete(heldSession);
+              }
+              // A late block only releases its own retain; it never calls
+              // completion callbacks or starts native work after termination.
+              heldSession = nil;
+          }
+      } @finally {
+          if (counted) {
+              endExecution();
+          }
+      }
+    });
+}
+
+/**
+ * End callback admission after grace, then release history references after a
+ * short final wait. Active and queued blocks retain their own sessions safely.
+ */
+static void finishShutdown(NSDate *cleanupDeadline) {
+    libraryWorkDepth++;
+    @try {
+        @autoreleasepool {
+            [executionCondition lock];
+            while (pendingExecutions > 0 || queuedExecutionCount > 0 || activeDeliveryLoops > 0 || activeCallbacks > 0) {
+                if (![executionCondition waitUntilDate:shutdownGraceDeadline]) {
+                    break;
+                }
+            }
+            atomic_store(&shutdownState, LibraryTerminated);
+            [executionCondition broadcast];
+            while (pendingExecutions > 0 || activeDeliveryLoops > 0 || activeCallbacks > 0) {
+                if (![executionCondition waitUntilDate:cleanupDeadline]) {
+                    break;
+                }
+            }
+            [executionCondition unlock];
+
+            [FFmpegKitConfig clearSessions];
+        }
+    } @finally {
+        [executionCondition lock];
+        shutdownCleanupPending = NO;
+        [executionCondition broadcast];
+        [executionCondition unlock];
+        libraryWorkDepth--;
+    }
 }
 
 @implementation FFmpegKitConfig
@@ -1590,8 +1813,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
         atomic_init(&sessionInTransitMessageCountMap[i], 0);
     }
 
-    asyncDispatchQueue =
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    asyncDispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
 
     globalCallbackLock = [[NSRecursiveLock alloc] init];
     logCallback = nil;
@@ -1600,8 +1822,9 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     ffprobeSessionCompleteCallback = nil;
     mediaInformationSessionCompleteCallback = nil;
 
-    globalLogRedirectionStrategy =
-        LogRedirectionStrategyPrintLogsWhenNoCallbacksDefined;
+    globalLogRedirectionStrategy = LogRedirectionStrategyPrintLogsWhenNoCallbacksDefined;
+
+    executionCondition = [[NSCondition alloc] init];
 
     redirectionEnabled = 0;
     lock = [[NSRecursiveLock alloc] init];
@@ -1609,12 +1832,8 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     callbackDataArray = [[NSMutableArray alloc] init];
 
 #ifdef USES_FFMPEG_KIT_PROTOCOLS
-    av_set_ffkitmem_functions(ffkit_memory_open, ffkit_memory_read,
-                              ffkit_memory_write, ffkit_memory_seek,
-                              ffkit_memory_close);
-    av_set_ffkitstream_functions(ffkit_stream_open, ffkit_stream_read,
-                                 ffkit_stream_write, ffkit_stream_seek,
-                                 ffkit_stream_close);
+    av_set_ffkitmem_functions(ffkit_memory_open, ffkit_memory_read, ffkit_memory_write, ffkit_memory_seek, ffkit_memory_close);
+    av_set_ffkitstream_functions(ffkit_stream_open, ffkit_stream_read, ffkit_stream_write, ffkit_stream_seek, ffkit_stream_close);
 #endif
 
     [FFmpegKitConfig enableRedirection];
@@ -1625,17 +1844,14 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
         return 0;
     }
 
-    return [FFmpegKitConfig registerFFmpegKitInputBufferWithBytes:[data bytes]
-                                                           length:[data length]];
+    return [FFmpegKitConfig registerFFmpegKitInputBufferWithBytes:[data bytes] length:[data length]];
 }
 
-+ (long)registerFFmpegKitInputBufferWithBytes:(const void *)bytes
-                                       length:(NSUInteger)length {
++ (long)registerFFmpegKitInputBufferWithBytes:(const void *)bytes length:(NSUInteger)length {
     int64_t id;
     FFKitMemoryResource *resource;
 
-    if ((bytes == NULL && length > 0) ||
-        length > (NSUInteger)ffkit_max_alloc_size()) {
+    if ((bytes == NULL && length > 0) || length > (NSUInteger)ffkit_max_alloc_size()) {
         return 0;
     }
 
@@ -1667,18 +1883,13 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return (long)id;
 }
 
-+ (long)registerFFmpegKitOutputBuffer:(long)initialCapacity
-                          maxCapacity:(long)maxCapacity {
++ (long)registerFFmpegKitOutputBuffer:(long)initialCapacity maxCapacity:(long)maxCapacity {
     int64_t id;
     FFKitMemoryResource *resource;
-    int64_t capacity = initialCapacity > 0 ? initialCapacity
-                                           : FFKIT_DEFAULT_OUTPUT_CAPACITY;
-    int64_t maximumCapacity =
-        maxCapacity > 0 ? maxCapacity : ffkit_max_alloc_size();
+    int64_t capacity = initialCapacity > 0 ? initialCapacity : FFKIT_DEFAULT_OUTPUT_CAPACITY;
+    int64_t maximumCapacity = maxCapacity > 0 ? maxCapacity : ffkit_max_alloc_size();
 
-    if (initialCapacity < 0 || maxCapacity < 0 ||
-        capacity > maximumCapacity || capacity > ffkit_max_alloc_size() ||
-        maximumCapacity > ffkit_max_alloc_size()) {
+    if (initialCapacity < 0 || maxCapacity < 0 || capacity > maximumCapacity || capacity > ffkit_max_alloc_size() || maximumCapacity > ffkit_max_alloc_size()) {
         return 0;
     }
 
@@ -1729,11 +1940,8 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     resource = ffkit_memory_find_locked(bufferId);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->type == FFKIT_RESOURCE_OUTPUT &&
-            resource->size >= 0 &&
-            (uint64_t)resource->size <= (uint64_t)NSUIntegerMax) {
-            result = [NSData dataWithBytes:resource->data
-                                    length:(NSUInteger)resource->size];
+        if (resource->type == FFKIT_RESOURCE_OUTPUT && resource->size >= 0 && (uint64_t)resource->size <= (uint64_t)NSUIntegerMax) {
+            result = [NSData dataWithBytes:resource->data length:(NSUInteger)resource->size];
         }
         pthread_mutex_unlock(&resource->mutex);
     }
@@ -1750,12 +1958,8 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     resource = ffkit_memory_find_locked(bufferId);
     if (resource != NULL) {
         pthread_mutex_lock(&resource->mutex);
-        if (resource->type == FFKIT_RESOURCE_OUTPUT &&
-            resource->size >= 0 &&
-            (uint64_t)resource->size <= (uint64_t)NSUIntegerMax) {
-            result = [NSData dataWithBytesNoCopy:resource->data
-                                          length:(NSUInteger)resource->size
-                                    freeWhenDone:NO];
+        if (resource->type == FFKIT_RESOURCE_OUTPUT && resource->size >= 0 && (uint64_t)resource->size <= (uint64_t)NSUIntegerMax) {
+            result = [NSData dataWithBytesNoCopy:resource->data length:(NSUInteger)resource->size freeWhenDone:NO];
         }
         pthread_mutex_unlock(&resource->mutex);
     }
@@ -1802,11 +2006,9 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
 + (long)registerFFmpegKitStream:(long)capacity type:(int)type {
     int64_t id;
     FFKitStreamResource *resource;
-    int64_t streamCapacity = capacity > 0 ? capacity
-                                          : FFKIT_DEFAULT_STREAM_CAPACITY;
+    int64_t streamCapacity = capacity > 0 ? capacity : FFKIT_DEFAULT_STREAM_CAPACITY;
 
-    if (capacity < 0 || streamCapacity > ffkit_max_alloc_size() ||
-        (type != FFKIT_RESOURCE_INPUT && type != FFKIT_RESOURCE_OUTPUT)) {
+    if (capacity < 0 || streamCapacity > ffkit_max_alloc_size() || (type != FFKIT_RESOURCE_INPUT && type != FFKIT_RESOURCE_OUTPUT)) {
         return 0;
     }
 
@@ -1833,17 +2035,12 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return (long)id;
 }
 
-+ (int)writeFFmpegKitStream:(long)streamId
-                       data:(NSData *)data
-                     offset:(NSUInteger)offset
-                     length:(NSUInteger)length
-                    timeout:(int)timeoutMs {
++ (int)writeFFmpegKitStream:(long)streamId data:(NSData *)data offset:(NSUInteger)offset length:(NSUInteger)length timeout:(int)timeoutMs {
     FFKitStreamResource *resource;
     int ret = AVERROR(ENOENT);
     int freeResource = 0;
 
-    if (data == nil || offset > [data length] ||
-        length > ([data length] - offset) || length > INT_MAX) {
+    if (data == nil || offset > [data length] || length > ([data length] - offset) || length > INT_MAX) {
         return AVERROR(EINVAL);
     }
 
@@ -1860,9 +2057,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_write_bytes(
-            resource, ((const uint8_t *)[data bytes]) + offset, (int)length,
-            timeoutMs);
+        ret = ffkit_stream_write_bytes(resource, ((const uint8_t *)[data bytes]) + offset, (int)length, timeoutMs);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -1879,9 +2074,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return ret;
 }
 
-+ (NSData *)readFFmpegKitStream:(long)streamId
-                       maxBytes:(int)maxBytes
-                        timeout:(int)timeoutMs {
++ (NSData *)readFFmpegKitStream:(long)streamId maxBytes:(int)maxBytes timeout:(int)timeoutMs {
     FFKitStreamResource *resource;
     uint8_t *buffer;
     int ret = AVERROR(ENOENT);
@@ -1912,8 +2105,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs,
-                                      &timedOut, &eof);
+        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, &timedOut, &eof);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -1994,7 +2186,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
 + (void)enableRedirection {
     [lock lock];
 
-    if (redirectionEnabled != 0) {
+    if (redirectionEnabled != 0 || (atomic_load(&shutdownState) != LibraryRunning)) {
         [lock unlock];
         return;
     }
@@ -2004,13 +2196,17 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     // INSTEAD OF RUNNING NEXT TO THE NEW ONE
     const int generationId = atomic_fetch_add(&redirectionGenerationId, 1) + 1;
 
+    // THE LOOP IS COUNTED BEFORE IT STARTS, SO SHUTDOWN WAITS FOR IT
+    [executionCondition lock];
+    activeDeliveryLoops++;
+    [executionCondition unlock];
+
     // THE FLAG, THE LOOP AND THE HOOKS OF FFMPEG CHANGE TOGETHER, SO THREADS
     // THAT ENABLE AND DISABLE AT THE SAME TIME CANNOT LEAVE THE HOOKS OUT OF
     // STEP WITH THE FLAG
-    dispatch_async(
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-          callbackBlockFunction(generationId);
-        });
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+      callbackBlockFunction(generationId);
+    });
 
     av_log_set_callback(ffmpegkit_log_callback_function);
     set_report_callback(ffmpegkit_statistics_callback_function);
@@ -2035,74 +2231,85 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     callbackNotify();
 }
 
++ (BOOL)shutdownWithTimeout:(int)waitTimeout {
+    NSDate *deadline = waitTimeout < 0 ? [NSDate distantFuture] : [NSDate dateWithTimeIntervalSinceNow:waitTimeout / 1000.0];
+    [executionCondition lock];
+    const BOOL initiate = atomic_load(&shutdownState) == LibraryRunning;
+    if (initiate) {
+        atomic_store(&shutdownState, LibraryTerminating);
+        shutdownCleanupPending = YES;
+        shutdownGraceDeadline = [[NSDate dateWithTimeIntervalSinceNow:2] earlierDate:deadline];
+    }
+    [executionCondition unlock];
+
+    if (initiate) {
+        cancelAllSessions();
+        ffkit_stream_close_all();
+        [FFmpegKitConfig disableRedirection];
+        discardQueuedMessagesWhenIdle(NO);
+
+        NSDate *cleanupDeadline = [[shutdownGraceDeadline dateByAddingTimeInterval:1] earlierDate:deadline];
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+          finishShutdown(cleanupDeadline);
+        });
+    }
+
+    // Retries only wait; they never reset grace or reopen callback admission.
+    if (libraryWorkDepth > 0) {
+        return NO;
+    }
+    [executionCondition lock];
+    while (shutdownCleanupPending || pendingExecutions > 0 || activeDeliveryLoops > 0 || activeCallbacks > 0) {
+        if (![executionCondition waitUntilDate:deadline]) {
+            break;
+        }
+    }
+    const BOOL stopped = !shutdownCleanupPending && pendingExecutions == 0 && activeDeliveryLoops == 0 && activeCallbacks == 0;
+    [executionCondition unlock];
+    return stopped;
+}
+
++ (BOOL)isShutdown {
+    return atomic_load(&shutdownState) != LibraryRunning;
+}
+
 + (int)setFontconfigConfigurationPath:(NSString *)path {
-    return [FFmpegKitConfig setEnvironmentVariable:@"FONTCONFIG_PATH"
-                                             value:path];
+    return [FFmpegKitConfig setEnvironmentVariable:@"FONTCONFIG_PATH" value:path];
 }
 
-+ (void)setFontDirectory:(NSString *)fontDirectoryPath
-                    with:(NSDictionary *)fontNameMapping {
-    [FFmpegKitConfig
-        setFontDirectoryList:[NSArray arrayWithObject:fontDirectoryPath]
-                        with:fontNameMapping];
++ (void)setFontDirectory:(NSString *)fontDirectoryPath with:(NSDictionary *)fontNameMapping {
+    [FFmpegKitConfig setFontDirectoryList:[NSArray arrayWithObject:fontDirectoryPath] with:fontNameMapping];
 }
 
-+ (void)setFontDirectoryList:(NSArray *)fontDirectoryArray
-                        with:(NSDictionary *)fontNameMapping {
++ (void)setFontDirectoryList:(NSArray *)fontDirectoryArray with:(NSDictionary *)fontNameMapping {
     NSError *error = nil;
     BOOL isDirectory = YES;
     BOOL isCacheDirectory = YES;
     BOOL isFile = NO;
     int validFontNameMappingCount = 0;
-    NSString *tempConfigurationDirectory =
-        [NSTemporaryDirectory() stringByAppendingPathComponent:@"fontconfig"];
-    NSString *fontConfigurationFile = [tempConfigurationDirectory
-        stringByAppendingPathComponent:@"fonts.conf"];
-    NSString *fontConfigurationCacheDirectory = [tempConfigurationDirectory
-        stringByAppendingPathComponent:@"cache"];
+    NSString *tempConfigurationDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"fontconfig"];
+    NSString *fontConfigurationFile = [tempConfigurationDirectory stringByAppendingPathComponent:@"fonts.conf"];
+    NSString *fontConfigurationCacheDirectory = [tempConfigurationDirectory stringByAppendingPathComponent:@"cache"];
 
-    if (![[NSFileManager defaultManager]
-            fileExistsAtPath:tempConfigurationDirectory
-                 isDirectory:&isDirectory]) {
-        if (![[NSFileManager defaultManager]
-                      createDirectoryAtPath:tempConfigurationDirectory
-                withIntermediateDirectories:YES
-                                 attributes:nil
-                                      error:&error]) {
-            NSLog(@"Failed to set font directory. Error received while "
-                  @"creating temp "
-                  @"conf directory: %@.",
-                  error);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:tempConfigurationDirectory isDirectory:&isDirectory]) {
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:tempConfigurationDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
+            NSLog(@"Failed to set font directory. Error received while creating temp conf directory: %@.", error);
             return;
         }
         NSLog(@"Created temporary font conf directory: TRUE.");
     }
 
-    if (![[NSFileManager defaultManager]
-            fileExistsAtPath:fontConfigurationCacheDirectory
-                 isDirectory:&isCacheDirectory] ||
-        !isCacheDirectory) {
-        if (![[NSFileManager defaultManager]
-                      createDirectoryAtPath:fontConfigurationCacheDirectory
-                withIntermediateDirectories:YES
-                                 attributes:nil
-                                      error:&error]) {
-            NSLog(@"Failed to set font directory. Error received while "
-                  @"creating temp "
-                  @"cache directory: %@.",
-                  error);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:fontConfigurationCacheDirectory isDirectory:&isCacheDirectory] || !isCacheDirectory) {
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:fontConfigurationCacheDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
+            NSLog(@"Failed to set font directory. Error received while creating temp cache directory: %@.", error);
             return;
         }
         NSLog(@"Created temporary font cache directory: TRUE.");
     }
 
-    if ([[NSFileManager defaultManager] fileExistsAtPath:fontConfigurationFile
-                                             isDirectory:&isFile]) {
-        BOOL fontConfigurationDeleted = [[NSFileManager defaultManager]
-            removeItemAtPath:fontConfigurationFile
-                       error:nil];
-        NSLog(@"Deleted old temporary font configuration: %s.",
-              fontConfigurationDeleted ? "TRUE" : "FALSE");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:fontConfigurationFile isDirectory:&isFile]) {
+        BOOL fontConfigurationDeleted = [[NSFileManager defaultManager] removeItemAtPath:fontConfigurationFile error:nil];
+        NSLog(@"Deleted old temporary font configuration: %s.", fontConfigurationDeleted ? "TRUE" : "FALSE");
     }
 
     /* PROCESS MAPPINGS FIRST */
@@ -2110,8 +2317,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     for (NSString *fontName in [fontNameMapping allKeys]) {
         NSString *mappedFontName = [fontNameMapping objectForKey:fontName];
 
-        if ((fontName != nil) && (mappedFontName != nil) &&
-            ([fontName length] > 0) && ([mappedFontName length] > 0)) {
+        if ((fontName != nil) && (mappedFontName != nil) && ([fontName length] > 0) && ([mappedFontName length] > 0)) {
 
             fontNameMappingBlock = [NSString
                 stringWithFormat:
@@ -2145,18 +2351,12 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     [fontConfiguration appendString:fontNameMappingBlock];
     [fontConfiguration appendString:@"</fontconfig>\n"];
 
-    if (![fontConfiguration writeToFile:fontConfigurationFile
-                             atomically:YES
-                               encoding:NSUTF8StringEncoding
-                                  error:&error]) {
-        NSLog(@"Failed to set font directory. Error received while saving font "
-              @"configuration: %@.",
-              error);
+    if (![fontConfiguration writeToFile:fontConfigurationFile atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        NSLog(@"Failed to set font directory. Error received while saving font configuration: %@.", error);
         return;
     }
 
-    NSLog(@"Saved new temporary font configuration with %d font name mappings.",
-          validFontNameMappingCount);
+    NSLog(@"Saved new temporary font configuration with %d font name mappings.", validFontNameMappingCount);
 
     [FFmpegKitConfig setFontconfigConfigurationPath:tempConfigurationDirectory];
 
@@ -2171,38 +2371,26 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     BOOL isDirectory;
 
     // PIPES ARE CREATED UNDER THE PIPES DIRECTORY
-    NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(
-        NSCachesDirectory, NSUserDomainMask, YES) objectAtIndex:0];
+    NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) objectAtIndex:0];
     NSString *pipesDir = [cacheDir stringByAppendingPathComponent:@"pipes"];
 
-    if (![[NSFileManager defaultManager] fileExistsAtPath:pipesDir
-                                              isDirectory:&isDirectory]) {
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:pipesDir
-                                       withIntermediateDirectories:YES
-                                                        attributes:nil
-                                                             error:&error]) {
-            NSLog(@"Failed to create pipes directory: %@. Operation failed "
-                  @"with %@.",
-                  pipesDir, error);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:pipesDir isDirectory:&isDirectory]) {
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:pipesDir withIntermediateDirectories:YES attributes:nil error:&error]) {
+            NSLog(@"Failed to create pipes directory: %@. Operation failed with %@.", pipesDir, error);
             return nil;
         }
     }
 
-    NSString *newFFmpegPipePath = [NSString
-        stringWithFormat:@"%@/%@%ld", pipesDir, FFmpegKitNamedPipePrefix,
-                         [pipeIndexGenerator getAndIncrement]];
+    NSString *newFFmpegPipePath = [NSString stringWithFormat:@"%@/%@%ld", pipesDir, FFmpegKitNamedPipePrefix, [pipeIndexGenerator getAndIncrement]];
 
     // FIRST CLOSE OLD PIPES WITH THE SAME NAME
     [FFmpegKitConfig closeFFmpegPipe:newFFmpegPipePath];
 
-    int rc =
-        mkfifo([newFFmpegPipePath UTF8String], S_IRWXU | S_IRWXG | S_IROTH);
+    int rc = mkfifo([newFFmpegPipePath UTF8String], S_IRWXU | S_IRWXG | S_IROTH);
     if (rc == 0) {
         return newFFmpegPipePath;
     } else {
-        NSLog(@"Failed to register new FFmpeg pipe %@. Operation failed with "
-              @"rc=%d.",
-              newFFmpegPipePath, rc);
+        NSLog(@"Failed to register new FFmpeg pipe %@. Operation failed with rc=%d.", newFFmpegPipePath, rc);
         return nil;
     }
 }
@@ -2233,8 +2421,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return [NSString stringWithUTF8String:buildDate];
 }
 
-+ (int)setEnvironmentVariable:(NSString *)variableName
-                        value:(NSString *)variableValue {
++ (int)setEnvironmentVariable:(NSString *)variableName value:(NSString *)variableValue {
     return setenv([variableName UTF8String], [variableValue UTF8String], true);
 }
 
@@ -2253,38 +2440,67 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
 }
 
 + (void)ffmpegExecute:(FFmpegSession *)ffmpegSession {
-    [ffmpegSession startRunning];
-
+    if (!beginExecution()) {
+        rejectSession(ffmpegSession);
+        return;
+    }
     @try {
-        int returnCode = executeFFmpeg([ffmpegSession getSessionId],
-                                       [ffmpegSession getArguments]);
-        [ffmpegSession complete:[[ReturnCode alloc] init:returnCode]];
-    } @catch (NSException *exception) {
-        [ffmpegSession fail:exception];
-        NSLog(@"FFmpeg execute failed: %@.%@",
-              [FFmpegKitConfig argumentsToString:[ffmpegSession getArguments]],
-              [NSString stringWithFormat:@"%@", [exception callStackSymbols]]);
+        [FFmpegKitConfig runFFmpegSession:ffmpegSession];
+    } @finally {
+        endExecution();
     }
 }
 
 + (void)ffprobeExecute:(FFprobeSession *)ffprobeSession {
-    [ffprobeSession startRunning];
-
+    if (!beginExecution()) {
+        rejectSession(ffprobeSession);
+        return;
+    }
     @try {
-        int returnCode = executeFFprobe([ffprobeSession getSessionId],
-                                        [ffprobeSession getArguments]);
-        [ffprobeSession complete:[[ReturnCode alloc] init:returnCode]];
-    } @catch (NSException *exception) {
-        [ffprobeSession fail:exception];
-        NSLog(@"FFprobe execute failed: %@.%@",
-              [FFmpegKitConfig argumentsToString:[ffprobeSession getArguments]],
-              [NSString stringWithFormat:@"%@", [exception callStackSymbols]]);
+        [FFmpegKitConfig runFFprobeSession:ffprobeSession];
+    } @finally {
+        endExecution();
     }
 }
 
-+ (void)getMediaInformationExecute:
-            (MediaInformationSession *)mediaInformationSession
-                       withTimeout:(int)waitTimeout {
++ (void)getMediaInformationExecute:(MediaInformationSession *)mediaInformationSession withTimeout:(int)waitTimeout {
+    if (!beginExecution()) {
+        rejectSession(mediaInformationSession);
+        return;
+    }
+    @try {
+        [FFmpegKitConfig runMediaInformationSession:mediaInformationSession withTimeout:waitTimeout];
+    } @finally {
+        endExecution();
+    }
+}
+
++ (void)runFFmpegSession:(FFmpegSession *)ffmpegSession {
+    [ffmpegSession startRunning];
+
+    @try {
+        int returnCode = executeFFmpeg([ffmpegSession getSessionId], [ffmpegSession getArguments]);
+        [ffmpegSession complete:[[ReturnCode alloc] init:returnCode]];
+    } @catch (NSException *exception) {
+        [ffmpegSession fail:exception];
+        NSLog(@"FFmpeg execute failed: %@.%@", [FFmpegKitConfig argumentsToString:[ffmpegSession getArguments]], [NSString stringWithFormat:@"%@", [exception callStackSymbols]]);
+    }
+}
+
++ (void)runFFprobeSession:(FFprobeSession *)ffprobeSession {
+    [ffprobeSession startRunning];
+
+    @try {
+        int returnCode = executeFFprobe([ffprobeSession getSessionId], [ffprobeSession getArguments]);
+        // Shutdown may have dropped output; the native result still stands.
+        [ffprobeSession complete:[[ReturnCode alloc] init:returnCode]];
+    } @catch (NSException *exception) {
+        [ffprobeSession fail:exception];
+        NSLog(@"FFprobe execute failed: %@.%@", [FFmpegKitConfig argumentsToString:[ffprobeSession getArguments]], [NSString stringWithFormat:@"%@", [exception callStackSymbols]]);
+    }
+}
+
++ (void)runMediaInformationSession:(MediaInformationSession *)mediaInformationSession withTimeout:(int)waitTimeout {
     [mediaInformationSession startRunning];
 
     ReturnCode *returnCode = nil;
@@ -2294,9 +2510,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
         AVBPrint mediaInformationBuffer;
         av_bprint_init(&mediaInformationBuffer, 0, AV_BPRINT_SIZE_UNLIMITED);
         @try {
-            int returnCodeValue = executeFFprobeToBuffer(
-                [mediaInformationSession getSessionId],
-                [mediaInformationSession getArguments], &mediaInformationBuffer);
+            int returnCodeValue = executeFFprobeToBuffer([mediaInformationSession getSessionId], [mediaInformationSession getArguments], &mediaInformationBuffer);
             returnCode = [[ReturnCode alloc] init:returnCodeValue];
             [mediaInformationSession complete:returnCode];
 
@@ -2306,11 +2520,8 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
             // async log delivery. Callers that read the session logs afterwards
             // still get the wait, because getAllLogs applies the timeout itself.
             if ([returnCode isValueSuccess]) {
-                ffprobeJsonOutput =
-                    [NSString stringWithCString:mediaInformationBuffer.str
-                                       encoding:NSUTF8StringEncoding];
-                mediaInformation = [MediaInformationJsonParser
-                    fromWithError:ffprobeJsonOutput];
+                ffprobeJsonOutput = [NSString stringWithCString:mediaInformationBuffer.str encoding:NSUTF8StringEncoding];
+                mediaInformation = [MediaInformationJsonParser fromWithError:ffprobeJsonOutput];
                 [mediaInformationSession setMediaInformation:mediaInformation];
             }
         } @finally {
@@ -2318,127 +2529,37 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
         }
     } @catch (NSException *exception) {
         [mediaInformationSession fail:exception];
-        NSLog(@"Get media information execute failed: %@.%@",
-              [FFmpegKitConfig
-                  argumentsToString:[mediaInformationSession getArguments]],
-              [NSString stringWithFormat:@"\n%@\n%@", [exception userInfo],
-                                         [exception callStackSymbols]]);
+        NSLog(@"Get media information execute failed: %@.%@", [FFmpegKitConfig argumentsToString:[mediaInformationSession getArguments]], [NSString stringWithFormat:@"\n%@\n%@", [exception userInfo], [exception callStackSymbols]]);
     }
 }
 
 + (void)asyncFFmpegExecute:(FFmpegSession *)ffmpegSession {
-    [FFmpegKitConfig asyncFFmpegExecute:ffmpegSession
-                        onDispatchQueue:asyncDispatchQueue];
+    [FFmpegKitConfig asyncFFmpegExecute:ffmpegSession onDispatchQueue:asyncDispatchQueue];
 }
 
-+ (void)asyncFFmpegExecute:(FFmpegSession *)ffmpegSession
-           onDispatchQueue:(dispatch_queue_t)queue {
-    dispatch_async(queue, ^{
-      [FFmpegKitConfig ffmpegExecute:ffmpegSession];
-
-      FFmpegSessionCompleteCallback completeCallback =
-          [ffmpegSession getCompleteCallback];
-      if (completeCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              completeCallback(ffmpegSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside session complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
-
-      FFmpegSessionCompleteCallback globalFFmpegSessionCompleteCallback =
-          [FFmpegKitConfig getFFmpegSessionCompleteCallback];
-      if (globalFFmpegSessionCompleteCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              globalFFmpegSessionCompleteCallback(ffmpegSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside global complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
++ (void)asyncFFmpegExecute:(FFmpegSession *)ffmpegSession onDispatchQueue:(dispatch_queue_t)queue {
+    submitAsyncExecution(ffmpegSession, queue, ^(id<Session> session) {
+      [FFmpegKitConfig runFFmpegSession:(FFmpegSession *)session];
     });
 }
 
 + (void)asyncFFprobeExecute:(FFprobeSession *)ffprobeSession {
-    [FFmpegKitConfig asyncFFprobeExecute:ffprobeSession
-                         onDispatchQueue:asyncDispatchQueue];
+    [FFmpegKitConfig asyncFFprobeExecute:ffprobeSession onDispatchQueue:asyncDispatchQueue];
 }
 
-+ (void)asyncFFprobeExecute:(FFprobeSession *)ffprobeSession
-            onDispatchQueue:(dispatch_queue_t)queue {
-    dispatch_async(queue, ^{
-      [FFmpegKitConfig ffprobeExecute:ffprobeSession];
-
-      FFprobeSessionCompleteCallback completeCallback =
-          [ffprobeSession getCompleteCallback];
-      if (completeCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              completeCallback(ffprobeSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside session complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
-
-      FFprobeSessionCompleteCallback globalFFprobeSessionCompleteCallback =
-          [FFmpegKitConfig getFFprobeSessionCompleteCallback];
-      if (globalFFprobeSessionCompleteCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              globalFFprobeSessionCompleteCallback(ffprobeSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside global complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
++ (void)asyncFFprobeExecute:(FFprobeSession *)ffprobeSession onDispatchQueue:(dispatch_queue_t)queue {
+    submitAsyncExecution(ffprobeSession, queue, ^(id<Session> session) {
+      [FFmpegKitConfig runFFprobeSession:(FFprobeSession *)session];
     });
 }
 
-+ (void)asyncGetMediaInformationExecute:
-            (MediaInformationSession *)mediaInformationSession
-                            withTimeout:(int)waitTimeout {
-    [FFmpegKitConfig asyncGetMediaInformationExecute:mediaInformationSession
-                                     onDispatchQueue:asyncDispatchQueue
-                                         withTimeout:waitTimeout];
++ (void)asyncGetMediaInformationExecute:(MediaInformationSession *)mediaInformationSession withTimeout:(int)waitTimeout {
+    [FFmpegKitConfig asyncGetMediaInformationExecute:mediaInformationSession onDispatchQueue:asyncDispatchQueue withTimeout:waitTimeout];
 }
 
-+ (void)asyncGetMediaInformationExecute:
-            (MediaInformationSession *)mediaInformationSession
-                        onDispatchQueue:(dispatch_queue_t)queue
-                            withTimeout:(int)waitTimeout {
-    dispatch_async(queue, ^{
-      [FFmpegKitConfig getMediaInformationExecute:mediaInformationSession
-                                      withTimeout:waitTimeout];
-
-      MediaInformationSessionCompleteCallback completeCallback =
-          [mediaInformationSession getCompleteCallback];
-      if (completeCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              completeCallback(mediaInformationSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside session complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
-
-      MediaInformationSessionCompleteCallback
-          globalMediaInformationSessionCompleteCallback =
-              [FFmpegKitConfig getMediaInformationSessionCompleteCallback];
-      if (globalMediaInformationSessionCompleteCallback != nil) {
-          @try {
-              // NOTIFY SESSION CALLBACK DEFINED
-              globalMediaInformationSessionCompleteCallback(
-                  mediaInformationSession);
-          } @catch (NSException *exception) {
-              NSLog(@"Exception thrown inside global complete callback. %@",
-                    [exception callStackSymbols]);
-          }
-      }
++ (void)asyncGetMediaInformationExecute:(MediaInformationSession *)mediaInformationSession onDispatchQueue:(dispatch_queue_t)queue withTimeout:(int)waitTimeout {
+    submitAsyncExecution(mediaInformationSession, queue, ^(id<Session> session) {
+      [FFmpegKitConfig runMediaInformationSession:(MediaInformationSession *)session withTimeout:waitTimeout];
     });
 }
 
@@ -2462,8 +2583,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     retired = nil;
 }
 
-+ (void)enableFFmpegSessionCompleteCallback:
-    (FFmpegSessionCompleteCallback)completeCallback {
++ (void)enableFFmpegSessionCompleteCallback:(FFmpegSessionCompleteCallback)completeCallback {
     FFmpegSessionCompleteCallback replacement = [completeCallback copy];
     __attribute__((objc_precise_lifetime)) FFmpegSessionCompleteCallback retired;
     [globalCallbackLock lock];
@@ -2480,8 +2600,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return callback;
 }
 
-+ (void)enableFFprobeSessionCompleteCallback:
-    (FFprobeSessionCompleteCallback)completeCallback {
++ (void)enableFFprobeSessionCompleteCallback:(FFprobeSessionCompleteCallback)completeCallback {
     FFprobeSessionCompleteCallback replacement = [completeCallback copy];
     __attribute__((objc_precise_lifetime)) FFprobeSessionCompleteCallback retired;
     [globalCallbackLock lock];
@@ -2564,10 +2683,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
          * THERE IS A HARD LIMIT ON THE NATIVE SIDE. HISTORY SIZE MUST BE
          * SMALLER THAN SESSION_MAP_SIZE
          */
-        @throw([NSException exceptionWithName:NSInvalidArgumentException
-                                       reason:@"Session history size must not "
-                                              @"exceed the hard limit!"
-                                     userInfo:nil]);
+        @throw([NSException exceptionWithName:NSInvalidArgumentException reason:@"Session history size must not exceed the hard limit!" userInfo:nil]);
     } else if (pSessionHistorySize > 0) {
         NSArray *deletedSessionIds;
         NSMutableArray *retiredSessions = [[NSMutableArray alloc] init];
@@ -2585,8 +2701,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
 + (id<Session>)getSession:(long)sessionId {
     [sessionHistoryLock lock];
 
-    id<Session> session =
-        [sessionHistoryMap objectForKey:[NSNumber numberWithLong:sessionId]];
+    id<Session> session = [sessionHistoryMap objectForKey:[NSNumber numberWithLong:sessionId]];
 
     [sessionHistoryLock unlock];
 
@@ -2771,14 +2886,12 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
     return globalLogRedirectionStrategy;
 }
 
-+ (void)setLogRedirectionStrategy:
-    (LogRedirectionStrategy)logRedirectionStrategy {
++ (void)setLogRedirectionStrategy:(LogRedirectionStrategy)logRedirectionStrategy {
     globalLogRedirectionStrategy = logRedirectionStrategy;
 }
 
 + (int)messagesInTransmit:(long)sessionId {
-    return atomic_load(
-        &sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE]);
+    return atomic_load(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE]);
 }
 
 + (NSString *)sessionStateToString:(SessionState)state {
@@ -2819,8 +2932,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
                 [argumentArray addObject:currentArgument];
                 currentArgument = [[NSMutableString alloc] init];
             }
-        } else if (currentChar == '\'' &&
-                   (previousChar == 0 || previousChar != '\\')) {
+        } else if (currentChar == '\'' && (previousChar == 0 || previousChar != '\\')) {
             if (singleQuoteStarted) {
                 singleQuoteStarted = false;
             } else if (doubleQuoteStarted) {
@@ -2828,8 +2940,7 @@ int executeFFprobe(long sessionId, NSArray *arguments) {
             } else {
                 singleQuoteStarted = true;
             }
-        } else if (currentChar == '\"' &&
-                   (previousChar == 0 || previousChar != '\\')) {
+        } else if (currentChar == '\"' && (previousChar == 0 || previousChar != '\\')) {
             if (doubleQuoteStarted) {
                 doubleQuoteStarted = false;
             } else if (singleQuoteStarted) {

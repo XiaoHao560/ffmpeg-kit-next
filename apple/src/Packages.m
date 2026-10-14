@@ -89,18 +89,12 @@ static NSMutableArray *supportedExternalLibraries;
     NSMutableArray *enabledLibraryArray = [[NSMutableArray alloc] init];
 
     for (int i = 0; i < [supportedExternalLibraries count]; i++) {
-        NSString *supportedExternalLibrary =
-            [supportedExternalLibraries objectAtIndex:i];
+        NSString *supportedExternalLibrary = [supportedExternalLibraries objectAtIndex:i];
 
-        NSString *libraryName1 =
-            [NSString stringWithFormat:@"enable-%@", supportedExternalLibrary];
-        NSString *libraryName2 = [NSString
-            stringWithFormat:@"enable-lib%@", supportedExternalLibrary];
+        NSString *libraryName1 = [NSString stringWithFormat:@"enable-%@", supportedExternalLibrary];
+        NSString *libraryName2 = [NSString stringWithFormat:@"enable-lib%@", supportedExternalLibrary];
 
-        if ([buildConfiguration rangeOfString:libraryName1].location !=
-                NSNotFound ||
-            [buildConfiguration rangeOfString:libraryName2].location !=
-                NSNotFound) {
+        if ([buildConfiguration rangeOfString:libraryName1].location != NSNotFound || [buildConfiguration rangeOfString:libraryName2].location != NSNotFound) {
             [enabledLibraryArray addObject:supportedExternalLibrary];
         }
     }

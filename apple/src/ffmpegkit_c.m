@@ -95,30 +95,20 @@
 /* ------------------------------------------------------------------------ */
 
 @interface FFmpegKitConfig (FFKCApiSupport)
-+ (long)registerFFmpegKitInputBufferWithBytes:(const void *)bytes
-                                       length:(NSUInteger)length;
-+ (long)registerFFmpegKitOutputBuffer:(long)initialCapacity
-                          maxCapacity:(long)maxCapacity;
++ (long)registerFFmpegKitInputBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
++ (long)registerFFmpegKitOutputBuffer:(long)initialCapacity maxCapacity:(long)maxCapacity;
 + (long)getFFmpegKitBufferSize:(long)bufferId;
 + (NSData *)getFFmpegKitOutputBuffer:(long)bufferId;
 + (void)unregisterFFmpegKitBuffer:(long)bufferId;
 + (long)registerFFmpegKitStream:(long)capacity type:(int)type;
-+ (int)writeFFmpegKitStream:(long)streamId
-                       data:(NSData *)data
-                     offset:(NSUInteger)offset
-                     length:(NSUInteger)length
-                    timeout:(int)timeoutMs;
-+ (NSData *)readFFmpegKitStream:(long)streamId
-                       maxBytes:(int)maxBytes
-                        timeout:(int)timeoutMs;
++ (int)writeFFmpegKitStream:(long)streamId data:(NSData *)data offset:(NSUInteger)offset length:(NSUInteger)length timeout:(int)timeoutMs;
++ (NSData *)readFFmpegKitStream:(long)streamId maxBytes:(int)maxBytes timeout:(int)timeoutMs;
 + (void)closeFFmpegKitStreamInput:(long)streamId;
 + (void)unregisterFFmpegKitStream:(long)streamId;
 @end
 
 @interface FFmpegKitInputBuffer (FFKCApiUrlSupport)
-+ (NSString *)urlWithProtocol:(NSString *)protocol
-                   resourceId:(long)resourceId
-                    extension:(NSString *)extension;
++ (NSString *)urlWithProtocol:(NSString *)protocol resourceId:(long)resourceId extension:(NSString *)extension;
 @end
 
 /* ------------------------------------------------------------------------ */
@@ -150,8 +140,7 @@ static void ffkSetError(const char *message) {
     ffkClearError();
     pthread_once(&ffkErrorKeyOnce, ffkCreateErrorKey);
     // When the copy fails there is still an error, only without its message
-    pthread_setspecific(ffkErrorKey,
-                        strdup(message == NULL ? "Unknown error." : message));
+    pthread_setspecific(ffkErrorKey, strdup(message == NULL ? "Unknown error." : message));
     ffkThreadErrorSet = 1;
 }
 
@@ -159,6 +148,49 @@ static void ffkSetErrorFromException(NSException *exception) {
     NSString *reason = exception.reason != nil ? exception.reason : exception.name;
     ffkSetError([reason UTF8String]);
 }
+
+/*
+ * Consumer code - a callback, a session delete listener or a free function -
+ * runs with an error slot of its own: what its own ffk_* calls leave there is
+ * dropped when it returns, and the slot of the code around it is put back.
+ * Consumer code can run inside an entry point, as the complete callbacks of an
+ * asynchronous execution after shutdown do, and must not change what that
+ * entry point reports.
+ */
+typedef struct {
+    int set;
+    char *message;
+} FFKSavedError;
+
+static FFKSavedError ffkSaveError(void) {
+    FFKSavedError saved = {ffkThreadErrorSet, NULL};
+    if (saved.set) {
+        pthread_once(&ffkErrorKeyOnce, ffkCreateErrorKey);
+        saved.message = pthread_getspecific(ffkErrorKey);
+        pthread_setspecific(ffkErrorKey, NULL);
+        ffkThreadErrorSet = 0;
+    }
+    return saved;
+}
+
+static void ffkRestoreError(FFKSavedError saved) {
+    ffkClearError();
+    if (saved.set) {
+        pthread_once(&ffkErrorKeyOnce, ffkCreateErrorKey);
+        pthread_setspecific(ffkErrorKey, saved.message);
+        ffkThreadErrorSet = 1;
+    }
+}
+
+#define FFK_CONSUMER_CALL(call)                                                                                                                                                                                                                                                                            \
+    do {                                                                                                                                                                                                                                                                                                   \
+        const FFKSavedError ffkSaved = ffkSaveError();                                                                                                                                                                                                                                                     \
+        @try {                                                                                                                                                                                                                                                                                             \
+            call;                                                                                                                                                                                                                                                                                          \
+        } @finally {                                                                                                                                                                                                                                                                                       \
+            ffkRestoreError(ffkSaved);                                                                                                                                                                                                                                                                     \
+        }                                                                                                                                                                                                                                                                                                  \
+    } while (0)
 
 /*
  * Every entry point is wrapped in FFK_BEGIN / FFK_END(neutral): the error slot
@@ -270,10 +302,7 @@ static FFprobeSession *ffkFFprobeSession(const FFKSession *handle) {
     return ffkAs(handle, [FFprobeSession class]);
 }
 
-static MediaInformationSession *
-ffkMediaInformationSession(const FFKSession *handle) {
-    return ffkAs(handle, [MediaInformationSession class]);
-}
+static MediaInformationSession *ffkMediaInformationSession(const FFKSession *handle) { return ffkAs(handle, [MediaInformationSession class]); }
 
 /** Retains a snapshot of an array, or returns NULL when there is none. */
 static void *ffkRetainList(NSArray *array) {
@@ -314,15 +343,13 @@ static NSString *ffkText(const char *value, const char *what) {
  * The texts as strings, or nil and an error when one is not valid UTF-8. A
  * NULL array holds `count` empty texts. `what` names one text in the message.
  */
-static NSArray *ffkStrings(const char *const *values, size_t count,
-                           const char *what) {
+static NSArray *ffkStrings(const char *const *values, size_t count, const char *what) {
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:count];
     for (size_t i = 0; i < count; i++) {
         NSString *text = ffkQuietText(values == NULL ? NULL : values[i]);
         if (text == nil) {
             char message[80];
-            snprintf(message, sizeof(message), "%s %zu is not valid UTF-8.",
-                     what, i);
+            snprintf(message, sizeof(message), "%s %zu is not valid UTF-8.", what, i);
             ffkSetError(message);
             return nil;
         }
@@ -345,10 +372,8 @@ static NSString *ffkKey(const char *key) {
  * value is the empty one, and a later entry replaces an earlier one with the
  * same name. Returns nil and an error when a text is not valid UTF-8.
  */
-static NSDictionary *ffkStringMap(const char *const *keys,
-                                  const char *const *values, size_t count) {
-    NSMutableDictionary *mapping =
-        [NSMutableDictionary dictionaryWithCapacity:count];
+static NSDictionary *ffkStringMap(const char *const *keys, const char *const *values, size_t count) {
+    NSMutableDictionary *mapping = [NSMutableDictionary dictionaryWithCapacity:count];
     for (size_t i = 0; i < count; i++) {
         const char *key = keys == NULL ? NULL : keys[i];
         if (key == NULL) {
@@ -358,8 +383,7 @@ static NSDictionary *ffkStringMap(const char *const *keys,
         NSString *value = ffkQuietText(values == NULL ? NULL : values[i]);
         if (name == nil || value == nil) {
             char message[80];
-            snprintf(message, sizeof(message),
-                     "Mapping entry %zu is not valid UTF-8.", i);
+            snprintf(message, sizeof(message), "Mapping entry %zu is not valid UTF-8.", i);
             ffkSetError(message);
             return nil;
         }
@@ -374,9 +398,7 @@ static NSDictionary *ffkParseDictionary(const char *json) {
         return nil;
     }
     NSData *data = [NSData dataWithBytes:json length:strlen(json)];
-    id object = [NSJSONSerialization JSONObjectWithData:data
-                                                options:kNilOptions
-                                                  error:nil];
+    id object = [NSJSONSerialization JSONObjectWithData:data options:kNilOptions error:nil];
     return [object isKindOfClass:[NSDictionary class]] ? object : nil;
 }
 
@@ -386,18 +408,12 @@ static char *ffkJson(id value) {
         return NULL;
     }
     NSError *error = nil;
-    NSData *data = [NSJSONSerialization
-        dataWithJSONObject:value
-                   options:NSJSONWritingFragmentsAllowed |
-                           NSJSONWritingSortedKeys |
-                           NSJSONWritingWithoutEscapingSlashes
-                     error:&error];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingFragmentsAllowed | NSJSONWritingSortedKeys | NSJSONWritingWithoutEscapingSlashes error:&error];
     if (data == nil) {
         ffkSetError([[error localizedDescription] UTF8String]);
         return NULL;
     }
-    return ffkCopyString([[NSString alloc] initWithData:data
-                                               encoding:NSUTF8StringEncoding]);
+    return ffkCopyString([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
 }
 
 /**
@@ -460,9 +476,7 @@ static char *ffkStringValue(id value) {
  * block that refers to it is released.
  */
 @interface FFKCookie : NSObject
-- (instancetype)initWithFunction:(void *)function
-                            data:(void *)data
-                            free:(ffk_free_cb)freeCallback;
+- (instancetype)initWithFunction:(void *)function data:(void *)data free:(ffk_free_cb)freeCallback;
 - (void *)function;
 - (void *)data;
 @end
@@ -473,9 +487,7 @@ static char *ffkStringValue(id value) {
     ffk_free_cb _free;
 }
 
-- (instancetype)initWithFunction:(void *)function
-                            data:(void *)data
-                            free:(ffk_free_cb)freeCallback {
+- (instancetype)initWithFunction:(void *)function data:(void *)data free:(ffk_free_cb)freeCallback {
     self = [super init];
     if (self != nil) {
         _function = function;
@@ -495,7 +507,7 @@ static char *ffkStringValue(id value) {
 
 - (void)dealloc {
     if (_free != NULL) {
-        _free(_data);
+        FFK_CONSUMER_CALL(_free(_data));
     }
 }
 
@@ -504,10 +516,7 @@ static char *ffkStringValue(id value) {
 static const char ffkCookieKey = 0;
 
 /** Lets the *_get_*_callback() functions find the cookie of a block again. */
-static void ffkAttach(id block, FFKCookie *cookie) {
-    objc_setAssociatedObject(block, &ffkCookieKey, cookie,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
+static void ffkAttach(id block, FFKCookie *cookie) { objc_setAssociatedObject(block, &ffkCookieKey, cookie, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
 
 static FFKCookie *ffkCookieOf(id block) {
     return block == nil ? nil : objc_getAssociatedObject(block, &ffkCookieKey);
@@ -517,81 +526,62 @@ static FFKCookie *ffkCookieOf(id block) {
  * With a NULL callback the cookie is dropped on the spot, which releases it:
  * the contract stays the same whether or not a callback was given.
  */
-static LogCallback ffkLogBlock(ffk_log_cb callback, void *data,
-                               ffk_free_cb freeData) {
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:data
-                                                       free:freeData];
+static LogCallback ffkLogBlock(ffk_log_cb callback, void *data, ffk_free_cb freeData) {
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:data free:freeData];
     if (callback == NULL) {
         return nil;
     }
     LogCallback block = [^(Log *log) {
-      callback((FFKLog *)(__bridge void *)log, [cookie data]);
+      FFK_CONSUMER_CALL(callback((FFKLog *)(__bridge void *)log, [cookie data]));
     } copy];
     ffkAttach(block, cookie);
     return block;
 }
 
-static StatisticsCallback ffkStatisticsBlock(ffk_statistics_cb callback,
-                                             void *data, ffk_free_cb freeData) {
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:data
-                                                       free:freeData];
+static StatisticsCallback ffkStatisticsBlock(ffk_statistics_cb callback, void *data, ffk_free_cb freeData) {
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:data free:freeData];
     if (callback == NULL) {
         return nil;
     }
     StatisticsCallback block = [^(Statistics *statistics) {
-      callback((FFKStatistics *)(__bridge void *)statistics, [cookie data]);
+      FFK_CONSUMER_CALL(callback((FFKStatistics *)(__bridge void *)statistics, [cookie data]));
     } copy];
     ffkAttach(block, cookie);
     return block;
 }
 
-static FFmpegSessionCompleteCallback
-ffkFFmpegCompleteBlock(ffk_session_cb callback, void *data,
-                       ffk_free_cb freeData) {
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:data
-                                                       free:freeData];
+static FFmpegSessionCompleteCallback ffkFFmpegCompleteBlock(ffk_session_cb callback, void *data, ffk_free_cb freeData) {
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:data free:freeData];
     if (callback == NULL) {
         return nil;
     }
     FFmpegSessionCompleteCallback block = [^(FFmpegSession *session) {
-      callback((FFKSession *)(__bridge void *)session, [cookie data]);
+      FFK_CONSUMER_CALL(callback((FFKSession *)(__bridge void *)session, [cookie data]));
     } copy];
     ffkAttach(block, cookie);
     return block;
 }
 
-static FFprobeSessionCompleteCallback
-ffkFFprobeCompleteBlock(ffk_session_cb callback, void *data,
-                        ffk_free_cb freeData) {
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:data
-                                                       free:freeData];
+static FFprobeSessionCompleteCallback ffkFFprobeCompleteBlock(ffk_session_cb callback, void *data, ffk_free_cb freeData) {
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:data free:freeData];
     if (callback == NULL) {
         return nil;
     }
     FFprobeSessionCompleteCallback block = [^(FFprobeSession *session) {
-      callback((FFKSession *)(__bridge void *)session, [cookie data]);
+      FFK_CONSUMER_CALL(callback((FFKSession *)(__bridge void *)session, [cookie data]));
     } copy];
     ffkAttach(block, cookie);
     return block;
 }
 
-static MediaInformationSessionCompleteCallback
-ffkMediaInformationCompleteBlock(ffk_session_cb callback, void *data,
-                                 ffk_free_cb freeData) {
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:data
-                                                       free:freeData];
+static MediaInformationSessionCompleteCallback ffkMediaInformationCompleteBlock(ffk_session_cb callback, void *data, ffk_free_cb freeData) {
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:data free:freeData];
     if (callback == NULL) {
         return nil;
     }
-    MediaInformationSessionCompleteCallback block =
-        [^(MediaInformationSession *session) {
-          callback((FFKSession *)(__bridge void *)session, [cookie data]);
-        } copy];
+    MediaInformationSessionCompleteCallback block = [^(MediaInformationSession *session) {
+      FFK_CONSUMER_CALL(callback((FFKSession *)(__bridge void *)session, [cookie data]));
+    } copy];
     ffkAttach(block, cookie);
     return block;
 }
@@ -611,8 +601,7 @@ static int ffkReadLog(id block, ffk_log_cb *callback, void **userData) {
     return 1;
 }
 
-static int ffkReadStatistics(id block, ffk_statistics_cb *callback,
-                             void **userData) {
+static int ffkReadStatistics(id block, ffk_statistics_cb *callback, void **userData) {
     FFKCookie *cookie = ffkCookieOf(block);
     if (cookie == nil) {
         return 0;
@@ -626,8 +615,7 @@ static int ffkReadStatistics(id block, ffk_statistics_cb *callback,
     return 1;
 }
 
-static int ffkReadSession(id block, ffk_session_cb *callback,
-                          void **userData) {
+static int ffkReadSession(id block, ffk_session_cb *callback, void **userData) {
     FFKCookie *cookie = ffkCookieOf(block);
     if (cookie == nil) {
         return 0;
@@ -651,8 +639,7 @@ static int ffkReadSession(id block, ffk_session_cb *callback,
  * so that a token can be resolved back to the object that has to be removed.
  */
 @interface FFKSessionDeleteListener : NSObject <SessionDeleteListener>
-- (instancetype)initWithCallback:(ffk_session_delete_cb)callback
-                          cookie:(FFKCookie *)cookie;
+- (instancetype)initWithCallback:(ffk_session_delete_cb)callback cookie:(FFKCookie *)cookie;
 @end
 
 @implementation FFKSessionDeleteListener {
@@ -660,8 +647,7 @@ static int ffkReadSession(id block, ffk_session_cb *callback,
     FFKCookie *_cookie;
 }
 
-- (instancetype)initWithCallback:(ffk_session_delete_cb)callback
-                          cookie:(FFKCookie *)cookie {
+- (instancetype)initWithCallback:(ffk_session_delete_cb)callback cookie:(FFKCookie *)cookie {
     self = [super init];
     if (self != nil) {
         _callback = callback;
@@ -671,7 +657,7 @@ static int ffkReadSession(id block, ffk_session_cb *callback,
 }
 
 - (void)sessionDeleted:(long)sessionId {
-    _callback(sessionId, [_cookie data]);
+    FFK_CONSUMER_CALL(_callback(sessionId, [_cookie data]));
 }
 
 @end
@@ -758,8 +744,7 @@ void ffk_string_list_free(FFKStringList *list) { ffkRelease(list); }
 FFK_DEFINE_HANDLE_LIST(ffk_session_list, FFKSessionList, FFKSession)
 FFK_DEFINE_HANDLE_LIST(ffk_log_list, FFKLogList, FFKLog)
 FFK_DEFINE_HANDLE_LIST(ffk_statistics_list, FFKStatisticsList, FFKStatistics)
-FFK_DEFINE_HANDLE_LIST(ffk_stream_information_list, FFKStreamInformationList,
-                       FFKStreamInformation)
+FFK_DEFINE_HANDLE_LIST(ffk_stream_information_list, FFKStreamInformationList, FFKStreamInformation)
 FFK_DEFINE_HANDLE_LIST(ffk_chapter_list, FFKChapterList, FFKChapter)
 
 /* ------------------------------------------------------------------------ */
@@ -800,20 +785,9 @@ char *ffk_log_get_message(const FFKLog *log) {
 /* Statistics                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFKStatistics *ffk_statistics_create(long session_id, int video_frame_number,
-                                     float video_fps, float video_quality,
-                                     int64_t size, double time, double bitrate,
-                                     double speed) {
+FFKStatistics *ffk_statistics_create(long session_id, int video_frame_number, float video_fps, float video_quality, int64_t size, double time, double bitrate, double speed) {
     FFK_BEGIN
-    return (FFKStatistics *)ffkRetain([[Statistics alloc]
-                          init:session_id
-              videoFrameNumber:video_frame_number
-                      videoFps:video_fps
-                  videoQuality:video_quality
-                          size:size
-                          time:time
-                       bitrate:bitrate
-                         speed:speed]);
+    return (FFKStatistics *)ffkRetain([[Statistics alloc] init:session_id videoFrameNumber:video_frame_number videoFps:video_fps videoQuality:video_quality size:size time:time bitrate:bitrate speed:speed]);
     FFK_END(NULL)
 }
 
@@ -827,8 +801,7 @@ long ffk_statistics_get_session_id(const FFKStatistics *statistics) {
 
 int ffk_statistics_get_video_frame_number(const FFKStatistics *statistics) {
     FFK_BEGIN
-    return statistics == NULL ? 0
-                              : [ffkStatistics(statistics) getVideoFrameNumber];
+    return statistics == NULL ? 0 : [ffkStatistics(statistics) getVideoFrameNumber];
     FFK_END(0)
 }
 
@@ -902,8 +875,7 @@ static BOOL ffkSessionState(int value, SessionState *state) {
 }
 
 /** A log redirection strategy, or NO and an error when the value is none. */
-static BOOL ffkLogRedirectionStrategy(int value,
-                                      LogRedirectionStrategy *strategy) {
+static BOOL ffkLogRedirectionStrategy(int value, LogRedirectionStrategy *strategy) {
     switch (value) {
     case LogRedirectionStrategyAlwaysPrintLogs:
     case LogRedirectionStrategyPrintLogsWhenNoCallbacksDefined:
@@ -948,10 +920,7 @@ static BOOL ffkStrategy(int value, LogRedirectionStrategy *strategy) {
     return ffkLogRedirectionStrategy(value, strategy);
 }
 
-FFKSession *ffk_abstract_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int log_redirection_strategy) {
+FFKSession *ffk_abstract_session_create(const char *const *arguments, size_t argument_count, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int log_redirection_strategy) {
     FFK_BEGIN
     // The callbacks come first: the library owns their cookies from here on
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
@@ -964,26 +933,16 @@ FFKSession *ffk_abstract_session_create(
     if (!ffkStrategy(log_redirection_strategy, &strategy)) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([[AbstractSession alloc]
-                          init:list
-               withLogCallback:log
-    withLogRedirectionStrategy:strategy]);
+    return (FFKSession *)ffkRetain([[AbstractSession alloc] init:list withLogCallback:log withLogRedirectionStrategy:strategy]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffmpeg_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
-    void *statistics_user_data, ffk_free_cb statistics_free,
-    int log_redirection_strategy) {
+FFKSession *ffk_ffmpeg_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
+                                      void *statistics_user_data, ffk_free_cb statistics_free, int log_redirection_strategy) {
     FFK_BEGIN
-    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
-    StatisticsCallback statistics = ffkStatisticsBlock(
-        statistics_callback, statistics_user_data, statistics_free);
+    StatisticsCallback statistics = ffkStatisticsBlock(statistics_callback, statistics_user_data, statistics_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
@@ -993,23 +952,13 @@ FFKSession *ffk_ffmpeg_session_create(
     if (!ffkStrategy(log_redirection_strategy, &strategy)) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFmpegSession
-                       create:list
-          withCompleteCallback:complete
-               withLogCallback:log
-        withStatisticsCallback:statistics
-    withLogRedirectionStrategy:strategy]);
+    return (FFKSession *)ffkRetain([FFmpegSession create:list withCompleteCallback:complete withLogCallback:log withStatisticsCallback:statistics withLogRedirectionStrategy:strategy]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobe_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, int log_redirection_strategy) {
+FFKSession *ffk_ffprobe_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int log_redirection_strategy) {
     FFK_BEGIN
-    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
@@ -1020,33 +969,20 @@ FFKSession *ffk_ffprobe_session_create(
     if (!ffkStrategy(log_redirection_strategy, &strategy)) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeSession
-                       create:list
-          withCompleteCallback:complete
-               withLogCallback:log
-    withLogRedirectionStrategy:strategy]);
+    return (FFKSession *)ffkRetain([FFprobeSession create:list withCompleteCallback:complete withLogCallback:log withLogRedirectionStrategy:strategy]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_media_information_session_create(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free) {
+FFKSession *ffk_media_information_session_create(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free) {
     FFK_BEGIN
-    MediaInformationSessionCompleteCallback complete =
-        ffkMediaInformationCompleteBlock(complete_callback, complete_user_data,
-                                         complete_free);
+    MediaInformationSessionCompleteCallback complete = ffkMediaInformationCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([MediaInformationSession
-                     create:list
-        withCompleteCallback:complete
-             withLogCallback:log]);
+    return (FFKSession *)ffkRetain([MediaInformationSession create:list withCompleteCallback:complete withLogCallback:log]);
     FFK_END(NULL)
 }
 
@@ -1090,9 +1026,7 @@ long ffk_session_get_duration(const FFKSession *session) {
 
 FFKStringList *ffk_session_get_arguments(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL
-               ? NULL
-               : (FFKStringList *)ffkRetainList([ffkSession(session) getArguments]);
+    return session == NULL ? NULL : (FFKStringList *)ffkRetainList([ffkSession(session) getArguments]);
     FFK_END(NULL)
 }
 
@@ -1102,52 +1036,39 @@ char *ffk_session_get_command(const FFKSession *session) {
     FFK_END(NULL)
 }
 
-FFKLogList *ffk_session_get_all_logs_with_timeout(const FFKSession *session,
-                                                  int wait_timeout) {
+FFKLogList *ffk_session_get_all_logs_with_timeout(const FFKSession *session, int wait_timeout) {
     FFK_BEGIN
-    return session == NULL ? NULL
-                           : (FFKLogList *)ffkRetainList([ffkSession(session)
-                                 getAllLogsWithTimeout:wait_timeout]);
+    return session == NULL ? NULL : (FFKLogList *)ffkRetainList([ffkSession(session) getAllLogsWithTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
 FFKLogList *ffk_session_get_all_logs(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL
-               ? NULL
-               : (FFKLogList *)ffkRetainList([ffkSession(session) getAllLogs]);
+    return session == NULL ? NULL : (FFKLogList *)ffkRetainList([ffkSession(session) getAllLogs]);
     FFK_END(NULL)
 }
 
 FFKLogList *ffk_session_get_logs(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL
-               ? NULL
-               : (FFKLogList *)ffkRetainList([ffkSession(session) getLogs]);
+    return session == NULL ? NULL : (FFKLogList *)ffkRetainList([ffkSession(session) getLogs]);
     FFK_END(NULL)
 }
 
-char *ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session,
-                                                      int wait_timeout) {
+char *ffk_session_get_all_logs_as_string_with_timeout(const FFKSession *session, int wait_timeout) {
     FFK_BEGIN
-    return session == NULL ? NULL
-                           : ffkCopyString([ffkSession(session)
-                                 getAllLogsAsStringWithTimeout:wait_timeout]);
+    return session == NULL ? NULL : ffkCopyString([ffkSession(session) getAllLogsAsStringWithTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
 char *ffk_session_get_all_logs_as_string(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL
-               ? NULL
-               : ffkCopyString([ffkSession(session) getAllLogsAsString]);
+    return session == NULL ? NULL : ffkCopyString([ffkSession(session) getAllLogsAsString]);
     FFK_END(NULL)
 }
 
 char *ffk_session_get_logs_as_string(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL ? NULL
-                           : ffkCopyString([ffkSession(session) getLogsAsString]);
+    return session == NULL ? NULL : ffkCopyString([ffkSession(session) getLogsAsString]);
     FFK_END(NULL)
 }
 
@@ -1181,42 +1102,34 @@ int ffk_session_get_return_code(const FFKSession *session, int *value) {
 
 char *ffk_session_get_fail_stack_trace(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL
-               ? NULL
-               : ffkCopyString([ffkSession(session) getFailStackTrace]);
+    return session == NULL ? NULL : ffkCopyString([ffkSession(session) getFailStackTrace]);
     FFK_END(NULL)
 }
 
 int ffk_session_get_log_redirection_strategy(const FFKSession *session) {
     FFK_BEGIN
-    return session == NULL ? 0
-                           : (int)[ffkSession(session) getLogRedirectionStrategy];
+    return session == NULL ? 0 : (int)[ffkSession(session) getLogRedirectionStrategy];
     FFK_END(0)
 }
 
-int ffk_session_there_are_asynchronous_messages_in_transmit(
-    const FFKSession *session) {
+int ffk_session_there_are_asynchronous_messages_in_transmit(const FFKSession *session) {
     FFK_BEGIN
-    return session != NULL &&
-           [ffkSession(session) thereAreAsynchronousMessagesInTransmit];
+    return session != NULL && [ffkSession(session) thereAreAsynchronousMessagesInTransmit];
     FFK_END(0)
 }
 
-void ffk_session_wait_for_asynchronous_messages_in_transmit(
-    const FFKSession *session, int timeout) {
+void ffk_session_wait_for_asynchronous_messages_in_transmit(const FFKSession *session, int timeout) {
     FFK_BEGIN
     AbstractSession *abstractSession = ffkAs(session, [AbstractSession class]);
     [abstractSession waitForAsynchronousMessagesInTransmit:timeout];
     FFK_END_VOID
 }
 
-void ffk_session_add_log(FFKSession *session, long log_session_id, int level,
-                         const char *message) {
+void ffk_session_add_log(FFKSession *session, long log_session_id, int level, const char *message) {
     FFK_BEGIN
     NSString *text = ffkText(message, "message");
     if (session != NULL && text != nil) {
-        [ffkSession(session)
-            addLog:[[Log alloc] init:log_session_id :level :text]];
+        [ffkSession(session) addLog:[[Log alloc] init:log_session_id:level:text]];
     }
     FFK_END_VOID
 }
@@ -1249,9 +1162,7 @@ void ffk_session_fail(FFKSession *session, const char *error) {
     // The stack trace comes from the exception, so it has to have been raised
     NSException *failure = nil;
     @try {
-        @throw [NSException exceptionWithName:@"FFmpegKitSessionFailure"
-                                       reason:text
-                                     userInfo:@{@"error" : text}];
+        @throw [NSException exceptionWithName:@"FFmpegKitSessionFailure" reason:text userInfo:@{@"error" : text}];
     } @catch (NSException *raised) {
         failure = raised;
     }
@@ -1285,8 +1196,7 @@ void ffk_session_cancel(FFKSession *session) {
     FFK_END_VOID
 }
 
-int ffk_session_get_log_callback(const FFKSession *session,
-                                 ffk_log_cb *callback, void **user_data) {
+int ffk_session_get_log_callback(const FFKSession *session, ffk_log_cb *callback, void **user_data) {
     FFK_BEGIN
     if (session == NULL) {
         return 0;
@@ -1295,24 +1205,19 @@ int ffk_session_get_log_callback(const FFKSession *session,
     FFK_END(0)
 }
 
-int ffk_session_get_complete_callback(const FFKSession *session,
-                                      ffk_session_cb *callback,
-                                      void **user_data) {
+int ffk_session_get_complete_callback(const FFKSession *session, ffk_session_cb *callback, void **user_data) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
     if (ffmpegSession != nil) {
-        return ffkReadSession([ffmpegSession getCompleteCallback], callback,
-                              user_data);
+        return ffkReadSession([ffmpegSession getCompleteCallback], callback, user_data);
     }
     FFprobeSession *ffprobeSession = ffkFFprobeSession(session);
     if (ffprobeSession != nil) {
-        return ffkReadSession([ffprobeSession getCompleteCallback], callback,
-                              user_data);
+        return ffkReadSession([ffprobeSession getCompleteCallback], callback, user_data);
     }
     MediaInformationSession *mediaSession = ffkMediaInformationSession(session);
     if (mediaSession != nil) {
-        return ffkReadSession([mediaSession getCompleteCallback], callback,
-                              user_data);
+        return ffkReadSession([mediaSession getCompleteCallback], callback, user_data);
     }
     return 0;
     FFK_END(0)
@@ -1320,50 +1225,35 @@ int ffk_session_get_complete_callback(const FFKSession *session,
 
 /* ---- FFmpeg session specific -------------------------------------------- */
 
-FFKStatisticsList *
-ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session,
-                                                   int wait_timeout) {
+FFKStatisticsList *ffk_ffmpeg_session_get_all_statistics_with_timeout(FFKSession *session, int wait_timeout) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
-    return ffmpegSession == nil
-               ? NULL
-               : (FFKStatisticsList *)ffkRetainList(
-                     [ffmpegSession getAllStatisticsWithTimeout:wait_timeout]);
+    return ffmpegSession == nil ? NULL : (FFKStatisticsList *)ffkRetainList([ffmpegSession getAllStatisticsWithTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
 FFKStatisticsList *ffk_ffmpeg_session_get_all_statistics(FFKSession *session) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
-    return ffmpegSession == nil
-               ? NULL
-               : (FFKStatisticsList *)ffkRetainList(
-                     [ffmpegSession getAllStatistics]);
+    return ffmpegSession == nil ? NULL : (FFKStatisticsList *)ffkRetainList([ffmpegSession getAllStatistics]);
     FFK_END(NULL)
 }
 
 FFKStatisticsList *ffk_ffmpeg_session_get_statistics(FFKSession *session) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
-    return ffmpegSession == nil
-               ? NULL
-               : (FFKStatisticsList *)ffkRetainList([ffmpegSession getStatistics]);
+    return ffmpegSession == nil ? NULL : (FFKStatisticsList *)ffkRetainList([ffmpegSession getStatistics]);
     FFK_END(NULL)
 }
 
-FFKStatistics *
-ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session) {
+FFKStatistics *ffk_ffmpeg_session_get_last_received_statistics(FFKSession *session) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
-    return ffmpegSession == nil
-               ? NULL
-               : (FFKStatistics *)ffkRetain(
-                     [ffmpegSession getLastReceivedStatistics]);
+    return ffmpegSession == nil ? NULL : (FFKStatistics *)ffkRetain([ffmpegSession getLastReceivedStatistics]);
     FFK_END(NULL)
 }
 
-void ffk_ffmpeg_session_add_statistics(FFKSession *session,
-                                       const FFKStatistics *statistics) {
+void ffk_ffmpeg_session_add_statistics(FFKSession *session, const FFKStatistics *statistics) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
     if (ffmpegSession != nil && statistics != NULL) {
@@ -1372,38 +1262,30 @@ void ffk_ffmpeg_session_add_statistics(FFKSession *session,
     FFK_END_VOID
 }
 
-int ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session,
-                                               ffk_statistics_cb *callback,
-                                               void **user_data) {
+int ffk_ffmpeg_session_get_statistics_callback(const FFKSession *session, ffk_statistics_cb *callback, void **user_data) {
     FFK_BEGIN
     FFmpegSession *ffmpegSession = ffkFFmpegSession(session);
     if (ffmpegSession == nil) {
         return 0;
     }
-    return ffkReadStatistics([ffmpegSession getStatisticsCallback], callback,
-                             user_data);
+    return ffkReadStatistics([ffmpegSession getStatisticsCallback], callback, user_data);
     FFK_END(0)
 }
 
 /* ---- media information session specific --------------------------------- */
 
-FFKMediaInformation *
-ffk_media_information_session_get_media_information(FFKSession *session) {
+FFKMediaInformation *ffk_media_information_session_get_media_information(FFKSession *session) {
     FFK_BEGIN
     MediaInformationSession *mediaSession = ffkMediaInformationSession(session);
-    return mediaSession == nil
-               ? NULL
-               : (FFKMediaInformation *)ffkRetain([mediaSession getMediaInformation]);
+    return mediaSession == nil ? NULL : (FFKMediaInformation *)ffkRetain([mediaSession getMediaInformation]);
     FFK_END(NULL)
 }
 
-void ffk_media_information_session_set_media_information(
-    FFKSession *session, FFKMediaInformation *media_information) {
+void ffk_media_information_session_set_media_information(FFKSession *session, FFKMediaInformation *media_information) {
     FFK_BEGIN
     MediaInformationSession *mediaSession = ffkMediaInformationSession(session);
     if (mediaSession != nil) {
-        [mediaSession
-            setMediaInformation:ffkAs(media_information, [MediaInformation class])];
+        [mediaSession setMediaInformation:ffkAs(media_information, [MediaInformation class])];
     }
     FFK_END_VOID
 }
@@ -1463,71 +1345,49 @@ void ffk_media_information_session_set_media_information(
 
 FFKChapter *ffk_chapter_create(const char *value_json) {
     FFK_BEGIN
-    return (FFKChapter *)ffkRetain(
-        [[Chapter alloc] init:ffkParseDictionary(value_json)]);
+    return (FFKChapter *)ffkRetain([[Chapter alloc] init:ffkParseDictionary(value_json)]);
     FFK_END(NULL)
 }
 
 FFKStreamInformation *ffk_stream_information_create(const char *value_json) {
     FFK_BEGIN
-    return (FFKStreamInformation *)ffkRetain(
-        [[StreamInformation alloc] init:ffkParseDictionary(value_json)]);
+    return (FFKStreamInformation *)ffkRetain([[StreamInformation alloc] init:ffkParseDictionary(value_json)]);
     FFK_END(NULL)
 }
 
-FFKMediaInformation *ffk_media_information_create(
-    const char *value_json, const char *const *stream_json,
-    size_t stream_count, const char *const *chapter_json,
-    size_t chapter_count) {
+FFKMediaInformation *ffk_media_information_create(const char *value_json, const char *const *stream_json, size_t stream_count, const char *const *chapter_json, size_t chapter_count) {
     FFK_BEGIN
     NSMutableArray *streams = [NSMutableArray arrayWithCapacity:stream_count];
     for (size_t i = 0; i < stream_count; i++) {
-        [streams addObject:[[StreamInformation alloc]
-                               init:ffkParseDictionary(
-                                        stream_json == NULL ? NULL
-                                                            : stream_json[i])]];
+        [streams addObject:[[StreamInformation alloc] init:ffkParseDictionary(stream_json == NULL ? NULL : stream_json[i])]];
     }
     NSMutableArray *chapters = [NSMutableArray arrayWithCapacity:chapter_count];
     for (size_t i = 0; i < chapter_count; i++) {
-        [chapters addObject:[[Chapter alloc]
-                                init:ffkParseDictionary(
-                                         chapter_json == NULL ? NULL
-                                                              : chapter_json[i])]];
+        [chapters addObject:[[Chapter alloc] init:ffkParseDictionary(chapter_json == NULL ? NULL : chapter_json[i])]];
     }
-    return (FFKMediaInformation *)ffkRetain([[MediaInformation alloc]
-                 init:ffkParseDictionary(value_json)
-          withStreams:streams
-         withChapters:chapters]);
+    return (FFKMediaInformation *)ffkRetain([[MediaInformation alloc] init:ffkParseDictionary(value_json) withStreams:streams withChapters:chapters]);
     FFK_END(NULL)
 }
 
 FFK_DEFINE_PROPERTY_ACCESSORS(ffk_chapter, FFKChapter, Chapter)
-FFK_DEFINE_PROPERTY_ACCESSORS(ffk_stream_information, FFKStreamInformation,
-                              StreamInformation)
-FFK_DEFINE_PROPERTY_ACCESSORS(ffk_media_information, FFKMediaInformation,
-                              MediaInformation)
+FFK_DEFINE_PROPERTY_ACCESSORS(ffk_stream_information, FFKStreamInformation, StreamInformation)
+FFK_DEFINE_PROPERTY_ACCESSORS(ffk_media_information, FFKMediaInformation, MediaInformation)
 
-FFKStreamInformationList *
-ffk_media_information_get_streams(FFKMediaInformation *media_information) {
+FFKStreamInformationList *ffk_media_information_get_streams(FFKMediaInformation *media_information) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
-    return object == nil
-               ? NULL
-               : (FFKStreamInformationList *)ffkRetainList([object getStreams]);
+    return object == nil ? NULL : (FFKStreamInformationList *)ffkRetainList([object getStreams]);
     FFK_END(NULL)
 }
 
-FFKChapterList *
-ffk_media_information_get_chapters(FFKMediaInformation *media_information) {
+FFKChapterList *ffk_media_information_get_chapters(FFKMediaInformation *media_information) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
-    return object == nil ? NULL
-                         : (FFKChapterList *)ffkRetainList([object getChapters]);
+    return object == nil ? NULL : (FFKChapterList *)ffkRetainList([object getChapters]);
     FFK_END(NULL)
 }
 
-int ffk_media_information_get_number_format_property(
-    FFKMediaInformation *media_information, const char *key, int64_t *value) {
+int ffk_media_information_get_number_format_property(FFKMediaInformation *media_information, const char *key, int64_t *value) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
     NSString *name = ffkKey(key);
@@ -1538,8 +1398,7 @@ int ffk_media_information_get_number_format_property(
     FFK_END(0)
 }
 
-char *ffk_media_information_get_string_format_property(
-    FFKMediaInformation *media_information, const char *key) {
+char *ffk_media_information_get_string_format_property(FFKMediaInformation *media_information, const char *key) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
     NSString *name = ffkKey(key);
@@ -1550,8 +1409,7 @@ char *ffk_media_information_get_string_format_property(
     FFK_END(NULL)
 }
 
-char *ffk_media_information_get_format_property_json(
-    FFKMediaInformation *media_information, const char *key) {
+char *ffk_media_information_get_format_property_json(FFKMediaInformation *media_information, const char *key) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
     NSString *name = ffkKey(key);
@@ -1562,16 +1420,14 @@ char *ffk_media_information_get_format_property_json(
     FFK_END(NULL)
 }
 
-char *ffk_media_information_get_format_properties_json(
-    FFKMediaInformation *media_information) {
+char *ffk_media_information_get_format_properties_json(FFKMediaInformation *media_information) {
     FFK_BEGIN
     MediaInformation *object = ffkAs(media_information, [MediaInformation class]);
     return object == nil ? NULL : ffkJson([object getFormatProperties]);
     FFK_END(NULL)
 }
 
-FFKMediaInformation *
-ffk_media_information_parser_from(const char *ffprobe_json_output) {
+FFKMediaInformation *ffk_media_information_parser_from(const char *ffprobe_json_output) {
     FFK_BEGIN
     NSString *text = ffkQuietText(ffprobe_json_output);
     if (text == nil) {
@@ -1581,33 +1437,28 @@ ffk_media_information_parser_from(const char *ffprobe_json_output) {
     // stack. This one is silent and leaves the error slot alone, so a failure is
     // nothing but a NULL result.
     @try {
-        return (FFKMediaInformation *)ffkRetain(
-            [MediaInformationJsonParser fromWithError:text]);
+        return (FFKMediaInformation *)ffkRetain([MediaInformationJsonParser fromWithError:text]);
     } @catch (NSException *failure) {
         return NULL;
     }
     FFK_END(NULL)
 }
 
-FFKMediaInformation *
-ffk_media_information_parser_from_with_error(const char *ffprobe_json_output) {
+FFKMediaInformation *ffk_media_information_parser_from_with_error(const char *ffprobe_json_output) {
     FFK_BEGIN
     NSString *text = ffkQuietText(ffprobe_json_output);
     NSString *problem = @"the text is not valid UTF-8";
     if (text != nil) {
         @try {
-            return (FFKMediaInformation *)ffkRetain(
-                [MediaInformationJsonParser fromWithError:text]);
+            return (FFKMediaInformation *)ffkRetain([MediaInformationJsonParser fromWithError:text]);
         } @catch (NSException *failure) {
             // The exception's reason is only the JSON reader's error code: the
             // reader's own description is in its user info
-            NSString *detail =
-                [[failure userInfo] objectForKey:NSDebugDescriptionErrorKey];
+            NSString *detail = [[failure userInfo] objectForKey:NSDebugDescriptionErrorKey];
             problem = detail != nil ? detail : [failure reason];
         }
     }
-    NSString *message = [NSString
-        stringWithFormat:@"Media information could not be parsed: %@", problem];
+    NSString *message = [NSString stringWithFormat:@"Media information could not be parsed: %@", problem];
     ffkSetError([message UTF8String]);
     return NULL;
     FFK_END(NULL)
@@ -1617,9 +1468,7 @@ ffk_media_information_parser_from_with_error(const char *ffprobe_json_output) {
 /* FFmpegKit                                                                 */
 /* ------------------------------------------------------------------------ */
 
-FFKSession *
-ffk_ffmpegkit_execute_with_arguments(const char *const *arguments,
-                                     size_t argument_count) {
+FFKSession *ffk_ffmpegkit_execute_with_arguments(const char *const *arguments, size_t argument_count) {
     FFK_BEGIN
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
@@ -1629,28 +1478,19 @@ ffk_ffmpegkit_execute_with_arguments(const char *const *arguments,
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffmpegkit_execute_with_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, ffk_statistics_cb statistics_callback,
-    void *statistics_user_data, ffk_free_cb statistics_free) {
+FFKSession *ffk_ffmpegkit_execute_with_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
+                                                       ffk_statistics_cb statistics_callback, void *statistics_user_data, ffk_free_cb statistics_free) {
     FFK_BEGIN
     // The callbacks come first: the library owns their cookies from here on
-    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
-    StatisticsCallback statistics = ffkStatisticsBlock(
-        statistics_callback, statistics_user_data, statistics_free);
+    StatisticsCallback statistics = ffkStatisticsBlock(statistics_callback, statistics_user_data, statistics_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFmpegKit executeWithArgumentsAsync:list
-                                                   withCompleteCallback:complete
-                                                        withLogCallback:log
-                                                 withStatisticsCallback:statistics]);
+    return (FFKSession *)ffkRetain([FFmpegKit executeWithArgumentsAsync:list withCompleteCallback:complete withLogCallback:log withStatisticsCallback:statistics]);
     FFK_END(NULL)
 }
 
@@ -1664,27 +1504,18 @@ FFKSession *ffk_ffmpegkit_execute(const char *command) {
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffmpegkit_execute_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    ffk_statistics_cb statistics_callback, void *statistics_user_data,
-    ffk_free_cb statistics_free) {
+FFKSession *ffk_ffmpegkit_execute_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, ffk_statistics_cb statistics_callback, void *statistics_user_data,
+                                        ffk_free_cb statistics_free) {
     FFK_BEGIN
-    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFmpegSessionCompleteCallback complete = ffkFFmpegCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
-    StatisticsCallback statistics = ffkStatisticsBlock(
-        statistics_callback, statistics_user_data, statistics_free);
+    StatisticsCallback statistics = ffkStatisticsBlock(statistics_callback, statistics_user_data, statistics_free);
 
     NSString *text = ffkText(command, "command");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFmpegKit executeAsync:text
-                                      withCompleteCallback:complete
-                                           withLogCallback:log
-                                    withStatisticsCallback:statistics]);
+    return (FFKSession *)ffkRetain([FFmpegKit executeAsync:text withCompleteCallback:complete withLogCallback:log withStatisticsCallback:statistics]);
     FFK_END(NULL)
 }
 
@@ -1710,9 +1541,7 @@ FFKSessionList *ffk_ffmpegkit_list_sessions(void) {
 /* FFprobeKit                                                                */
 /* ------------------------------------------------------------------------ */
 
-FFKSession *
-ffk_ffprobekit_execute_with_arguments(const char *const *arguments,
-                                      size_t argument_count) {
+FFKSession *ffk_ffprobekit_execute_with_arguments(const char *const *arguments, size_t argument_count) {
     FFK_BEGIN
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
@@ -1722,23 +1551,16 @@ ffk_ffprobekit_execute_with_arguments(const char *const *arguments,
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_execute_with_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free) {
+FFKSession *ffk_ffprobekit_execute_with_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free) {
     FFK_BEGIN
-    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit executeWithArgumentsAsync:list
-                                                    withCompleteCallback:complete
-                                                         withLogCallback:log]);
+    return (FFKSession *)ffkRetain([FFprobeKit executeWithArgumentsAsync:list withCompleteCallback:complete withLogCallback:log]);
     FFK_END(NULL)
 }
 
@@ -1752,133 +1574,86 @@ FFKSession *ffk_ffprobekit_execute(const char *command) {
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_execute_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free) {
+FFKSession *ffk_ffprobekit_execute_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free) {
     FFK_BEGIN
-    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(
-        complete_callback, complete_user_data, complete_free);
+    FFprobeSessionCompleteCallback complete = ffkFFprobeCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSString *text = ffkText(command, "command");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit executeAsync:text
-                                       withCompleteCallback:complete
-                                            withLogCallback:log]);
+    return (FFKSession *)ffkRetain([FFprobeKit executeAsync:text withCompleteCallback:complete withLogCallback:log]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_get_media_information(const char *path,
-                                                 int wait_timeout) {
+FFKSession *ffk_ffprobekit_get_media_information(const char *path, int wait_timeout) {
     FFK_BEGIN
     NSString *text = ffkText(path, "path");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain(
-        [FFprobeKit getMediaInformation:text withTimeout:wait_timeout]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformation:text withTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_async(
-    const char *path, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int wait_timeout) {
+FFKSession *ffk_ffprobekit_get_media_information_async(const char *path, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int wait_timeout) {
     FFK_BEGIN
-    MediaInformationSessionCompleteCallback complete =
-        ffkMediaInformationCompleteBlock(complete_callback, complete_user_data,
-                                         complete_free);
+    MediaInformationSessionCompleteCallback complete = ffkMediaInformationCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSString *text = ffkText(path, "path");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationAsync:text
-                                                   withCompleteCallback:complete
-                                                        withLogCallback:log
-                                                            withTimeout:wait_timeout]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationAsync:text withCompleteCallback:complete withLogCallback:log withTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
-FFKSession *
-ffk_ffprobekit_get_media_information_from_command(const char *command) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command(const char *command) {
     FFK_BEGIN
     NSString *text = ffkText(command, "command");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain(
-        [FFprobeKit getMediaInformationFromCommand:text]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationFromCommand:text]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_async(
-    const char *command, ffk_session_cb complete_callback,
-    void *complete_user_data, ffk_free_cb complete_free,
-    ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
-    int wait_timeout) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command_async(const char *command, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free, int wait_timeout) {
     FFK_BEGIN
-    MediaInformationSessionCompleteCallback complete =
-        ffkMediaInformationCompleteBlock(complete_callback, complete_user_data,
-                                         complete_free);
+    MediaInformationSessionCompleteCallback complete = ffkMediaInformationCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSString *text = ffkText(command, "command");
     if (text == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit
-        getMediaInformationFromCommandAsync:text
-                       withCompleteCallback:complete
-                            withLogCallback:log
-                            onDispatchQueue:dispatch_get_global_queue(
-                                                DISPATCH_QUEUE_PRIORITY_DEFAULT,
-                                                0)
-                                withTimeout:wait_timeout]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationFromCommandAsync:text withCompleteCallback:complete withLogCallback:log onDispatchQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0) withTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(
-    const char *const *arguments, size_t argument_count, int wait_timeout) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments(const char *const *arguments, size_t argument_count, int wait_timeout) {
     FFK_BEGIN
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit
-        getMediaInformationFromCommandArguments:list
-                                    withTimeout:wait_timeout]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationFromCommandArguments:list withTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
-FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments_async(
-    const char *const *arguments, size_t argument_count,
-    ffk_session_cb complete_callback, void *complete_user_data,
-    ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data,
-    ffk_free_cb log_free, int wait_timeout) {
+FFKSession *ffk_ffprobekit_get_media_information_from_command_arguments_async(const char *const *arguments, size_t argument_count, ffk_session_cb complete_callback, void *complete_user_data, ffk_free_cb complete_free, ffk_log_cb log_callback, void *log_user_data, ffk_free_cb log_free,
+                                                                              int wait_timeout) {
     FFK_BEGIN
-    MediaInformationSessionCompleteCallback complete =
-        ffkMediaInformationCompleteBlock(complete_callback, complete_user_data,
-                                         complete_free);
+    MediaInformationSessionCompleteCallback complete = ffkMediaInformationCompleteBlock(complete_callback, complete_user_data, complete_free);
     LogCallback log = ffkLogBlock(log_callback, log_user_data, log_free);
 
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {
         return NULL;
     }
-    return (FFKSession *)ffkRetain([FFprobeKit
-        getMediaInformationFromCommandArgumentsAsync:list
-                                withCompleteCallback:complete
-                                     withLogCallback:log
-                                     onDispatchQueue:
-                                         dispatch_get_global_queue(
-                                             DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)
-                                         withTimeout:wait_timeout]);
+    return (FFKSession *)ffkRetain([FFprobeKit getMediaInformationFromCommandArgumentsAsync:list withCompleteCallback:complete withLogCallback:log onDispatchQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0) withTimeout:wait_timeout]);
     FFK_END(NULL)
 }
 
@@ -1890,8 +1665,7 @@ FFKSessionList *ffk_ffprobekit_list_ffprobe_sessions(void) {
 
 FFKSessionList *ffk_ffprobekit_list_media_information_sessions(void) {
     FFK_BEGIN
-    return (FFKSessionList *)ffkRetainList(
-        [FFprobeKit listMediaInformationSessions]);
+    return (FFKSessionList *)ffkRetainList([FFprobeKit listMediaInformationSessions]);
     FFK_END(NULL)
 }
 
@@ -1911,6 +1685,18 @@ void ffk_config_disable_redirection(void) {
     FFK_END_VOID
 }
 
+int ffk_config_shutdown(int timeout_ms) {
+    FFK_BEGIN
+    return [FFmpegKitConfig shutdownWithTimeout:timeout_ms] ? 1 : 0;
+    FFK_END(0)
+}
+
+int ffk_config_is_shutdown(void) {
+    FFK_BEGIN
+    return [FFmpegKitConfig isShutdown] ? 1 : 0;
+    FFK_END(0)
+}
+
 int ffk_config_set_fontconfig_configuration_path(const char *path) {
     FFK_BEGIN
     NSString *text = ffkText(path, "path");
@@ -1921,17 +1707,13 @@ int ffk_config_set_fontconfig_configuration_path(const char *path) {
     FFK_END(-1)
 }
 
-void ffk_config_set_font_directory(const char *font_directory_path,
-                                   const char *const *mapping_keys,
-                                   const char *const *mapping_values,
-                                   size_t mapping_count) {
+void ffk_config_set_font_directory(const char *font_directory_path, const char *const *mapping_keys, const char *const *mapping_values, size_t mapping_count) {
     FFK_BEGIN
     NSString *path = ffkText(font_directory_path, "font directory path");
     if (path == nil) {
         return;
     }
-    NSDictionary *mapping =
-        ffkStringMap(mapping_keys, mapping_values, mapping_count);
+    NSDictionary *mapping = ffkStringMap(mapping_keys, mapping_values, mapping_count);
     if (mapping == nil) {
         return;
     }
@@ -1939,18 +1721,13 @@ void ffk_config_set_font_directory(const char *font_directory_path,
     FFK_END_VOID
 }
 
-void ffk_config_set_font_directory_list(
-    const char *const *font_directories, size_t font_directory_count,
-    const char *const *mapping_keys, const char *const *mapping_values,
-    size_t mapping_count) {
+void ffk_config_set_font_directory_list(const char *const *font_directories, size_t font_directory_count, const char *const *mapping_keys, const char *const *mapping_values, size_t mapping_count) {
     FFK_BEGIN
-    NSArray *directories =
-        ffkStrings(font_directories, font_directory_count, "Font directory");
+    NSArray *directories = ffkStrings(font_directories, font_directory_count, "Font directory");
     if (directories == nil) {
         return;
     }
-    NSDictionary *mapping =
-        ffkStringMap(mapping_keys, mapping_values, mapping_count);
+    NSDictionary *mapping = ffkStringMap(mapping_keys, mapping_values, mapping_count);
     if (mapping == nil) {
         return;
     }
@@ -1974,19 +1751,15 @@ void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path) {
     FFK_END_VOID
 }
 
-long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data,
-                                                size_t size) {
+long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data, size_t size) {
     FFK_BEGIN
-    return [FFmpegKitConfig registerFFmpegKitInputBufferWithBytes:data
-                                                           length:size];
+    return [FFmpegKitConfig registerFFmpegKitInputBufferWithBytes:data length:size];
     FFK_END(0)
 }
 
-long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity,
-                                                 long max_capacity) {
+long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity, long max_capacity) {
     FFK_BEGIN
-    return [FFmpegKitConfig registerFFmpegKitOutputBuffer:initial_capacity
-                                              maxCapacity:max_capacity];
+    return [FFmpegKitConfig registerFFmpegKitOutputBuffer:initial_capacity maxCapacity:max_capacity];
     FFK_END(0)
 }
 
@@ -1996,8 +1769,7 @@ long ffk_config_get_ffmpegkit_buffer_size(long buffer_id) {
     FFK_END(-1)
 }
 
-int ffk_config_get_ffmpegkit_output_buffer(long buffer_id, uint8_t **data,
-                                           size_t *size) {
+int ffk_config_get_ffmpegkit_output_buffer(long buffer_id, uint8_t **data, size_t *size) {
     FFK_BEGIN
     NSData *output = [FFmpegKitConfig getFFmpegKitOutputBuffer:buffer_id];
     if (output == nil) {
@@ -2032,32 +1804,17 @@ long ffk_config_register_ffmpegkit_stream(long capacity, int type) {
     FFK_END(0)
 }
 
-int ffk_config_write_ffmpegkit_stream(long stream_id, const uint8_t *data,
-                                      size_t length, int timeout_ms) {
+int ffk_config_write_ffmpegkit_stream(long stream_id, const uint8_t *data, size_t length, int timeout_ms) {
     FFK_BEGIN
     // No copy: the write completes before this call returns
-    NSData *bytes = data == NULL && length == 0
-                        ? [NSData data]
-                        : (data == NULL
-                               ? nil
-                               : [NSData dataWithBytesNoCopy:(void *)data
-                                                      length:length
-                                                freeWhenDone:NO]);
-    return [FFmpegKitConfig writeFFmpegKitStream:stream_id
-                                            data:bytes
-                                          offset:0
-                                          length:length
-                                         timeout:timeout_ms];
+    NSData *bytes = data == NULL && length == 0 ? [NSData data] : (data == NULL ? nil : [NSData dataWithBytesNoCopy:(void *)data length:length freeWhenDone:NO]);
+    return [FFmpegKitConfig writeFFmpegKitStream:stream_id data:bytes offset:0 length:length timeout:timeout_ms];
     FFK_END(-1)
 }
 
-int ffk_config_read_ffmpegkit_stream(long stream_id, int max_bytes,
-                                     int timeout_ms, uint8_t **data,
-                                     size_t *size) {
+int ffk_config_read_ffmpegkit_stream(long stream_id, int max_bytes, int timeout_ms, uint8_t **data, size_t *size) {
     FFK_BEGIN
-    NSData *chunk = [FFmpegKitConfig readFFmpegKitStream:stream_id
-                                                maxBytes:max_bytes
-                                                 timeout:timeout_ms];
+    NSData *chunk = [FFmpegKitConfig readFFmpegKitStream:stream_id maxBytes:max_bytes timeout:timeout_ms];
     if (chunk == nil) {
         return 0;
     }
@@ -2090,8 +1847,7 @@ void ffk_config_unregister_ffmpegkit_stream(long stream_id) {
     FFK_END_VOID
 }
 
-char *ffk_protocol_build_url(const char *protocol, long id,
-                             const char *extension) {
+char *ffk_protocol_build_url(const char *protocol, long id, const char *extension) {
     FFK_BEGIN
     NSString *name = ffkText(protocol, "protocol");
     if (name == nil) {
@@ -2102,9 +1858,7 @@ char *ffk_protocol_build_url(const char *protocol, long id,
     if (extension != NULL && suffix == nil) {
         return NULL;
     }
-    return ffkCopyString([FFmpegKitInputBuffer urlWithProtocol:name
-                                                    resourceId:id
-                                                     extension:suffix]);
+    return ffkCopyString([FFmpegKitInputBuffer urlWithProtocol:name resourceId:id extension:suffix]);
     FFK_END(NULL)
 }
 
@@ -2132,8 +1886,7 @@ char *ffk_config_get_build_date(void) {
     FFK_END(NULL)
 }
 
-int ffk_config_set_environment_variable(const char *variable_name,
-                                        const char *variable_value) {
+int ffk_config_set_environment_variable(const char *variable_name, const char *variable_value) {
     FFK_BEGIN
     NSString *name = ffkText(variable_name, "variable name");
     NSString *value = name == nil ? nil : ffkText(variable_value, "variable value");
@@ -2172,13 +1925,11 @@ void ffk_config_ffprobe_execute(FFKSession *session) {
     FFK_END_VOID
 }
 
-void ffk_config_get_media_information_execute(FFKSession *session,
-                                              int wait_timeout) {
+void ffk_config_get_media_information_execute(FFKSession *session, int wait_timeout) {
     FFK_BEGIN
     MediaInformationSession *mediaSession = ffkMediaInformationSession(session);
     if (mediaSession != nil) {
-        [FFmpegKitConfig getMediaInformationExecute:mediaSession
-                                        withTimeout:wait_timeout];
+        [FFmpegKitConfig getMediaInformationExecute:mediaSession withTimeout:wait_timeout];
     }
     FFK_END_VOID
 }
@@ -2201,85 +1952,60 @@ void ffk_config_async_ffprobe_execute(FFKSession *session) {
     FFK_END_VOID
 }
 
-void ffk_config_async_get_media_information_execute(FFKSession *session,
-                                                    int wait_timeout) {
+void ffk_config_async_get_media_information_execute(FFKSession *session, int wait_timeout) {
     FFK_BEGIN
     MediaInformationSession *mediaSession = ffkMediaInformationSession(session);
     if (mediaSession != nil) {
-        [FFmpegKitConfig asyncGetMediaInformationExecute:mediaSession
-                                             withTimeout:wait_timeout];
+        [FFmpegKitConfig asyncGetMediaInformationExecute:mediaSession withTimeout:wait_timeout];
     }
     FFK_END_VOID
 }
 
-void ffk_config_enable_log_callback(ffk_log_cb callback, void *user_data,
-                                    ffk_free_cb free_user_data) {
+void ffk_config_enable_log_callback(ffk_log_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    [FFmpegKitConfig
-        enableLogCallback:ffkLogBlock(callback, user_data, free_user_data)];
+    [FFmpegKitConfig enableLogCallback:ffkLogBlock(callback, user_data, free_user_data)];
     FFK_END_VOID
 }
 
-void ffk_config_enable_statistics_callback(ffk_statistics_cb callback,
-                                           void *user_data,
-                                           ffk_free_cb free_user_data) {
+void ffk_config_enable_statistics_callback(ffk_statistics_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    [FFmpegKitConfig enableStatisticsCallback:ffkStatisticsBlock(
-                                                  callback, user_data,
-                                                  free_user_data)];
+    [FFmpegKitConfig enableStatisticsCallback:ffkStatisticsBlock(callback, user_data, free_user_data)];
     FFK_END_VOID
 }
 
-void ffk_config_enable_ffmpeg_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
+void ffk_config_enable_ffmpeg_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    [FFmpegKitConfig enableFFmpegSessionCompleteCallback:ffkFFmpegCompleteBlock(
-                                                            callback, user_data,
-                                                            free_user_data)];
+    [FFmpegKitConfig enableFFmpegSessionCompleteCallback:ffkFFmpegCompleteBlock(callback, user_data, free_user_data)];
     FFK_END_VOID
 }
 
-int ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback,
-                                                    void **user_data) {
+int ffk_config_get_ffmpeg_session_complete_callback(ffk_session_cb *callback, void **user_data) {
     FFK_BEGIN
-    return ffkReadSession([FFmpegKitConfig getFFmpegSessionCompleteCallback],
-                          callback, user_data);
+    return ffkReadSession([FFmpegKitConfig getFFmpegSessionCompleteCallback], callback, user_data);
     FFK_END(0)
 }
 
-void ffk_config_enable_ffprobe_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
+void ffk_config_enable_ffprobe_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    [FFmpegKitConfig enableFFprobeSessionCompleteCallback:ffkFFprobeCompleteBlock(
-                                                             callback, user_data,
-                                                             free_user_data)];
+    [FFmpegKitConfig enableFFprobeSessionCompleteCallback:ffkFFprobeCompleteBlock(callback, user_data, free_user_data)];
     FFK_END_VOID
 }
 
-int ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback,
-                                                     void **user_data) {
+int ffk_config_get_ffprobe_session_complete_callback(ffk_session_cb *callback, void **user_data) {
     FFK_BEGIN
-    return ffkReadSession([FFmpegKitConfig getFFprobeSessionCompleteCallback],
-                          callback, user_data);
+    return ffkReadSession([FFmpegKitConfig getFFprobeSessionCompleteCallback], callback, user_data);
     FFK_END(0)
 }
 
-void ffk_config_enable_media_information_session_complete_callback(
-    ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
+void ffk_config_enable_media_information_session_complete_callback(ffk_session_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    [FFmpegKitConfig
-        enableMediaInformationSessionCompleteCallback:
-            ffkMediaInformationCompleteBlock(callback, user_data,
-                                             free_user_data)];
+    [FFmpegKitConfig enableMediaInformationSessionCompleteCallback:ffkMediaInformationCompleteBlock(callback, user_data, free_user_data)];
     FFK_END_VOID
 }
 
-int ffk_config_get_media_information_session_complete_callback(
-    ffk_session_cb *callback, void **user_data) {
+int ffk_config_get_media_information_session_complete_callback(ffk_session_cb *callback, void **user_data) {
     FFK_BEGIN
-    return ffkReadSession(
-        [FFmpegKitConfig getMediaInformationSessionCompleteCallback], callback,
-        user_data);
+    return ffkReadSession([FFmpegKitConfig getMediaInformationSessionCompleteCallback], callback, user_data);
     FFK_END(0)
 }
 
@@ -2325,19 +2051,13 @@ void ffk_config_delete_session(long session_id) {
     FFK_END_VOID
 }
 
-long ffk_config_add_session_delete_listener(ffk_session_delete_cb callback,
-                                            void *user_data,
-                                            ffk_free_cb free_user_data) {
+long ffk_config_add_session_delete_listener(ffk_session_delete_cb callback, void *user_data, ffk_free_cb free_user_data) {
     FFK_BEGIN
-    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback
-                                                       data:user_data
-                                                       free:free_user_data];
+    FFKCookie *cookie = [[FFKCookie alloc] initWithFunction:(void *)callback data:user_data free:free_user_data];
     if (callback == NULL) {
         return 0;
     }
-    FFKSessionDeleteListener *listener =
-        [[FFKSessionDeleteListener alloc] initWithCallback:callback
-                                                    cookie:cookie];
+    FFKSessionDeleteListener *listener = [[FFKSessionDeleteListener alloc] initWithCallback:callback cookie:cookie];
     [FFmpegKitConfig addSessionDeleteListener:listener];
 
     [ffkListenerLock() lock];
@@ -2400,8 +2120,7 @@ FFKSessionList *ffk_config_get_ffprobe_sessions(void) {
 
 FFKSessionList *ffk_config_get_media_information_sessions(void) {
     FFK_BEGIN
-    return (FFKSessionList *)ffkRetainList(
-        [FFmpegKitConfig getMediaInformationSessions]);
+    return (FFKSessionList *)ffkRetainList([FFmpegKitConfig getMediaInformationSessions]);
     FFK_END(NULL)
 }
 
@@ -2411,8 +2130,7 @@ FFKSessionList *ffk_config_get_sessions_by_state(int state) {
     if (!ffkSessionState(state, &value)) {
         return NULL;
     }
-    return (FFKSessionList *)ffkRetainList(
-        [FFmpegKitConfig getSessionsByState:value]);
+    return (FFKSessionList *)ffkRetainList([FFmpegKitConfig getSessionsByState:value]);
     FFK_END(NULL)
 }
 
@@ -2458,8 +2176,7 @@ FFKStringList *ffk_config_parse_arguments(const char *command) {
     FFK_END(NULL)
 }
 
-char *ffk_config_arguments_to_string(const char *const *arguments,
-                                     size_t argument_count) {
+char *ffk_config_arguments_to_string(const char *const *arguments, size_t argument_count) {
     FFK_BEGIN
     NSArray *list = ffkArguments(arguments, argument_count);
     if (list == nil) {

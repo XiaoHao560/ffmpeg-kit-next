@@ -22,39 +22,25 @@
 NSString *const MediaInformationJsonParserKeyStreams = @"streams";
 NSString *const MediaInformationJsonParserKeyChapters = @"chapters";
 
-static MediaInformation *parseMediaInformation(
-        NSString *ffprobeJsonOutput,
-        NSException *__autoreleasing *failure) {
+static MediaInformation *parseMediaInformation(NSString *ffprobeJsonOutput, NSException *__autoreleasing *failure) {
 
-    NSData *jsonData =
-        [ffprobeJsonOutput dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *jsonData = [ffprobeJsonOutput dataUsingEncoding:NSUTF8StringEncoding];
     if (jsonData == nil) {
-        *failure = [NSException exceptionWithName:@"ParsingException"
-                                           reason:@"The text is not valid UTF-8."
-                                         userInfo:nil];
+        *failure = [NSException exceptionWithName:@"ParsingException" reason:@"The text is not valid UTF-8." userInfo:nil];
         return nil;
     }
 
     NSError *error = nil;
-    id json = [NSJSONSerialization JSONObjectWithData:jsonData
-                                              options:kNilOptions
-                                                error:&error];
+    id json = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:&error];
     if (error != nil) {
-        *failure = [NSException
-            exceptionWithName:@"ParsingException"
-                       reason:[NSString
-                                  stringWithFormat:@"%ld", (long)[error code]]
-                     userInfo:[error userInfo]];
+        *failure = [NSException exceptionWithName:@"ParsingException" reason:[NSString stringWithFormat:@"%ld", (long)[error code]] userInfo:[error userInfo]];
         return nil;
     }
     if (json == nil) {
         return nil;
     }
     if (![json isKindOfClass:[NSDictionary class]]) {
-        *failure = [NSException
-            exceptionWithName:@"ParsingException"
-                       reason:@"The top-level JSON value is not an object."
-                     userInfo:nil];
+        *failure = [NSException exceptionWithName:@"ParsingException" reason:@"The top-level JSON value is not an object." userInfo:nil];
         return nil;
     }
     NSDictionary *jsonDictionary = json;
@@ -65,31 +51,24 @@ static MediaInformation *parseMediaInformation(
      * value does not understand, which would raise.
      */
     NSMutableArray *streamArray = [[NSMutableArray alloc] init];
-    id jsonStreamArray =
-        [jsonDictionary objectForKey:MediaInformationJsonParserKeyStreams];
+    id jsonStreamArray = [jsonDictionary objectForKey:MediaInformationJsonParserKeyStreams];
     if ([jsonStreamArray isKindOfClass:[NSArray class]]) {
         for (id element in jsonStreamArray) {
-            NSDictionary *streamDictionary =
-                [element isKindOfClass:[NSDictionary class]] ? element : nil;
-            [streamArray
-                addObject:[[StreamInformation alloc] init:streamDictionary]];
+            NSDictionary *streamDictionary = [element isKindOfClass:[NSDictionary class]] ? element : nil;
+            [streamArray addObject:[[StreamInformation alloc] init:streamDictionary]];
         }
     }
 
     NSMutableArray *chapterArray = [[NSMutableArray alloc] init];
-    id jsonChapterArray =
-        [jsonDictionary objectForKey:MediaInformationJsonParserKeyChapters];
+    id jsonChapterArray = [jsonDictionary objectForKey:MediaInformationJsonParserKeyChapters];
     if ([jsonChapterArray isKindOfClass:[NSArray class]]) {
         for (id element in jsonChapterArray) {
-            NSDictionary *chapterDictionary =
-                [element isKindOfClass:[NSDictionary class]] ? element : nil;
+            NSDictionary *chapterDictionary = [element isKindOfClass:[NSDictionary class]] ? element : nil;
             [chapterArray addObject:[[Chapter alloc] init:chapterDictionary]];
         }
     }
 
-    return [[MediaInformation alloc] init:jsonDictionary
-                              withStreams:streamArray
-                             withChapters:chapterArray];
+    return [[MediaInformation alloc] init:jsonDictionary withStreams:streamArray withChapters:chapterArray];
 }
 
 @implementation MediaInformationJsonParser
@@ -98,9 +77,7 @@ static MediaInformation *parseMediaInformation(
     @try {
         return [self fromWithError:ffprobeJsonOutput];
     } @catch (NSException *exception) {
-        NSLog(@"MediaInformation parsing failed: %@.\n",
-              [NSString stringWithFormat:@"%@\n%@", [exception userInfo],
-                                         [exception callStackSymbols]]);
+        NSLog(@"MediaInformation parsing failed: %@.\n", [NSString stringWithFormat:@"%@\n%@", [exception userInfo], [exception callStackSymbols]]);
         return nil;
     }
 }
@@ -113,8 +90,7 @@ static MediaInformation *parseMediaInformation(
  */
 + (MediaInformation *)fromWithError:(NSString *)ffprobeJsonOutput {
     NSException *__autoreleasing failure = nil;
-    MediaInformation *mediaInformation =
-        parseMediaInformation(ffprobeJsonOutput, &failure);
+    MediaInformation *mediaInformation = parseMediaInformation(ffprobeJsonOutput, &failure);
     if (failure != nil) {
         ffprobeJsonOutput = nil;
         @throw failure;
