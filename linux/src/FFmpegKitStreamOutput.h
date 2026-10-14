@@ -20,6 +20,7 @@
 #ifndef FFMPEG_KIT_STREAM_OUTPUT_H
 #define FFMPEG_KIT_STREAM_OUTPUT_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -54,7 +55,9 @@ class FFmpegKitStreamOutput {
 
     long _id;
     std::string _url;
-    bool _closed;
+    // Do not lock across I/O: native close must be able to wake blocked reads.
+    // Operations past the open check are synchronized by the native registry.
+    std::atomic<bool> _closed;
 };
 
 } // namespace ffmpegkit

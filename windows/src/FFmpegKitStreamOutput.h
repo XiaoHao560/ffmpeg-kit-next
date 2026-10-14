@@ -22,6 +22,7 @@
 
 #include "FFmpegKitConfig.h"
 #include "ffmpegkit_facade.h"
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -105,9 +106,8 @@ class FFmpegKitStreamOutput {
      * Unregisters this stream. Safe to call more than once.
      */
     void close() {
-        if (!_closed) {
+        if (!_closed.exchange(true)) {
             ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(_id);
-            _closed = true;
         }
     }
 
@@ -118,14 +118,16 @@ class FFmpegKitStreamOutput {
     FFmpegKitStreamOutput(const long id, const std::string &extension) : _id{id}, _url{ffmpegkit::detail::buildProtocolUrl("ffkitstream", id, extension)}, _closed{false} {}
 
     void ensureOpen() {
-        if (_closed) {
+        if (_closed.load()) {
             throw ffmpegkit::Exception("FFmpegKit output stream is closed.");
         }
     }
 
     long _id;
     std::string _url;
-    bool _closed;
+    // Do not lock across I/O: native close must be able to wake blocked reads.
+    // Operations past the open check are synchronized by the native registry.
+    std::atomic<bool> _closed;
 };
 
 } // namespace ffmpegkit

@@ -22,6 +22,7 @@
 
 #include "FFmpegKitConfig.h"
 #include "ffmpegkit_facade.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -134,9 +135,8 @@ class FFmpegKitStreamInput {
      * data is consumed. Safe to call more than once.
      */
     void closeInput() {
-        if (!_closed && !_inputClosed) {
+        if (!_closed.load() && !_inputClosed.exchange(true)) {
             ffmpegkit::FFmpegKitConfig::closeFFmpegKitStreamInput(_id);
-            _inputClosed = true;
         }
     }
 
@@ -144,9 +144,8 @@ class FFmpegKitStreamInput {
      * Unregisters this stream. Safe to call more than once.
      */
     void close() {
-        if (!_closed) {
+        if (!_closed.exchange(true)) {
             ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(_id);
-            _closed = true;
         }
     }
 
@@ -157,14 +156,14 @@ class FFmpegKitStreamInput {
     FFmpegKitStreamInput(const long id, const std::string &extension) : _id{id}, _url{ffmpegkit::detail::buildProtocolUrl("ffkitstream", id, extension)}, _closed{false}, _inputClosed{false} {}
 
     void ensureOpen() {
-        if (_closed) {
+        if (_closed.load()) {
             throw ffmpegkit::Exception("FFmpegKit input stream is closed.");
         }
     }
 
     void ensureWritable() {
         ensureOpen();
-        if (_inputClosed) {
+        if (_inputClosed.load()) {
             throw ffmpegkit::Exception("FFmpegKit input stream is closed for writing.");
         }
     }
@@ -178,8 +177,10 @@ class FFmpegKitStreamInput {
 
     long _id;
     std::string _url;
-    bool _closed;
-    bool _inputClosed;
+    // Do not lock across I/O: native close must be able to wake blocked writes.
+    // Operations past these checks are synchronized by the native registry.
+    std::atomic<bool> _closed;
+    std::atomic<bool> _inputClosed;
 };
 
 } // namespace ffmpegkit

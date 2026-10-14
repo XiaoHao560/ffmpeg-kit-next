@@ -61,14 +61,13 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitStreamOutput::read(con
 }
 
 void ffmpegkit::FFmpegKitStreamOutput::close() {
-    if (!_closed) {
+    if (!_closed.exchange(true)) {
         ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(_id);
-        _closed = true;
     }
 }
 
 void ffmpegkit::FFmpegKitStreamOutput::ensureOpen() {
-    if (_closed) {
+    if (_closed.load()) {
         throw std::runtime_error("FFmpegKit output stream is closed.");
     }
 }

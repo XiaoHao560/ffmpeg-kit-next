@@ -55,7 +55,7 @@ int ffmpegkit::internal::FFmpegKitStreamInput::write(const std::vector<uint8_t> 
 
 int ffmpegkit::internal::FFmpegKitStreamInput::write(const std::vector<uint8_t> &data, const size_t offset, const size_t length, const int timeoutMs) {
     ensureOpen();
-    if (_inputClosed) {
+    if (_inputClosed.load()) {
         throw std::runtime_error("FFmpegKit input stream is closed for writing.");
     }
     if (offset > data.size() || length > (data.size() - offset)) {
@@ -72,7 +72,7 @@ int ffmpegkit::internal::FFmpegKitStreamInput::write(const std::vector<uint8_t> 
 
 int ffmpegkit::internal::FFmpegKitStreamInput::write(const uint8_t *data, const size_t length, const int timeoutMs) {
     ensureOpen();
-    if (_inputClosed) {
+    if (_inputClosed.load()) {
         throw std::runtime_error("FFmpegKit input stream is closed for writing.");
     }
     if (data == NULL && length > 0) {
@@ -88,22 +88,20 @@ int ffmpegkit::internal::FFmpegKitStreamInput::write(const uint8_t *data, const 
 }
 
 void ffmpegkit::internal::FFmpegKitStreamInput::closeInput() {
-    if (!_closed && !_inputClosed) {
+    if (!_closed.load() && !_inputClosed.exchange(true)) {
         ffmpegkit::internal::FFmpegKitConfig::closeFFmpegKitStreamInput(_id);
-        _inputClosed = true;
     }
 }
 
 void ffmpegkit::internal::FFmpegKitStreamInput::close() {
-    if (!_closed) {
-        closeInput();
+    if (!_closed.exchange(true)) {
+        // Unregister also closes the input side and wakes blocked operations.
         ffmpegkit::internal::FFmpegKitConfig::unregisterFFmpegKitStream(_id);
-        _closed = true;
     }
 }
 
 void ffmpegkit::internal::FFmpegKitStreamInput::ensureOpen() {
-    if (_closed) {
+    if (_closed.load()) {
         throw std::runtime_error("FFmpegKit input stream is closed.");
     }
 }
