@@ -18,6 +18,7 @@
  */
 
 #include "include/ffmpeg_kit_next_flutter/f_fmpeg_kit_flutter_plugin.h"
+#include "plugin_state.h"
 
 #include <flutter/event_channel.h>
 #include <flutter/event_stream_handler_functions.h>
@@ -399,6 +400,7 @@ struct NativeState : std::enable_shared_from_this<NativeState> {
   std::atomic<bool> alive{true};
   std::atomic<bool> logs{false};
   std::atomic<bool> statistics{false};
+  PluginState executions;
   std::mutex mutex;
   std::map<std::string, Resource> resources;
   std::set<long> sessions;
@@ -406,6 +408,13 @@ struct NativeState : std::enable_shared_from_this<NativeState> {
   std::map<long, std::shared_ptr<ffmpegkit::Session>> shutdown_sessions;
   std::vector<std::shared_ptr<PendingResponse>> pending_responses;
   std::shared_ptr<ffmpegkit::SessionDeleteListener> delete_listener;
+
+  std::unique_ptr<PluginState::Lease> StartExecution(const std::shared_ptr<ffmpegkit::Session> &session) {
+      auto lease = executions.TryStart([session] { session->cancel(); });
+      if (!lease)
+          throw ChannelError("PLUGIN_SHUTDOWN", "The Windows plugin is shutting down.");
+      return lease;
+  }
 
   bool AddPendingResponse(const std::shared_ptr<PendingResponse> &response) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -667,15 +676,21 @@ Value Dispatch(const std::shared_ptr<NativeState> &state,
     }
   }
   if (method == "ffmpegSessionExecute") {
-      Config::ffmpegExecute(GetFFmpegSession(state, args));
+      auto session = GetFFmpegSession(state, args);
+      auto execution = state->StartExecution(session);
+      Config::ffmpegExecute(session);
       return Value();
   }
   if (method == "ffprobeSessionExecute") {
-      Config::ffprobeExecute(GetFFprobeSession(state, args));
+      auto session = GetFFprobeSession(state, args);
+      auto execution = state->StartExecution(session);
+      Config::ffprobeExecute(session);
       return Value();
   }
   if (method == "mediaInformationSessionExecute") {
-      Config::getMediaInformationExecute(GetMediaSession(state, args), timeout);
+      auto session = GetMediaSession(state, args);
+      auto execution = state->StartExecution(session);
+      Config::getMediaInformationExecute(session, timeout);
       return Value();
   }
   if (method == "asyncFFmpegSessionExecute") {
@@ -949,38 +964,41 @@ public:
           const auto method = call.method_name();
           const auto arguments = call.arguments() ? *call.arguments() : Value();
           auto run = [state, method, arguments, pending](bool post_response) {
-            Value value;
-            std::string code, message;
-            try {
-              value = Dispatch(state, method, Arguments(arguments));
-            } catch (const ChannelError &error) {
-              code = error.code;
-              message = error.what();
-            } catch (const std::invalid_argument &error) {
-              code = "INVALID_ARGUMENTS";
-              message = error.what();
-            } catch (const std::exception &error) {
-              code = "NATIVE_ERROR";
-              message = error.what();
-            } catch (...) {
-              code = "NATIVE_ERROR";
-              message = "Unknown native error.";
-            }
-            auto respond = [state, pending, value = std::move(value), code,
-                            message] {
-              if (!state->ClaimPendingResponse(pending))
-                return;
-              if (code == "METHOD_NOT_IMPLEMENTED")
-                pending->result->NotImplemented();
-              else if (!code.empty())
-                pending->result->Error(code, Utf8(message));
+              // Teardown owns the pending response once the state is dead.
+              // A detached worker scheduled late must not enter native code.
+              if (!state->alive)
+                  return;
+              Value value;
+              std::string code, message;
+              try {
+                  value = Dispatch(state, method, Arguments(arguments));
+              } catch (const ChannelError &error) {
+                  code = error.code;
+                  message = error.what();
+              } catch (const std::invalid_argument &error) {
+                  code = "INVALID_ARGUMENTS";
+                  message = error.what();
+              } catch (const std::exception &error) {
+                  code = "NATIVE_ERROR";
+                  message = error.what();
+              } catch (...) {
+                  code = "NATIVE_ERROR";
+                  message = "Unknown native error.";
+              }
+              auto respond = [state, pending, value = std::move(value), code, message] {
+                  if (!state->ClaimPendingResponse(pending))
+                      return;
+                  if (code == "METHOD_NOT_IMPLEMENTED")
+                      pending->result->NotImplemented();
+                  else if (!code.empty())
+                      pending->result->Error(code, Utf8(message));
+                  else
+                      pending->result->Success(value);
+              };
+              if (post_response)
+                  state->dispatcher->Post(std::move(respond));
               else
-                pending->result->Success(value);
-            };
-            if (post_response)
-              state->dispatcher->Post(std::move(respond));
-            else
-              respond();
+                  respond();
           };
           // These calls can block on FFmpeg or stream I/O and must not run on
           // the Flutter platform thread.
@@ -1001,6 +1019,7 @@ public:
     // Mark state dead before releasing channel-owned objects so detached
     // workers cannot access them during shutdown.
     state_->alive = false;
+    state_->executions.BeginShutdown();
     state_->CompletePendingResponsesForShutdown();
     state_->sink.reset();
     Config::removeSessionDeleteListener(state_->delete_listener);
@@ -1013,6 +1032,9 @@ public:
       }
       state_->resources.clear();
     }
+    // Closing resources wakes stream I/O before waiting for owned executions.
+    // Cancellation is retried across native registration until they return.
+    state_->executions.CancelAndWait();
     state_->dispatcher->Close();
   }
 
