@@ -340,7 +340,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
             break;
         case "thereAreAsynchronousMessagesInTransmit":
             if (sessionId != null) {
-                abstractSessionThereAreAsynchronousMessagesInTransmit(sessionId, result);
+                thereAreAsynchronousMessagesInTransmit(sessionId, result);
             } else {
                 resultHandler.errorAsync(result, "INVALID_SESSION", "Invalid session id.");
             }
@@ -1104,7 +1104,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
         }
     }
 
-    protected void abstractSessionThereAreAsynchronousMessagesInTransmit(@NonNull final Integer sessionId, @NonNull final Result result) {
+    protected void thereAreAsynchronousMessagesInTransmit(@NonNull final Integer sessionId, @NonNull final Result result) {
         final Session session = findSession(sessionId.longValue());
         if (session == null) {
             resultHandler.errorAsync(result, "SESSION_NOT_FOUND", "Session not found.");
