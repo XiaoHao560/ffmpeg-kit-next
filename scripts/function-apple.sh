@@ -968,7 +968,6 @@ framework module ffmpegkit {
   header "Statistics.h"
   header "StatisticsCallback.h"
   header "StreamInformation.h"
-  header "ffmpegkit_exception.h"
 ${C_API_HEADER}
   export *
 }

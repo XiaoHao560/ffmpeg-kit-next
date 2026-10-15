@@ -30,7 +30,6 @@ libffmpegkit_la_SOURCES = \
     Statistics.m \
     StreamInformation.m \
     ffmpeg_context.c \
-    ffmpegkit_exception.m \
     fftools/cmdutils.c \
     fftools/ffmpeg.c \
     fftools/ffmpeg_dec.c \
@@ -99,7 +98,6 @@ include_HEADERS = \
     StatisticsCallback.h \
     StreamInformation.h \
     ffmpeg_context.h \
-    ffmpegkit_exception.h \
     fftools/cmdutils.h \
     fftools/ffmpeg.h \
     fftools/ffmpeg_mux.h \
