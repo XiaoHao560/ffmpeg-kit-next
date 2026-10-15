@@ -3,7 +3,7 @@ description: A common platform interface for ffmpeg_kit_next_flutter plugin.
 repository: https://github.com/arthenica/ffmpeg-kit-next
 issue_tracker: https://github.com/arthenica/ffmpeg-kit-next/issues
 homepage: https://github.com/arthenica/ffmpeg-kit-next
-version: 0.3.0
+version: 0.3.1
 publish_to: none
 
 environment:

@@ -90,7 +90,6 @@ import io.flutter.plugin.common.PluginRegistry;
 public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, MethodCallHandler, EventChannel.StreamHandler, PluginRegistry.ActivityResultListener {
 
     public static final String LIBRARY_NAME = "ffmpeg-kit-flutter";
-    public static final String LIBRARY_VERSION = "9.0.0";
     public static final String PLATFORM_NAME = "android";
 
     private static final String METHOD_CHANNEL = "flutter.arthenica.com/ffmpeg_kit";
@@ -537,7 +536,8 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
                 getLogLevel(result);
                 break;
             case "printLoadConfirmation":
-                printLoadConfirmation(result);
+                final Object version = call.argument("version");
+                printLoadConfirmation(version instanceof String ? (String)version : null, result);
                 break;
             case "setLogLevel":
                 final Integer level = call.argument("level");
@@ -1470,11 +1470,12 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
         resultHandler.successAsync(result, toInt(FFmpegKitConfig.getLogLevel()));
     }
 
-    protected void printLoadConfirmation(@NonNull final Result result) {
+    protected void printLoadConfirmation(@Nullable final String version, @NonNull final Result result) {
         if (loadedLogged.compareAndSet(false, true)) {
             final String packageName = Packages.getPackageName();
             final String packageNamePart = packageName.isEmpty() ? "" : packageName + "-";
-            Log.d(LIBRARY_NAME, String.format("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart, PLATFORM_NAME, AbiDetect.getAbi(), LIBRARY_VERSION));
+            final String versionPart = (version == null || version.isEmpty()) ? "unknown" : version;
+            Log.d(LIBRARY_NAME, String.format("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart, PLATFORM_NAME, AbiDetect.getAbi(), versionPart));
         }
 
         resultHandler.successAsync(result, null);

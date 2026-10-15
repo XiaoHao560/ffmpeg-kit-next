@@ -31,7 +31,6 @@
 #import <ffmpegkit/FFmpegKitStreamOutput.h>
 
 static NSString *const PLATFORM_NAME = @"macos";
-static NSString *const LIBRARY_VERSION = @"9.0.0";
 
 static NSString *const METHOD_CHANNEL = @"flutter.arthenica.com/ffmpeg_kit";
 static NSString *const EVENT_CHANNEL = @"flutter.arthenica.com/ffmpeg_kit_event";
@@ -489,7 +488,8 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
   } else if ([@"getLogLevel" isEqualToString:call.method]) {
       [self getLogLevel:result];
   } else if ([@"printLoadConfirmation" isEqualToString:call.method]) {
-      [self printLoadConfirmation:result];
+      NSString *version = call.arguments[@"version"];
+      [self printLoadConfirmation:version result:result];
   } else if ([@"setLogLevel" isEqualToString:call.method]) {
       NSNumber *level = call.arguments[@"level"];
       if (level != nil) {
@@ -1207,15 +1207,16 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
   result([NSNumber numberWithInt:[FFmpegKitConfig getLogLevel]]);
 }
 
-- (void)printLoadConfirmation:(FlutterResult)result {
-  static dispatch_once_t loadedLoggedToken;
-  dispatch_once(&loadedLoggedToken, ^{
-    NSString* packageName = [Packages getPackageName];
-    NSString* packageNamePart = [packageName length] > 0 ? [NSString stringWithFormat:@"%@-", packageName] : @"";
-    NSLog(@"Loaded ffmpeg-kit-next-flutter-%@%@-%@-%@.", packageNamePart, PLATFORM_NAME, [ArchDetect getArch], LIBRARY_VERSION);
-  });
+- (void)printLoadConfirmation:(NSString *)version result:(FlutterResult)result {
+    static dispatch_once_t loadedLoggedToken;
+    dispatch_once(&loadedLoggedToken, ^{
+      NSString *packageName = [Packages getPackageName];
+      NSString *packageNamePart = [packageName length] > 0 ? [NSString stringWithFormat:@"%@-", packageName] : @"";
+      NSString *versionPart = ([version isKindOfClass:[NSString class]] && [version length] > 0) ? version : @"unknown";
+      NSLog(@"Loaded ffmpeg-kit-next-flutter-%@%@-%@-%@.", packageNamePart, PLATFORM_NAME, [ArchDetect getArch], versionPart);
+    });
 
-  result(nil);
+    result(nil);
 }
 
 - (void)setLogLevel:(NSNumber*)level result:(FlutterResult)result {

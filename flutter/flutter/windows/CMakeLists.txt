@@ -10,7 +10,7 @@ if(NOT EXISTS "${FFMPEG_KIT_BUNDLE}/lib/cmake/ffmpeg-kit-next/ffmpeg-kit-next-co
   message(FATAL_ERROR "Build windows.sh, then run copy_local_binaries.sh windows before building the Flutter application.")
 endif()
 
-find_package(ffmpeg-kit-next 9.0.0 REQUIRED CONFIG
+find_package(ffmpeg-kit-next REQUIRED CONFIG
   PATHS "${FFMPEG_KIT_BUNDLE}/lib/cmake/ffmpeg-kit-next"
   NO_DEFAULT_PATH)
 

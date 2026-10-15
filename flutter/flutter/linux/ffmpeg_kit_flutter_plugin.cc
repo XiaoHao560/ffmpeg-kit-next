@@ -1040,7 +1040,10 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
             logged = TRUE;
             const std::string packageName = ffmpegkit::Packages::getPackageName();
             const std::string packageNamePart = packageName.empty() ? "" : packageName + "-";
-            g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart.c_str(), FFMPEG_KIT_PLATFORM_NAME, ffmpegkit::ArchDetect::getArch().c_str(), ffmpegkit::FFmpegKitConfig::getVersion().c_str());
+            FlValue *version = lookup(args, "version");
+            const char *versionText = version != nullptr && fl_value_get_type(version) == FL_VALUE_TYPE_STRING ? fl_value_get_string(version) : nullptr;
+            const std::string versionPart = versionText != nullptr && versionText[0] != '\0' ? versionText : "unknown";
+            g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart.c_str(), FFMPEG_KIT_PLATFORM_NAME, ffmpegkit::ArchDetect::getArch().c_str(), versionPart.c_str());
         }
         return resp_null();
 

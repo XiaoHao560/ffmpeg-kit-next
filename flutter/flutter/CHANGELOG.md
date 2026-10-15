@@ -1,5 +1,7 @@
 ## Development
 - Adds permanent `FFmpegKitConfig.shutdown(int waitTimeout)` and `isShutdown()` on all native hosts
+- The load confirmation log line prints the plugin version on every platform
+- Requires `ffmpeg_kit_next_flutter_platform_interface` 0.3.1
 
 ## 9.0.0
 - Feature release based on native 9.0.0 (FFmpeg 9.0.1)

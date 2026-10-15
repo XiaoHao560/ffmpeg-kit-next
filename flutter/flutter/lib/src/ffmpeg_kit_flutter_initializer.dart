@@ -74,7 +74,8 @@ class FFmpegKitInitializer {
       _initialized = true;
       await _instance._applyInitialLogLevel();
       if (printLoadConfirmation) {
-        await _platform.ffmpegKitFlutterInitializerPrintLoadConfirmation();
+        await _platform.ffmpegKitFlutterInitializerPrintLoadConfirmation(
+            FFmpegKitFactory.getVersion());
       }
       return true;
     }).catchError((Object error, StackTrace stackTrace) {

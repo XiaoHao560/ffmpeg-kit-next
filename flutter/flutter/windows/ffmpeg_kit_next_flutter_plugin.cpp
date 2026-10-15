@@ -622,10 +622,14 @@ Value Dispatch(const std::shared_ptr<PluginData> &state, const std::string &meth
 #endif
     if (method == "printLoadConfirmation") {
         static std::once_flag load_confirmation;
-        std::call_once(load_confirmation, [] {
+        const auto *version_value = args.Find("version");
+        const auto *version_text = version_value ? std::get_if<std::string>(version_value) : nullptr;
+        const std::string version = version_text ? *version_text : std::string();
+        std::call_once(load_confirmation, [&version] {
             const auto package = ffmpegkit::Packages::getPackageName();
             const auto package_part = package.empty() ? "" : package + "-";
-            std::fprintf(stderr, "Loaded ffmpeg-kit-next-flutter-%swindows-%s-%s.\n", package_part.c_str(), ffmpegkit::ArchDetect::getArch().c_str(), Config::getVersion().c_str());
+            const auto version_part = version.empty() ? std::string("unknown") : version;
+            std::fprintf(stderr, "Loaded ffmpeg-kit-next-flutter-%swindows-%s-%s.\n", package_part.c_str(), ffmpegkit::ArchDetect::getArch().c_str(), version_part.c_str());
         });
         return Value();
     }
