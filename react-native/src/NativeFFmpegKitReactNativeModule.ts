@@ -69,7 +69,7 @@ export interface Spec extends TurboModule {
 
   // Log level / history size
   getLogLevel(): Promise<number>;
-  printLoadConfirmation(): Promise<void>;
+  printLoadConfirmation(version: string): Promise<void>;
   setLogLevel(level: number): Promise<void>;
   getSessionHistorySize(): Promise<number>;
   setSessionHistorySize(sessionHistorySize: number): Promise<void>;

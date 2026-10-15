@@ -57,8 +57,15 @@ allprojects {
     repositories {
         def ffmpegKitProject = rootProject.findProject(":ffmpeg-kit-next-react-native")
         if (ffmpegKitProject != null) {
-            maven {
-                url "${ffmpegKitProject.projectDir}/libs-maven"
+            exclusiveContent {
+                forRepository {
+                    maven {
+                        url "${ffmpegKitProject.projectDir}/libs-maven"
+                    }
+                }
+                filter {
+                    includeModule('com.arthenica', 'ffmpeg-kit-next')
+                }
             }
         }
     }
@@ -67,6 +74,13 @@ allprojects {
 
 `ffmpegKitProject.projectDir` is the plugin's `android/` folder inside `node_modules`, so the same snippet works for
 any app. iOS and iPadOS need no extra repository step.
+
+The plugin reads its native dependency version from the single POM in the copied Maven bundle and requires that exact
+version. The exclusive repository rule keeps this module in the local repository. Re-run `copy_local_binaries.sh android`
+after rebuilding; missing or multiple native versions and missing AARs produce a build error.
+
+The React Native package version lives in `package.json`. `FFmpegKitConfig.getVersion()`, the native load-confirmation
+log, and the CocoaPods podspec all use that value.
 
 #### 2.1 Build Variants and External Libraries
 

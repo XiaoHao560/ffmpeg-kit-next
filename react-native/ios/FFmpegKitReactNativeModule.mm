@@ -35,7 +35,6 @@
 #import <ffmpegkit/FFmpegKitStreamOutput.h>
 
 static NSString *const PLATFORM_NAME = @"ios";
-static NSString *const LIBRARY_VERSION = @"9.0.0";
 
 // LOG CLASS
 static NSString *const KEY_LOG_SESSION_ID = @"sessionId";
@@ -601,12 +600,13 @@ RCT_EXPORT_METHOD(getLogLevel:(RCTPromiseResolveBlock)resolve reject:(RCTPromise
     resolve([NSNumber numberWithInt:[FFmpegKitConfig getLogLevel]]);
 }
 
-RCT_EXPORT_METHOD(printLoadConfirmation:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject) {
+RCT_EXPORT_METHOD(printLoadConfirmation : (NSString *)version resolve : (RCTPromiseResolveBlock)resolve reject : (RCTPromiseRejectBlock)reject) {
     static dispatch_once_t loadedLoggedToken;
     dispatch_once(&loadedLoggedToken, ^{
         NSString* packageName = [Packages getPackageName];
         NSString* packageNamePart = [packageName length] > 0 ? [NSString stringWithFormat:@"%@-", packageName] : @"";
-        NSLog(@"Loaded ffmpeg-kit-next-react-native-%@%@-%@-%@.", packageNamePart, PLATFORM_NAME, [ArchDetect getArch], LIBRARY_VERSION);
+        NSString *versionPart = [version length] > 0 ? version : @"unknown";
+        NSLog(@"Loaded ffmpeg-kit-next-react-native-%@%@-%@-%@.", packageNamePart, PLATFORM_NAME, [ArchDetect getArch], versionPart);
     });
 
     resolve(nil);

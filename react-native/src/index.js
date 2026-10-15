@@ -2,6 +2,8 @@ import {NativeEventEmitter} from 'react-native';
 
 import FFmpegKitReactNativeModule from './NativeFFmpegKitReactNativeModule';
 
+const {version : packageVersion} = require('../package.json');
+
 const ffmpegSessionCompleteCallbackMap = new Map()
 const ffprobeSessionCompleteCallbackMap = new Map()
 const mediaInformationSessionCompleteCallbackMap = new Map()
@@ -1974,9 +1976,7 @@ class FFmpegKitFactory {
       }
   }
 
-  static getVersion() {
-    return "9.0.0";
-  }
+  static getVersion() { return packageVersion; }
 
   static getLogRedirectionStrategy(sessionId) {
     return logRedirectionStrategyMap.get(sessionId);
@@ -2356,7 +2356,7 @@ class FFmpegKitInitializer {
       this.#initialized = true;
       await this._applyInitialLogLevel();
       if (printLoadConfirmation) {
-        await FFmpegKitReactNativeModule.printLoadConfirmation();
+          await FFmpegKitReactNativeModule.printLoadConfirmation(FFmpegKitFactory.getVersion());
       }
     }).catch(error => {
       this.#initialized = false;

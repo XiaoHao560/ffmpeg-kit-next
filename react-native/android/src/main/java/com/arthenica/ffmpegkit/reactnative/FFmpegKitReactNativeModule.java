@@ -84,7 +84,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class FFmpegKitReactNativeModule extends NativeFFmpegKitReactNativeModuleSpec {
 
   public static final String LIBRARY_NAME = "ffmpeg-kit-react-native";
-  public static final String LIBRARY_VERSION = "9.0.0";
   public static final String PLATFORM_NAME = "android";
 
   // LOG CLASS
@@ -664,14 +663,15 @@ public class FFmpegKitReactNativeModule extends NativeFFmpegKitReactNativeModule
   }
 
   @ReactMethod
-  public void printLoadConfirmation(final Promise promise) {
-    if (loadedLogged.compareAndSet(false, true)) {
-      final String packageName = Packages.getPackageName();
-      final String packageNamePart = packageName.isEmpty() ? "" : packageName + "-";
-      Log.d(LIBRARY_NAME, String.format("Loaded ffmpeg-kit-next-react-native-%s%s-%s-%s.", packageNamePart, PLATFORM_NAME, AbiDetect.getAbi(), LIBRARY_VERSION));
-    }
+  public void printLoadConfirmation(final String version, final Promise promise) {
+      if (loadedLogged.compareAndSet(false, true)) {
+          final String packageName = Packages.getPackageName();
+          final String packageNamePart = packageName.isEmpty() ? "" : packageName + "-";
+          final String versionPart = version != null && !version.isEmpty() ? version : "unknown";
+          Log.d(LIBRARY_NAME, String.format("Loaded ffmpeg-kit-next-react-native-%s%s-%s-%s.", packageNamePart, PLATFORM_NAME, AbiDetect.getAbi(), versionPart));
+      }
 
-    promise.resolve(null);
+      promise.resolve(null);
   }
 
   @ReactMethod
