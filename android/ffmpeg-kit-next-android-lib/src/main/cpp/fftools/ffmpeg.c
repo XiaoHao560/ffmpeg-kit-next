@@ -33,6 +33,11 @@
  *
  * ffmpeg-kit changes by Taner Sener
  *
+ * 10.2026
+ * --------------------------------------------------------
+ * - cancel requested before transcoding starts, e.g. while opening inputs,
+ *   returns 255 instead of 0
+ *
  * 09.2026
  * --------------------------------------------------------
  * - FFmpeg 9.0.2 changes migrated
@@ -1288,7 +1293,11 @@ int ffmpeg_execute(int argc, char **argv)
           (ret == FFMPEG_ERROR_RATE_EXCEEDED) ?  69 : ret;
 
 finish:
-    if (ret == AVERROR_EXIT)
+    // A CANCEL SEEN BEFORE transcode(), E.G. WHILE OPENING INPUTS, ENDS WITH
+    // AVERROR_EXIT AND JUMPS HERE; REPORT IT AS CANCELLED, NOT AS SUCCESS
+    if (received_nb_signals || cancelRequested(globalSessionId))
+        ret = 255;
+    else if (ret == AVERROR_EXIT)
         ret = 0;
 
     ffmpeg_cleanup(ret);
