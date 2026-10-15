@@ -615,12 +615,17 @@ create_ffmpeg_kit_xcframework() {
 set_default_min_ios_platform_version() {
   if [[ $(compare_versions "$DETECTED_IOS_SDK_VERSION" "12.1") -le 0 ]]; then
     export IOS_MIN_VERSION=$DETECTED_IOS_SDK_VERSION
+  elif [[ $(compare_versions "$DETECTED_IOS_SDK_VERSION" "27.0") -ge 0 ]]; then
+    # SDK 27 libc++ no longer supports iOS deployment targets below 15.0.
+    export IOS_MIN_VERSION=15.0
   else
     export IOS_MIN_VERSION=12.1
   fi
 
   if [[ $(compare_versions "$DETECTED_IOS_SDK_VERSION" "14.0") -le 0 ]]; then
     export MAC_CATALYST_MIN_VERSION=13.1
+  elif [[ $(compare_versions "$DETECTED_IOS_SDK_VERSION" "27.0") -ge 0 ]]; then
+    export MAC_CATALYST_MIN_VERSION=15.0
   else
     export MAC_CATALYST_MIN_VERSION=14.0
   fi
@@ -629,6 +634,9 @@ set_default_min_ios_platform_version() {
 set_default_min_macos_platform_version() {
   if [[ $(compare_versions "$DETECTED_MACOS_SDK_VERSION" "10.15") -le 0 ]]; then
     export MACOS_MIN_VERSION=$DETECTED_MACOS_SDK_VERSION
+  elif [[ $(compare_versions "$DETECTED_MACOS_SDK_VERSION" "27.0") -ge 0 ]]; then
+    # SDK 27 libc++ requires macOS 11.0 or newer.
+    export MACOS_MIN_VERSION=11.0
   else
     export MACOS_MIN_VERSION=10.15
   fi
@@ -637,6 +645,9 @@ set_default_min_macos_platform_version() {
 set_default_min_tvos_platform_version() {
   if [[ $(compare_versions "$DETECTED_TVOS_SDK_VERSION" "11.0") -le 0 ]]; then
     export TVOS_MIN_VERSION=$DETECTED_TVOS_SDK_VERSION
+  elif [[ $(compare_versions "$DETECTED_TVOS_SDK_VERSION" "27.0") -ge 0 ]]; then
+    # SDK 27 libc++ requires tvOS 15.0 or newer.
+    export TVOS_MIN_VERSION=15.0
   else
     export TVOS_MIN_VERSION=11.0
   fi
