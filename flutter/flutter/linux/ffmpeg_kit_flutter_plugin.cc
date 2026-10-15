@@ -23,6 +23,7 @@
 #include <gtk/gtk.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
@@ -33,12 +34,16 @@
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <functional>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "plugin_state.h"
@@ -69,7 +74,6 @@
 #include <json/Value.h>
 
 #define FFMPEG_KIT_PLATFORM_NAME "linux"
-#define FFMPEG_KIT_LIBRARY_VERSION "9.0.0"
 
 static const char* kMethodChannelName = "flutter.arthenica.com/ffmpeg_kit";
 static const char* kEventChannelName = "flutter.arthenica.com/ffmpeg_kit_event";
@@ -105,49 +109,16 @@ static const char* EVENT_COMPLETE_CALLBACK_EVENT =
 static const char* EVENT_SESSION_DELETED_CALLBACK_EVENT =
     "FFmpegKitSessionDeletedCallbackEvent";
 
-class PendingResponse;
+using ffmpeg_kit_linux::PendingResponse;
+
+// What workers and native callbacks hold instead of the plugin GObject.
+// Lifecycle (admission, executions, replies, async sessions) is PluginState.
 struct PluginData {
     std::shared_ptr<ffmpeg_kit_linux::PluginState> executions = std::make_shared<ffmpeg_kit_linux::PluginState>();
+    // Read by native callbacks, so disabled events are dropped before conversion.
+    std::atomic<bool> logs_enabled{false};
+    std::atomic<bool> statistics_enabled{false};
     GWeakRef plugin;
-    // Platform-thread owned. Workers retain their response independently.
-    std::vector<std::shared_ptr<PendingResponse>> pending;
-    std::mutex async_mutex;
-    std::map<long, std::shared_ptr<ffmpegkit::Session>> async_sessions;
-    void FinishAsync(long id) {
-        std::lock_guard<std::mutex> lock(async_mutex);
-        async_sessions.erase(id);
-    }
-    void PruneAsyncLocked() {
-        for (auto item = async_sessions.begin(); item != async_sessions.end();) {
-            const auto status = item->second->getState();
-            if (status == ffmpegkit::SessionStateCompleted || status == ffmpegkit::SessionStateFailed)
-                item = async_sessions.erase(item);
-            else
-                ++item;
-        }
-    }
-    bool TrackAsync(const std::shared_ptr<ffmpegkit::Session> &session) {
-        std::lock_guard<std::mutex> lock(async_mutex);
-        if (executions->IsStopping())
-            return false;
-        PruneAsyncLocked();
-        async_sessions[session->getSessionId()] = session;
-        return true;
-    }
-    void CancelAsync() {
-        std::map<long, std::shared_ptr<ffmpegkit::Session>> owned;
-        {
-            std::lock_guard<std::mutex> lock(async_mutex);
-            PruneAsyncLocked();
-            owned.swap(async_sessions);
-        }
-        for (const auto &item : owned) {
-            try {
-                item.second->cancel();
-            } catch (...) {
-            }
-        }
-    }
     PluginData() { g_weak_ref_init(&plugin, nullptr); }
     ~PluginData() { g_weak_ref_clear(&plugin); }
 };
@@ -156,8 +127,6 @@ struct _FfmpegKitNextFlutterPlugin {
   GObject parent_instance;
   FlEventChannel* event_channel;
   gboolean listening;
-  gboolean logs_enabled;
-  gboolean statistics_enabled;
   gboolean retain_shutdown_sessions;
   std::map<long, std::shared_ptr<ffmpegkit::Session>> *shutdown_sessions;
 
@@ -239,8 +208,9 @@ static FlValue* json_value_to_fl_value(const ffmpegkit::json::Value& value) {
     case ffmpegkit::json::Value::Type::Object: {
       FlValue* map = fl_value_new_map();
       for (const auto& entry : value.getObject()) {
-        fl_value_set_string_take(map, entry.first.c_str(),
-                                 json_value_to_fl_value(entry.second));
+          gchar *key = g_utf8_make_valid(entry.first.c_str(), static_cast<gssize>(entry.first.size()));
+          fl_value_set_string_take(map, key, json_value_to_fl_value(entry.second));
+          g_free(key);
       }
       return map;
     }
@@ -376,85 +346,134 @@ static FlValue* to_statistics_list_value(
 // Argument extraction and response helpers
 // ---------------------------------------------------------------------------
 
-static FlValue* lookup(FlValue* args, const char* name) {
-  if (args == nullptr || fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
-    return nullptr;
-  }
-  return fl_value_lookup_string(args, name);
+// A rejected argument. method_call_cb reports it with its code and message.
+class ArgumentError : public std::runtime_error {
+  public:
+    ArgumentError(const std::string &code, const std::string &message) : std::runtime_error(message), code(code) {}
+    explicit ArgumentError(const std::string &message) : ArgumentError("INVALID_ARGUMENTS", message) {}
+    const std::string code;
+};
+
+// The code and message a method reports for a bad argument, as on Windows. An
+// empty check falls back to INVALID_ARGUMENTS.
+struct Check {
+    const char *code;
+    const char *message;
+};
+
+// Argument checks shared with the Android, iOS and Windows plugins. Keep the
+// codes and messages aligned with them.
+static const Check kInvalidSession{"INVALID_SESSION", "Invalid session id."};
+static const Check kInvalidArgumentsArray{"INVALID_ARGUMENTS", "Invalid arguments array."};
+static const Check kInvalidShutdownTimeout{"INVALID_ARGUMENTS", "waitTimeout is required."};
+static const Check kInvalidFfprobeJsonOutput{"INVALID_FFPROBE_JSON_OUTPUT", "Invalid ffprobe json output."};
+static const Check kInvalidPath{"INVALID_PATH", "Invalid path."};
+static const Check kInvalidFontDirectory{"INVALID_FONT_DIRECTORY", "Invalid font directory."};
+static const Check kInvalidFontDirectoryList{"INVALID_FONT_DIRECTORY_LIST", "Invalid font directory list."};
+static const Check kInvalidPipePath{"INVALID_PIPE_PATH", "Invalid ffmpeg pipe path."};
+static const Check kInvalidVariableName{"INVALID_NAME", "Invalid environment variable name."};
+static const Check kInvalidVariableValue{"INVALID_VALUE", "Invalid environment variable value."};
+static const Check kInvalidSignal{"INVALID_SIGNAL", "Invalid signal value."};
+static const Check kInvalidLevel{"INVALID_LEVEL", "Invalid level value."};
+static const Check kInvalidSize{"INVALID_SIZE", "Invalid session history size value."};
+static const Check kInvalidSessionState{"INVALID_SESSION_STATE", "Invalid session state value."};
+static const Check kInvalidLogRedirectionStrategy{"INVALID_LOG_REDIRECTION_STRATEGY", "Invalid log redirection strategy value."};
+static const Check kInvalidData{"INVALID_DATA", "Invalid input buffer data."};
+static const Check kInvalidInputBufferUrl{"INVALID_URL", "Invalid input buffer url."};
+static const Check kInvalidOutputBufferUrl{"INVALID_URL", "Invalid output buffer url."};
+static const Check kInvalidStreamInputUrl{"INVALID_URL", "Invalid stream input url."};
+static const Check kInvalidStreamOutputUrl{"INVALID_URL", "Invalid stream output url."};
+static const Check kInvalidStreamInputArguments{"INVALID_ARGUMENTS", "Invalid stream input arguments."};
+static const Check kInvalidStreamOutputArguments{"INVALID_ARGUMENTS", "Invalid stream output arguments."};
+// writeToPipe is Linux-only here; these match Android and iOS.
+static const Check kInvalidPipe{"INVALID_PIPE", "Invalid pipe value."};
+static const Check kInvalidInput{"INVALID_INPUT", "Invalid input value."};
+
+[[noreturn]] static void reject(const Check &check, const std::string &message) {
+    if (check.code)
+        throw ArgumentError(check.code, check.message);
+    throw ArgumentError(message);
 }
 
-static const gchar* get_string_argument(FlValue* args, const char* name) {
-  FlValue* v = lookup(args, name);
-  return (v != nullptr && fl_value_get_type(v) == FL_VALUE_TYPE_STRING)
-             ? fl_value_get_string(v)
-             : nullptr;
+// Null counts as missing, as on Windows.
+static FlValue *lookup(FlValue *args, const char *name) {
+    if (args == nullptr || fl_value_get_type(args) != FL_VALUE_TYPE_MAP)
+        return nullptr;
+    FlValue *value = fl_value_lookup_string(args, name);
+    return value == nullptr || fl_value_get_type(value) == FL_VALUE_TYPE_NULL ? nullptr : value;
 }
 
-static int64_t get_int_argument(FlValue* args, const char* name,
-                                gboolean* found) {
-  FlValue* v = lookup(args, name);
-  if (v != nullptr && fl_value_get_type(v) == FL_VALUE_TYPE_INT) {
-    if (found != nullptr) *found = TRUE;
-    return fl_value_get_int(v);
-  }
-  if (found != nullptr) *found = FALSE;
-  return 0;
+// Required accessors reject a missing, null, wrongly typed or unrepresentable
+// value with check.
+static std::string string_argument(FlValue *args, const char *name, const Check &check = {}) {
+    FlValue *value = lookup(args, name);
+    if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_STRING)
+        reject(check, std::string("Expected string: ") + name);
+    return fl_value_get_string(value);
 }
 
-// Matches the ObjC isValidPositiveNumber gate used for waitTimeout arguments.
-static gboolean is_valid_positive_argument(FlValue* args, const char* name) {
-  gboolean found = FALSE;
-  int64_t value = get_int_argument(args, name, &found);
-  return found && value > 0;
+static std::string optional_string_argument(FlValue *args, const char *name) { return lookup(args, name) ? string_argument(args, name) : std::string(); }
+
+static int int_argument(FlValue *args, const char *name, const Check &check = {}) {
+    FlValue *value = lookup(args, name);
+    if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_INT)
+        reject(check, std::string("Expected integer: ") + name);
+    const int64_t number = fl_value_get_int(value);
+    if (number < std::numeric_limits<int>::min() || number > std::numeric_limits<int>::max())
+        reject(check, std::string("Integer out of native range: ") + name);
+    return static_cast<int>(number);
 }
 
-static int resolve_timeout(FlValue* args) {
-  if (is_valid_positive_argument(args, "waitTimeout")) {
-    gboolean found = FALSE;
-    return static_cast<int>(get_int_argument(args, "waitTimeout", &found));
-  }
-  return ffmpegkit::AbstractSession::
-      DefaultTimeoutForAsynchronousMessagesInTransmit;
-}
+static int optional_int_argument(FlValue *args, const char *name, int fallback) { return lookup(args, name) ? int_argument(args, name) : fallback; }
 
-static std::list<std::string> fl_to_string_list(FlValue* value) {
-  std::list<std::string> out;
-  if (value != nullptr && fl_value_get_type(value) == FL_VALUE_TYPE_LIST) {
-    size_t n = fl_value_get_length(value);
-    for (size_t i = 0; i < n; i++) {
-      FlValue* e = fl_value_get_list_value(value, i);
-      if (fl_value_get_type(e) == FL_VALUE_TYPE_STRING) {
-        out.emplace_back(fl_value_get_string(e));
-      }
+static std::list<std::string> strings_argument(FlValue *args, const char *name, const Check &check = {}) {
+    FlValue *value = lookup(args, name);
+    if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_LIST)
+        reject(check, std::string("Expected list: ") + name);
+    std::list<std::string> result;
+    const size_t length = fl_value_get_length(value);
+    for (size_t i = 0; i < length; i++) {
+        FlValue *entry = fl_value_get_list_value(value, i);
+        if (fl_value_get_type(entry) != FL_VALUE_TYPE_STRING)
+            reject(check, "Expected string list entries.");
+        result.emplace_back(fl_value_get_string(entry));
     }
-  }
-  return out;
+    return result;
 }
 
-static std::map<std::string, std::string> fl_to_string_map(FlValue* value) {
-  std::map<std::string, std::string> out;
-  if (value != nullptr && fl_value_get_type(value) == FL_VALUE_TYPE_MAP) {
-    size_t n = fl_value_get_length(value);
-    for (size_t i = 0; i < n; i++) {
-      FlValue* k = fl_value_get_map_key(value, i);
-      FlValue* v = fl_value_get_map_value(value, i);
-      if (fl_value_get_type(k) == FL_VALUE_TYPE_STRING &&
-          fl_value_get_type(v) == FL_VALUE_TYPE_STRING) {
-        out[fl_value_get_string(k)] = fl_value_get_string(v);
-      }
+static std::map<std::string, std::string> mapping_argument(FlValue *args, const char *name) {
+    FlValue *value = lookup(args, name);
+    if (value == nullptr)
+        return {};
+    if (fl_value_get_type(value) != FL_VALUE_TYPE_MAP)
+        throw ArgumentError("Expected string map.");
+    std::map<std::string, std::string> result;
+    const size_t length = fl_value_get_length(value);
+    for (size_t i = 0; i < length; i++) {
+        FlValue *key = fl_value_get_map_key(value, i);
+        FlValue *text = fl_value_get_map_value(value, i);
+        if (fl_value_get_type(key) != FL_VALUE_TYPE_STRING || fl_value_get_type(text) != FL_VALUE_TYPE_STRING)
+            throw ArgumentError("Expected string map entries.");
+        result[fl_value_get_string(key)] = fl_value_get_string(text);
     }
-  }
-  return out;
+    return result;
 }
 
-static std::vector<uint8_t> fl_to_uint8_vector(FlValue* value) {
-  std::vector<uint8_t> out;
-  if (value != nullptr && fl_value_get_type(value) == FL_VALUE_TYPE_UINT8_LIST) {
-    const uint8_t* d = fl_value_get_uint8_list(value);
-    size_t n = fl_value_get_length(value);
-    out.assign(d, d + n);
-  }
-  return out;
+// Returns the call's own byte list. Use it before the handler returns; a worker
+// must never ref or unref it, since FlValue reference counts are not atomic.
+static FlValue *bytes_argument(FlValue *args, const char *name, const Check &check = {}) {
+    FlValue *value = lookup(args, name);
+    if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_UINT8_LIST)
+        reject(check, "Expected byte array.");
+    return value;
+}
+
+// Like Windows and the ObjC isValidPositiveNumber gate: a non-positive
+// waitTimeout selects the default.
+static int resolve_timeout(FlValue *args) {
+    const int fallback = ffmpegkit::AbstractSession::DefaultTimeoutForAsynchronousMessagesInTransmit;
+    const int wait = optional_int_argument(args, "waitTimeout", fallback);
+    return wait > 0 ? wait : fallback;
 }
 
 // All response builders return a newly-owned FlMethodResponse. The caller
@@ -480,8 +499,12 @@ static FlMethodResponse* resp_bool(bool v) {
 static FlMethodResponse* resp_null() {
   return resp_take_value(fl_value_new_null());
 }
+// Native exception text can carry raw bytes; the codec requires UTF-8.
 static FlMethodResponse* resp_error(const char* code, const char* message) {
-  return FL_METHOD_RESPONSE(fl_method_error_response_new(code, message, nullptr));
+    gchar *valid = message != nullptr ? g_utf8_make_valid(message, -1) : nullptr;
+    FlMethodResponse *response = FL_METHOD_RESPONSE(fl_method_error_response_new(code, valid, nullptr));
+    g_free(valid);
+    return response;
 }
 static FlMethodResponse* resp_session_not_found() {
   return resp_error("SESSION_NOT_FOUND", "Session not found.");
@@ -491,14 +514,11 @@ static FlMethodResponse* resp_not_supported() {
 }
 
 static std::shared_ptr<ffmpegkit::Session> get_session(FfmpegKitNextFlutterPlugin *self, FlValue *args) {
-    gboolean found = FALSE;
-    int64_t id = get_int_argument(args, "sessionId", &found);
-    if (!found)
-        return nullptr;
-    auto session = ffmpegkit::FFmpegKitConfig::getSession(static_cast<long>(id));
+    const long id = int_argument(args, "sessionId", kInvalidSession);
+    auto session = ffmpegkit::FFmpegKitConfig::getSession(id);
     if (session)
         return session;
-    auto found_session = self->shutdown_sessions->find(static_cast<long>(id));
+    auto found_session = self->shutdown_sessions->find(id);
     return found_session == self->shutdown_sessions->end() ? nullptr : found_session->second;
 }
 
@@ -520,7 +540,7 @@ static gboolean emit_on_main(gpointer user_data) {
     if (state && !state->executions->IsStopping()) {
         auto *self = static_cast<FfmpegKitNextFlutterPlugin *>(g_weak_ref_get(&state->plugin));
         if (self) {
-            if (self->listening && (data->kind != 1 || self->logs_enabled) && (data->kind != 2 || self->statistics_enabled))
+            if (self->listening && (data->kind != 1 || state->logs_enabled) && (data->kind != 2 || state->statistics_enabled))
                 fl_event_channel_send(self->event_channel, data->event, nullptr, nullptr);
             g_object_unref(self);
         }
@@ -538,15 +558,21 @@ static void post_event(const std::weak_ptr<PluginData> &weak, FlValue *event, in
     g_idle_add(emit_on_main, new EmitData{weak, event, kind});
 }
 
-static void post_event(FfmpegKitNextFlutterPlugin *self, FlValue *event) { post_event(*self->state, event); }
+static void emit_log(const std::weak_ptr<PluginData> &weak, const std::shared_ptr<ffmpegkit::Log> &log) {
+    auto state = weak.lock();
+    if (state && state->logs_enabled)
+        post_event(weak, to_event_map(EVENT_LOG_CALLBACK_EVENT, to_log_map(log)), 1);
+}
 
-static void emit_log(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Log> &log) { post_event(state, to_event_map(EVENT_LOG_CALLBACK_EVENT, to_log_map(log)), 1); }
-
-static void emit_statistics(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Statistics> &statistics) { post_event(state, to_event_map(EVENT_STATISTICS_CALLBACK_EVENT, to_statistics_map(statistics)), 2); }
+static void emit_statistics(const std::weak_ptr<PluginData> &weak, const std::shared_ptr<ffmpegkit::Statistics> &statistics) {
+    auto state = weak.lock();
+    if (state && state->statistics_enabled)
+        post_event(weak, to_event_map(EVENT_STATISTICS_CALLBACK_EVENT, to_statistics_map(statistics)), 2);
+}
 
 static void emit_session(const std::weak_ptr<PluginData> &state, const std::shared_ptr<ffmpegkit::Session> &session) {
     if (auto current = state.lock())
-        current->FinishAsync(session->getSessionId());
+        current->executions->FinishAsync(session->getSessionId());
     post_event(state, to_event_map(EVENT_COMPLETE_CALLBACK_EVENT, to_session_map(session)));
 }
 
@@ -574,59 +600,36 @@ static long stream_id(const std::string &url) {
 // Deferred (asynchronous) responses
 // ---------------------------------------------------------------------------
 
-class PendingResponse {
-  public:
-    explicit PendingResponse(FlMethodCall *call) : call_(static_cast<FlMethodCall *>(g_object_ref(call))) {}
-    ~PendingResponse() {
-        if (call_)
-            g_object_unref(call_);
-    }
-    // Invoked only on the platform thread, including channel teardown. Workers
-    // enqueue a response; they never call Flutter or release its call object.
-    void Complete(FlMethodResponse *response) {
-        if (call_) {
-            fl_method_call_respond(call_, response, nullptr);
-            g_object_unref(call_);
-            call_ = nullptr;
-        }
-        g_object_unref(response);
-    }
-    bool IsComplete() const { return call_ == nullptr; }
-
-  private:
-    FlMethodCall *call_;
-};
-
 struct DeferredResponse {
     std::shared_ptr<PluginData> state;
     std::shared_ptr<PendingResponse> pending;
     FlMethodResponse *response;
 };
 
-static void prune_responses(const std::shared_ptr<PluginData> &state) {
-    auto &pending = state->pending;
-    pending.erase(std::remove_if(pending.begin(), pending.end(), [](const std::shared_ptr<PendingResponse> &response) { return response->IsComplete(); }), pending.end());
-}
-
 static gboolean deliver_response(gpointer user_data) {
     std::unique_ptr<DeferredResponse> data(static_cast<DeferredResponse *>(user_data));
     data->pending->Complete(data->response);
-    prune_responses(data->state);
+    data->state->executions->PrunePendingResponses();
     return G_SOURCE_REMOVE;
 }
 
 static void respond_later(const std::shared_ptr<PluginData> &state, const std::shared_ptr<PendingResponse> &pending, FlMethodResponse *response) { g_idle_add(deliver_response, new DeferredResponse{state, pending, response}); }
 
-static FlMethodResponse *enqueue_call(FfmpegKitNextFlutterPlugin *self, FlMethodCall *call, std::function<FlMethodResponse *()> execute, std::function<void()> cancel = {}) {
+// Runs execute on a detached worker. Tracked work holds a lease, so teardown
+// cancels it and waits; untracked work (shutdown) is only answered by teardown.
+// execute is moved, never copied, into the worker.
+template <typename Execute> static FlMethodResponse *enqueue_call(FfmpegKitNextFlutterPlugin *self, FlMethodCall *call, Execute execute, std::function<void()> cancel = {}, bool tracked = true) {
     auto state = *self->state;
-    if (state->executions->IsStopping())
-        return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
     auto pending = std::make_shared<PendingResponse>(call);
-    state->pending.push_back(pending);
+    if (!state->executions->AddPendingResponse(pending))
+        return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
     try {
-        std::thread([state, pending, execute, cancel]() {
-            auto lease = state->executions->TryStart(cancel);
-            if (!lease) {
+        std::thread([state, pending, execute = std::move(execute), cancel, tracked]() {
+            std::shared_ptr<ffmpeg_kit_linux::PluginState::Lease> lease;
+            if (!tracked) {
+                if (state->executions->IsStopping())
+                    return;
+            } else if (!(lease = state->executions->TryStart(cancel))) {
                 respond_later(state, pending, resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down."));
                 return;
             }
@@ -640,22 +643,22 @@ static FlMethodResponse *enqueue_call(FfmpegKitNextFlutterPlugin *self, FlMethod
         }).detach();
     } catch (const std::exception &error) {
         pending->Complete(resp_error("EXECUTION_FAILED", error.what()));
-        prune_responses(state);
+        state->executions->PrunePendingResponses();
     }
     return nullptr;
 }
 
 template <typename SessionType, typename Submit> static FlMethodResponse *enqueue_async_execution(FfmpegKitNextFlutterPlugin *self, const std::shared_ptr<SessionType> &session, Submit submit) {
     auto state = *self->state;
-    if (!state->TrackAsync(session))
+    if (!state->executions->TrackAsync(session))
         return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
     try {
         submit();
         if (ffmpegkit::FFmpegKitConfig::isShutdown() && session->getState() == ffmpegkit::SessionStateFailed)
-            state->FinishAsync(session->getSessionId());
+            state->executions->FinishAsync(session->getSessionId());
         return resp_null();
     } catch (const std::exception &error) {
-        state->FinishAsync(session->getSessionId());
+        state->executions->FinishAsync(session->getSessionId());
         return resp_error("EXECUTION_FAILED", error.what());
     }
 }
@@ -673,26 +676,33 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
         return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
     const gchar *m = fl_method_call_get_name(call);
     FlValue *args = fl_method_call_get_args(call);
+    if (args != nullptr && fl_value_get_type(args) != FL_VALUE_TYPE_NULL && fl_value_get_type(args) != FL_VALUE_TYPE_MAP)
+        throw ArgumentError("Expected arguments map.");
 
     // -- Abstract session accessors --------------------------------------------
     if (g_strcmp0(m, "shutdown") == 0) {
-        gboolean found = FALSE;
-        int64_t wait = get_int_argument(args, "waitTimeout", &found);
-        if (!found || wait < INT32_MIN || wait > INT32_MAX)
-            return resp_error("INVALID_ARGUMENTS", "waitTimeout must be a signed 32-bit integer.");
+        const int wait = int_argument(args, "waitTimeout", kInvalidShutdownTimeout);
         self->retain_shutdown_sessions = TRUE;
         auto sessions = ffmpegkit::FFmpegKitConfig::getSessions();
         if (sessions)
             for (const auto &session : *sessions)
                 (*self->shutdown_sessions)[session->getSessionId()] = session;
-        return enqueue_call(self, call, [wait]() {
-            try {
-                return resp_bool(ffmpegkit::FFmpegKitConfig::shutdown(static_cast<int>(wait)));
-            } catch (const std::exception &error) {
-                return resp_error("SHUTDOWN_FAILED", error.what());
-            }
-        });
-    } else if (g_strcmp0(m, "isShutdown") == 0) {
+        // Untracked, as on Windows: shutdown(-1) cannot be cancelled and must not
+        // hold teardown. Teardown still answers the pending reply.
+        return enqueue_call(
+            self, call,
+            [wait]() {
+                try {
+                    return resp_bool(ffmpegkit::FFmpegKitConfig::shutdown(wait));
+                } catch (const std::exception &error) {
+                    return resp_error("SHUTDOWN_FAILED", error.what());
+                }
+            },
+            {}, false);
+    }
+    // Like Windows, every other method validates an optional waitTimeout first.
+    const int timeout = resolve_timeout(args);
+    if (g_strcmp0(m, "isShutdown") == 0) {
         return resp_bool(ffmpegkit::FFmpegKitConfig::isShutdown());
     } else if (g_strcmp0(m, "abstractSessionGetEndTime") == 0) {
         auto session = get_session(self, args);
@@ -712,7 +722,8 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
         auto session = get_session(self, args);
         if (session == nullptr)
             return resp_session_not_found();
-        return resp_take_value(to_log_list_value(session->getAllLogsWithTimeout(resolve_timeout(args))));
+        // The wait is bounded by timeout, so the lease needs no cancel.
+        return enqueue_call(self, call, [session, timeout]() { return resp_take_value(to_log_list_value(session->getAllLogsWithTimeout(timeout))); });
     } else if (g_strcmp0(m, "abstractSessionGetLogs") == 0) {
         auto session = get_session(self, args);
         if (session == nullptr)
@@ -722,7 +733,7 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
         auto session = get_session(self, args);
         if (session == nullptr)
             return resp_session_not_found();
-        return resp_utf8_string(session->getAllLogsAsStringWithTimeout(resolve_timeout(args)));
+        return enqueue_call(self, call, [session, timeout]() { return resp_utf8_string(session->getAllLogsAsStringWithTimeout(timeout)); });
     } else if (g_strcmp0(m, "abstractSessionGetState") == 0) {
         auto session = get_session(self, args);
         if (session == nullptr)
@@ -759,555 +770,531 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     return resp_bool(ffmpegkit::FFmpegKitConfig::isLTSBuild());
 #pragma GCC diagnostic pop
-  } else if (g_strcmp0(m, "getBuildDate") == 0) {
-      return resp_string(ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
-  } else if (g_strcmp0(m, "getPackageName") == 0) {
-      return resp_string(ffmpegkit::Packages::getPackageName().c_str());
-  } else if (g_strcmp0(m, "getExternalLibraries") == 0) {
-      FlValue *list = fl_value_new_list();
-      auto libraries = ffmpegkit::Packages::getExternalLibraries();
-      if (libraries != nullptr) {
-          for (const auto &name : *libraries) {
-              fl_value_append_take(list, fl_value_new_string(name.c_str()));
-          }
-      }
-      return resp_take_value(list);
+    } else if (g_strcmp0(m, "getBuildDate") == 0) {
+        return resp_string(ffmpegkit::FFmpegKitConfig::getBuildDate().c_str());
+    } else if (g_strcmp0(m, "getPackageName") == 0) {
+        return resp_string(ffmpegkit::Packages::getPackageName().c_str());
+    } else if (g_strcmp0(m, "getExternalLibraries") == 0) {
+        FlValue *list = fl_value_new_list();
+        auto libraries = ffmpegkit::Packages::getExternalLibraries();
+        if (libraries != nullptr) {
+            for (const auto &name : *libraries) {
+                fl_value_append_take(list, fl_value_new_string(name.c_str()));
+            }
+        }
+        return resp_take_value(list);
 
-      // -- Session creation -----------------------------------------------------
-  } else if (g_strcmp0(m, "ffmpegSession") == 0) {
-      auto session = ffmpegkit::FFmpegSession::create(
-          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFmpegSession> s) { emit_session(state, s); }, [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); },
-          [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Statistics> s) { emit_statistics(state, s); });
-      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
-          (*self->shutdown_sessions)[session->getSessionId()] = session;
-      return resp_take_value(to_session_map(session));
-  } else if (g_strcmp0(m, "ffprobeSession") == 0) {
-      auto session = ffmpegkit::FFprobeSession::create(
-          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFprobeSession> s) { emit_session(state, s); }, [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
-      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
-          (*self->shutdown_sessions)[session->getSessionId()] = session;
-      return resp_take_value(to_session_map(session));
-  } else if (g_strcmp0(m, "mediaInformationSession") == 0) {
-      auto session = ffmpegkit::MediaInformationSession::create(
-          fl_to_string_list(lookup(args, "arguments")), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::MediaInformationSession> s) { emit_session(state, s); },
-          [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
-      if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
-          (*self->shutdown_sessions)[session->getSessionId()] = session;
-      return resp_take_value(to_session_map(session));
+        // -- Session creation -----------------------------------------------------
+    } else if (g_strcmp0(m, "ffmpegSession") == 0) {
+        auto session = ffmpegkit::FFmpegSession::create(
+            strings_argument(args, "arguments", kInvalidArgumentsArray), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFmpegSession> s) { emit_session(state, s); },
+            [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); }, [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Statistics> s) { emit_statistics(state, s); });
+        if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+            (*self->shutdown_sessions)[session->getSessionId()] = session;
+        return resp_take_value(to_session_map(session));
+    } else if (g_strcmp0(m, "ffprobeSession") == 0) {
+        auto session = ffmpegkit::FFprobeSession::create(
+            strings_argument(args, "arguments", kInvalidArgumentsArray), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::FFprobeSession> s) { emit_session(state, s); },
+            [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
+        if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+            (*self->shutdown_sessions)[session->getSessionId()] = session;
+        return resp_take_value(to_session_map(session));
+    } else if (g_strcmp0(m, "mediaInformationSession") == 0) {
+        auto session = ffmpegkit::MediaInformationSession::create(
+            strings_argument(args, "arguments", kInvalidArgumentsArray), [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::MediaInformationSession> s) { emit_session(state, s); },
+            [state = std::weak_ptr<PluginData>(*self->state)](std::shared_ptr<ffmpegkit::Log> log) { emit_log(state, log); });
+        if (self->retain_shutdown_sessions || ffmpegkit::FFmpegKitConfig::isShutdown())
+            (*self->shutdown_sessions)[session->getSessionId()] = session;
+        return resp_take_value(to_session_map(session));
 
-      // -- FFmpeg statistics accessors -----------------------------------------
-  } else if (g_strcmp0(m, "ffmpegSessionGetAllStatistics") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFmpeg())
-          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
-                                                  "type.");
-      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-      return resp_take_value(to_statistics_list_value(ffmpeg_session->getAllStatisticsWithTimeout(resolve_timeout(args))));
-  } else if (g_strcmp0(m, "ffmpegSessionGetStatistics") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFmpeg())
-          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
-                                                  "type.");
-      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-      return resp_take_value(to_statistics_list_value(ffmpeg_session->getStatistics()));
+        // -- FFmpeg statistics accessors -----------------------------------------
+    } else if (g_strcmp0(m, "ffmpegSessionGetAllStatistics") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFmpeg())
+            return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                    "type.");
+        auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+        return enqueue_call(self, call, [ffmpeg_session, timeout]() { return resp_take_value(to_statistics_list_value(ffmpeg_session->getAllStatisticsWithTimeout(timeout))); });
+    } else if (g_strcmp0(m, "ffmpegSessionGetStatistics") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFmpeg())
+            return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                    "type.");
+        auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+        return resp_take_value(to_statistics_list_value(ffmpeg_session->getStatistics()));
 
-      // -- Media information ----------------------------------------------------
-  } else if (g_strcmp0(m, "getMediaInformation") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isMediaInformation())
-          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
-                                                             "type.");
-      auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-      return resp_take_value(to_media_information_map(media_information_session->getMediaInformation()));
-  } else if (g_strcmp0(m, "mediaInformationJsonParserFrom") == 0) {
-      const gchar *json = get_string_argument(args, "ffprobeJsonOutput");
-      try {
-          auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
-          return resp_take_value(to_media_information_map(media_information));
-      } catch (const std::exception &) {
-          return resp_null();
-      }
-  } else if (g_strcmp0(m, "mediaInformationJsonParserFromWithError") == 0) {
-      const gchar *json = get_string_argument(args, "ffprobeJsonOutput");
-      try {
-          auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json ? json : "");
-          return resp_take_value(to_media_information_map(media_information));
-      } catch (const std::exception &) {
-          return resp_error("PARSE_FAILED", "Parsing MediaInformation failed with JSON error.");
-      }
+        // -- Media information ----------------------------------------------------
+    } else if (g_strcmp0(m, "getMediaInformation") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isMediaInformation())
+            return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                               "type.");
+        auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+        return resp_take_value(to_media_information_map(media_information_session->getMediaInformation()));
+    } else if (g_strcmp0(m, "mediaInformationJsonParserFrom") == 0) {
+        const std::string json = string_argument(args, "ffprobeJsonOutput", kInvalidFfprobeJsonOutput);
+        try {
+            auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json);
+            return resp_take_value(to_media_information_map(media_information));
+        } catch (const std::exception &) {
+            return resp_null();
+        }
+    } else if (g_strcmp0(m, "mediaInformationJsonParserFromWithError") == 0) {
+        const std::string json = string_argument(args, "ffprobeJsonOutput", kInvalidFfprobeJsonOutput);
+        try {
+            auto media_information = ffmpegkit::MediaInformationJsonParser::fromWithError(json);
+            return resp_take_value(to_media_information_map(media_information));
+        } catch (const std::exception &) {
+            return resp_error("PARSE_FAILED", "Parsing MediaInformation failed with JSON error.");
+        }
 
-      // -- Redirection / logging toggles ---------------------------------------
-  } else if (g_strcmp0(m, "enableRedirection") == 0) {
-      self->logs_enabled = TRUE;
-      self->statistics_enabled = TRUE;
-      ffmpegkit::FFmpegKitConfig::enableRedirection();
-      return resp_null();
-  } else if (g_strcmp0(m, "disableRedirection") == 0) {
-      ffmpegkit::FFmpegKitConfig::disableRedirection();
-      return resp_null();
-  } else if (g_strcmp0(m, "enableLogs") == 0) {
-      self->logs_enabled = TRUE;
-      return resp_null();
-  } else if (g_strcmp0(m, "disableLogs") == 0) {
-      self->logs_enabled = FALSE;
-      return resp_null();
-  } else if (g_strcmp0(m, "enableStatistics") == 0) {
-      self->statistics_enabled = TRUE;
-      return resp_null();
-  } else if (g_strcmp0(m, "disableStatistics") == 0) {
-      self->statistics_enabled = FALSE;
-      return resp_null();
+        // -- Redirection / logging toggles ---------------------------------------
+    } else if (g_strcmp0(m, "enableRedirection") == 0) {
+        (*self->state)->logs_enabled = true;
+        (*self->state)->statistics_enabled = true;
+        ffmpegkit::FFmpegKitConfig::enableRedirection();
+        return resp_null();
+    } else if (g_strcmp0(m, "disableRedirection") == 0) {
+        ffmpegkit::FFmpegKitConfig::disableRedirection();
+        return resp_null();
+    } else if (g_strcmp0(m, "enableLogs") == 0) {
+        (*self->state)->logs_enabled = true;
+        return resp_null();
+    } else if (g_strcmp0(m, "disableLogs") == 0) {
+        (*self->state)->logs_enabled = false;
+        return resp_null();
+    } else if (g_strcmp0(m, "enableStatistics") == 0) {
+        (*self->state)->statistics_enabled = true;
+        return resp_null();
+    } else if (g_strcmp0(m, "disableStatistics") == 0) {
+        (*self->state)->statistics_enabled = false;
+        return resp_null();
 
-      // -- Fontconfig -----------------------------------------------------------
-  } else if (g_strcmp0(m, "setFontconfigConfigurationPath") == 0) {
-      const gchar *path = get_string_argument(args, "path");
-      if (path != nullptr)
-          ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(path);
-      return resp_null();
-  } else if (g_strcmp0(m, "setFontDirectory") == 0) {
-      const gchar *dir = get_string_argument(args, "fontDirectory");
-      ffmpegkit::FFmpegKitConfig::setFontDirectory(dir ? dir : "", fl_to_string_map(lookup(args, "fontNameMap")));
-      return resp_null();
-  } else if (g_strcmp0(m, "setFontDirectoryList") == 0) {
-      ffmpegkit::FFmpegKitConfig::setFontDirectoryList(fl_to_string_list(lookup(args, "fontDirectoryList")), fl_to_string_map(lookup(args, "fontNameMap")));
-      return resp_null();
+        // -- Fontconfig -----------------------------------------------------------
+    } else if (g_strcmp0(m, "setFontconfigConfigurationPath") == 0) {
+        ffmpegkit::FFmpegKitConfig::setFontconfigConfigurationPath(string_argument(args, "path", kInvalidPath));
+        return resp_null();
+        // Like mobile, the specific check runs before the unvalidated font map.
+    } else if (g_strcmp0(m, "setFontDirectory") == 0) {
+        const std::string directory = string_argument(args, "fontDirectory", kInvalidFontDirectory);
+        ffmpegkit::FFmpegKitConfig::setFontDirectory(directory, mapping_argument(args, "fontNameMap"));
+        return resp_null();
+    } else if (g_strcmp0(m, "setFontDirectoryList") == 0) {
+        const auto directories = strings_argument(args, "fontDirectoryList", kInvalidFontDirectoryList);
+        ffmpegkit::FFmpegKitConfig::setFontDirectoryList(directories, mapping_argument(args, "fontNameMap"));
+        return resp_null();
 
-      // -- Pipes ----------------------------------------------------------------
-  } else if (g_strcmp0(m, "registerNewFFmpegPipe") == 0) {
+        // -- Pipes ----------------------------------------------------------------
+    } else if (g_strcmp0(m, "registerNewFFmpegPipe") == 0) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     auto pipe = ffmpegkit::FFmpegKitConfig::registerNewFFmpegPipe();
 #pragma GCC diagnostic pop
     return resp_string(pipe ? pipe->c_str() : nullptr);
-  } else if (g_strcmp0(m, "closeFFmpegPipe") == 0) {
-      const gchar *pipe = get_string_argument(args, "ffmpegPipePath");
+    } else if (g_strcmp0(m, "closeFFmpegPipe") == 0) {
+        const std::string pipe = string_argument(args, "ffmpegPipePath", kInvalidPipePath);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (pipe != nullptr) ffmpegkit::FFmpegKitConfig::closeFFmpegPipe(pipe);
+        ffmpegkit::FFmpegKitConfig::closeFFmpegPipe(pipe);
 #pragma GCC diagnostic pop
     return resp_null();
 
     // -- Environment / signals ------------------------------------------------
-  } else if (g_strcmp0(m, "setEnvironmentVariable") == 0) {
-      const gchar *name = get_string_argument(args, "variableName");
-      const gchar *value = get_string_argument(args, "variableValue");
-      if (name != nullptr && value != nullptr)
-          ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(name, value);
-      return resp_null();
-  } else if (g_strcmp0(m, "ignoreSignal") == 0) {
-      gboolean found = FALSE;
-      int64_t idx = get_int_argument(args, "signal", &found);
-      if (!found || idx < 0 || idx > 4)
-          return resp_error("INVALID_SIGNAL", "Signal value not supported.");
-      ffmpegkit::Signal signal_value;
-      switch (idx) {
-      case 0: signal_value = ffmpegkit::SignalInt; break;
-      case 1: signal_value = ffmpegkit::SignalQuit; break;
-      case 2: signal_value = ffmpegkit::SignalPipe; break;
-      case 3: signal_value = ffmpegkit::SignalTerm; break;
-      default: signal_value = ffmpegkit::SignalXcpu; break;
+    } else if (g_strcmp0(m, "setEnvironmentVariable") == 0) {
+        // Like mobile, a bad value wins over a bad name.
+        const std::string value = string_argument(args, "variableValue", kInvalidVariableValue);
+        const std::string name = string_argument(args, "variableName", kInvalidVariableName);
+        ffmpegkit::FFmpegKitConfig::setEnvironmentVariable(name, value);
+        return resp_null();
+    } else if (g_strcmp0(m, "ignoreSignal") == 0) {
+        const int idx = int_argument(args, "signal", kInvalidSignal);
+        if (idx < 0 || idx > 4)
+            return resp_error("INVALID_SIGNAL", "Signal value not supported.");
+        ffmpegkit::Signal signal_value;
+        switch (idx) {
+        case 0:
+            signal_value = ffmpegkit::SignalInt;
+            break;
+        case 1:
+            signal_value = ffmpegkit::SignalQuit;
+            break;
+        case 2:
+            signal_value = ffmpegkit::SignalPipe;
+            break;
+        case 3:
+            signal_value = ffmpegkit::SignalTerm;
+            break;
+        default:
+            signal_value = ffmpegkit::SignalXcpu;
+            break;
+        }
+        ffmpegkit::FFmpegKitConfig::ignoreSignal(signal_value);
+        return resp_null();
+
+        // -- Synchronous (background) execution -----------------------------------
+    } else if (g_strcmp0(m, "ffmpegSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFmpeg())
+            return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                    "type.");
+        auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+        return enqueue_call(
+            self, call,
+            [ffmpeg_session]() {
+                ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
+                return resp_null();
+            },
+            [ffmpeg_session] { ffmpeg_session->cancel(); });
+    } else if (g_strcmp0(m, "ffprobeSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFprobe())
+            return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
+                                                     "type.");
+        auto ffprobe_session = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
+        return enqueue_call(
+            self, call,
+            [ffprobe_session]() {
+                ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
+                return resp_null();
+            },
+            [ffprobe_session] { ffprobe_session->cancel(); });
+    } else if (g_strcmp0(m, "mediaInformationSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isMediaInformation())
+            return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                               "type.");
+        auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+        return enqueue_call(
+            self, call,
+            [media_information_session, timeout]() {
+                ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(media_information_session, timeout);
+                return resp_null();
+            },
+            [media_information_session] { media_information_session->cancel(); });
+
+        // -- Asynchronous execution (returns immediately) -------------------------
+    } else if (g_strcmp0(m, "asyncFFmpegSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFmpeg())
+            return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
+                                                    "type.");
+        auto typed = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
+        return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(typed); });
+    } else if (g_strcmp0(m, "asyncFFprobeSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isFFprobe())
+            return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
+                                                     "type.");
+        auto typed = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
+        return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(typed); });
+    } else if (g_strcmp0(m, "asyncMediaInformationSessionExecute") == 0) {
+        auto session = get_session(self, args);
+        if (session == nullptr)
+            return resp_session_not_found();
+        if (!session->isMediaInformation())
+            return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
+                                                               "type.");
+        auto typed = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
+        return enqueue_async_execution(self, typed, [typed, timeout] { ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(typed, timeout); });
+
+        // -- Log level / history / redirection strategy --------------------------
+    } else if (g_strcmp0(m, "getLogLevel") == 0) {
+        return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogLevel()));
+    } else if (g_strcmp0(m, "setLogLevel") == 0) {
+        ffmpegkit::FFmpegKitConfig::setLogLevel(static_cast<ffmpegkit::Level>(int_argument(args, "level", kInvalidLevel)));
+        return resp_null();
+    } else if (g_strcmp0(m, "getSessionHistorySize") == 0) {
+        return resp_int(ffmpegkit::FFmpegKitConfig::getSessionHistorySize());
+    } else if (g_strcmp0(m, "setSessionHistorySize") == 0) {
+        ffmpegkit::FFmpegKitConfig::setSessionHistorySize(int_argument(args, "sessionHistorySize", kInvalidSize));
+        return resp_null();
+    } else if (g_strcmp0(m, "getLogRedirectionStrategy") == 0) {
+        return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy()));
+    } else if (g_strcmp0(m, "setLogRedirectionStrategy") == 0) {
+        const int strategy = int_argument(args, "strategy", kInvalidLogRedirectionStrategy);
+        if (strategy < 0 || strategy > 4)
+            return resp_error("INVALID_LOG_REDIRECTION_STRATEGY", "Log redirection strategy value not supported.");
+        ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(static_cast<ffmpegkit::LogRedirectionStrategy>(strategy));
+        return resp_null();
+    } else if (g_strcmp0(m, "messagesInTransmit") == 0) {
+        return resp_int(ffmpegkit::FFmpegKitConfig::messagesInTransmit(int_argument(args, "sessionId", kInvalidSession)));
+    } else if (g_strcmp0(m, "printLoadConfirmation") == 0) {
+        static gboolean logged = FALSE;
+        if (!logged) {
+            logged = TRUE;
+            const std::string packageName = ffmpegkit::Packages::getPackageName();
+            const std::string packageNamePart = packageName.empty() ? "" : packageName + "-";
+            g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart.c_str(), FFMPEG_KIT_PLATFORM_NAME, ffmpegkit::ArchDetect::getArch().c_str(), ffmpegkit::FFmpegKitConfig::getVersion().c_str());
+        }
+        return resp_null();
+
+        // -- Session registry queries --------------------------------------------
+    } else if (g_strcmp0(m, "getSession") == 0) {
+        return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getSession(int_argument(args, "sessionId", kInvalidSession))));
+    } else if (g_strcmp0(m, "getLastSession") == 0) {
+        return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastSession()));
+    } else if (g_strcmp0(m, "getLastCompletedSession") == 0) {
+        return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastCompletedSession()));
+    } else if (g_strcmp0(m, "getSessions") == 0) {
+        return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessions()));
+    } else if (g_strcmp0(m, "clearSessions") == 0) {
+        ffmpegkit::FFmpegKitConfig::clearSessions();
+        self->shutdown_sessions->clear();
+        return resp_null();
+    } else if (g_strcmp0(m, "deleteSession") == 0) {
+        const long id = int_argument(args, "sessionId", kInvalidSession);
+        ffmpegkit::FFmpegKitConfig::deleteSession(id);
+        self->shutdown_sessions->erase(id);
+        return resp_null();
+    } else if (g_strcmp0(m, "getSessionsByState") == 0) {
+        const int state = int_argument(args, "state", kInvalidSessionState);
+        if (state < 0 || state > 3)
+            return resp_error("INVALID_SESSION_STATE", "Session state value not supported.");
+        return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessionsByState(static_cast<ffmpegkit::SessionState>(state))));
+    } else if (g_strcmp0(m, "getFFmpegSessions") == 0) {
+        return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKit::listSessions()));
+    } else if (g_strcmp0(m, "getFFprobeSessions") == 0) {
+        return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listFFprobeSessions()));
+    } else if (g_strcmp0(m, "getMediaInformationSessions") == 0) {
+        return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listMediaInformationSessions()));
+
+        // -- Cancellation ---------------------------------------------------------
+    } else if (g_strcmp0(m, "cancel") == 0) {
+        ffmpegkit::FFmpegKit::cancel();
+        return resp_null();
+    } else if (g_strcmp0(m, "cancelSession") == 0) {
+        ffmpegkit::FFmpegKit::cancel(int_argument(args, "sessionId", kInvalidSession));
+        return resp_null();
+
+        // -- Packages -------------------------------------------------------------
+        // (getPackageName / getExternalLibraries handled above.)
+
+        // -- writeToPipe (background file copy) -----------------------------------
+    } else if (g_strcmp0(m, "writeToPipe") == 0) {
+        // Like Android and iOS, a bad pipe wins over a bad input.
+        const std::string pipe_path = string_argument(args, "pipe", kInvalidPipe);
+        const std::string input_path = string_argument(args, "input", kInvalidInput);
+        auto state = *self->state;
+        return enqueue_call(self, call, [state, input_path, pipe_path]() {
+            std::unique_ptr<FILE, decltype(&fclose)> input(fopen(input_path.c_str(), "rb"), fclose);
+            if (!input)
+                return resp_error("COPY_FAILED", "Failed to open file.");
+            int output = -1;
+            while (!state->executions->IsStopping()) {
+                output = open(pipe_path.c_str(), O_WRONLY | O_NONBLOCK | O_CREAT | O_TRUNC, 0666);
+                if (output >= 0)
+                    break;
+                if (errno != ENXIO && errno != EINTR)
+                    return resp_error("COPY_FAILED", "Failed to open pipe.");
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (output < 0)
+                return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+            // An abandoned FIFO must fail this worker rather than terminate the
+            // process. Block SIGPIPE only here; preserve the process signal policy.
+            sigset_t blocked, previous, pending;
+            sigemptyset(&blocked);
+            sigaddset(&blocked, SIGPIPE);
+            sigpending(&pending);
+            const bool already_pending = sigismember(&pending, SIGPIPE);
+            pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+            char buffer[4096];
+            bool ok = true;
+            size_t count;
+            while (!state->executions->IsStopping() && (count = fread(buffer, 1, sizeof(buffer), input.get())) > 0) {
+                size_t offset = 0;
+                while (offset < count && !state->executions->IsStopping()) {
+                    ssize_t written = write(output, buffer + offset, count - offset);
+                    if (written > 0)
+                        offset += static_cast<size_t>(written);
+                    else if (written < 0 && (errno == EAGAIN || errno == EINTR))
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok)
+                    break;
+            }
+            ok = ok && !ferror(input.get());
+            close(output);
+            sigpending(&pending);
+            if (!already_pending && sigismember(&pending, SIGPIPE)) {
+                int signal_number;
+                sigwait(&blocked, &signal_number);
+            }
+            pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+            if (state->executions->IsStopping())
+                return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+            return ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed.");
+        });
+
+        // -- Android-only methods -> NOT_SUPPORTED --------------------------------
+    } else if (g_strcmp0(m, "selectDocument") == 0 || g_strcmp0(m, "getSafParameter") == 0 || g_strcmp0(m, "unregisterSafProtocolUrl") == 0 || g_strcmp0(m, "getSupportedCameraIds") == 0) {
+        return resp_not_supported();
+
+        // -- ffkit input buffer ---------------------------------------------------
+    } else if (g_strcmp0(m, "inputBufferFromByteArray") == 0) {
+        // Like mobile, the data check runs before the unvalidated extension. The
+        // buffer copies the call's bytes directly.
+        FlValue *data = bytes_argument(args, "data", kInvalidData);
+        const std::string extension = optional_string_argument(args, "extension");
+        auto input_buffer = ffmpegkit::FFmpegKitInputBuffer::fromBytes(fl_value_get_uint8_list(data), fl_value_get_length(data), extension);
+        std::string url = input_buffer->getUrl();
+        (*self->input_buffers)[url] = input_buffer;
+        return resp_string(url.c_str());
+    } else if (g_strcmp0(m, "inputBufferClose") == 0) {
+        auto it = self->input_buffers->find(string_argument(args, "url", kInvalidInputBufferUrl));
+        if (it != self->input_buffers->end()) {
+            it->second->close();
+            self->input_buffers->erase(it);
+        }
+        return resp_null();
+
+        // -- ffkit output buffer --------------------------------------------------
+    } else if (g_strcmp0(m, "outputBufferCreate") == 0) {
+        const std::string extension = optional_string_argument(args, "extension");
+        std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer> output_buffer;
+        if (lookup(args, "initialCapacity") && lookup(args, "maxCapacity")) {
+            const int initial = int_argument(args, "initialCapacity");
+            const int max = int_argument(args, "maxCapacity");
+            output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension, initial, max);
+        } else {
+            output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension);
+        }
+        std::string url = output_buffer->getUrl();
+        (*self->output_buffers)[url] = output_buffer;
+        return resp_string(url.c_str());
+    } else if (g_strcmp0(m, "outputBufferGetSize") == 0) {
+        auto it = self->output_buffers->find(string_argument(args, "url", kInvalidOutputBufferUrl));
+        if (it == self->output_buffers->end())
+            return resp_error("NOT_FOUND", "Output buffer not found.");
+        return resp_int(it->second->getSize());
+    } else if (g_strcmp0(m, "outputBufferToByteArray") == 0) {
+        auto it = self->output_buffers->find(string_argument(args, "url", kInvalidOutputBufferUrl));
+        if (it == self->output_buffers->end())
+            return resp_error("NOT_FOUND", "Output buffer not found.");
+        auto data = it->second->toByteArray();
+        if (data == nullptr)
+            return resp_take_value(fl_value_new_uint8_list(nullptr, 0));
+        return resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
+    } else if (g_strcmp0(m, "outputBufferClose") == 0) {
+        auto it = self->output_buffers->find(string_argument(args, "url", kInvalidOutputBufferUrl));
+        if (it != self->output_buffers->end()) {
+            it->second->close();
+            self->output_buffers->erase(it);
+        }
+        return resp_null();
+
+        // -- ffkit stream input ---------------------------------------------------
+    } else if (g_strcmp0(m, "streamInputCreate") == 0) {
+        const std::string extension = optional_string_argument(args, "extension");
+        std::shared_ptr<ffmpegkit::FFmpegKitStreamInput> stream_input;
+        if (lookup(args, "capacity")) {
+            stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension, int_argument(args, "capacity"));
+        } else {
+            stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension);
+        }
+        std::string url = stream_input->getUrl();
+        (*self->stream_inputs)[url] = stream_input;
+        return resp_string(url.c_str());
+    } else if (g_strcmp0(m, "streamInputWrite") == 0) {
+        // Like mobile, stream I/O validates every argument before the lookup.
+        const std::string url = string_argument(args, "url", kInvalidStreamInputArguments);
+        FlValue *bytes = bytes_argument(args, "data", kInvalidStreamInputArguments);
+        const bool timed = lookup(args, "timeoutMs") != nullptr;
+        const int timeout_ms = timed ? int_argument(args, "timeoutMs", kInvalidStreamInputArguments) : 0;
+        auto it = self->stream_inputs->find(url);
+        if (it == self->stream_inputs->end())
+            return resp_error("NOT_FOUND", "Stream input not found.");
+        auto stream_input = it->second;
+        const long stream = stream_id(it->first);
+        // The worker outlives the call's FlValue, so it owns its one copy.
+        const uint8_t *source = fl_value_get_uint8_list(bytes);
+        std::vector<uint8_t> data(source, source + fl_value_get_length(bytes));
+        return enqueue_call(
+            self, call,
+            [stream_input, data = std::move(data), timed, timeout_ms]() {
+                try {
+                    int written = timed ? stream_input->write(data, timeout_ms) : stream_input->write(data);
+                    return resp_int(written);
+                } catch (const std::exception &error) {
+                    return resp_error("STREAM_INPUT_WRITE_FAILED", error.what());
+                }
+            },
+            [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
+    } else if (g_strcmp0(m, "streamInputCloseInput") == 0) {
+        auto it = self->stream_inputs->find(string_argument(args, "url", kInvalidStreamInputUrl));
+        if (it != self->stream_inputs->end())
+            it->second->closeInput();
+        return resp_null();
+    } else if (g_strcmp0(m, "streamInputClose") == 0) {
+        auto it = self->stream_inputs->find(string_argument(args, "url", kInvalidStreamInputUrl));
+        if (it != self->stream_inputs->end()) {
+            it->second->close();
+            self->stream_inputs->erase(it);
+        }
+        return resp_null();
+
+        // -- ffkit stream output --------------------------------------------------
+    } else if (g_strcmp0(m, "streamOutputCreate") == 0) {
+        const std::string extension = optional_string_argument(args, "extension");
+        std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput> stream_output;
+        if (lookup(args, "capacity")) {
+            stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension, int_argument(args, "capacity"));
+        } else {
+            stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension);
+        }
+        std::string url = stream_output->getUrl();
+        (*self->stream_outputs)[url] = stream_output;
+        return resp_string(url.c_str());
+    } else if (g_strcmp0(m, "streamOutputRead") == 0) {
+        const std::string url = string_argument(args, "url", kInvalidStreamOutputArguments);
+        const int max_bytes = int_argument(args, "maxBytes", kInvalidStreamOutputArguments);
+        const bool timed = lookup(args, "timeoutMs") != nullptr;
+        const int timeout_ms = timed ? int_argument(args, "timeoutMs", kInvalidStreamOutputArguments) : 0;
+        auto it = self->stream_outputs->find(url);
+        if (it == self->stream_outputs->end())
+            return resp_error("NOT_FOUND", "Stream output not found.");
+        auto stream_output = it->second;
+        const long stream = stream_id(it->first);
+        return enqueue_call(
+            self, call,
+            [stream_output, max_bytes, timed, timeout_ms]() {
+                std::shared_ptr<std::vector<uint8_t>> data;
+                try {
+                    data = timed ? stream_output->read(max_bytes, timeout_ms) : stream_output->read(max_bytes);
+                } catch (const std::exception &error) {
+                    return resp_error("STREAM_OUTPUT_READ_FAILED", error.what());
+                }
+                return data == nullptr ? resp_null() : resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
+            },
+            [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
+    } else if (g_strcmp0(m, "streamOutputClose") == 0) {
+        auto it = self->stream_outputs->find(string_argument(args, "url", kInvalidStreamOutputUrl));
+        if (it != self->stream_outputs->end()) {
+            it->second->close();
+            self->stream_outputs->erase(it);
+        }
+        return resp_null();
     }
-    ffmpegkit::FFmpegKitConfig::ignoreSignal(signal_value);
-    return resp_null();
-
-    // -- Synchronous (background) execution -----------------------------------
-  } else if (g_strcmp0(m, "ffmpegSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFmpeg())
-          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
-                                                  "type.");
-      auto ffmpeg_session = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-      return enqueue_call(
-          self, call,
-          [ffmpeg_session]() {
-              ffmpegkit::FFmpegKitConfig::ffmpegExecute(ffmpeg_session);
-              return resp_null();
-          },
-          [ffmpeg_session] { ffmpeg_session->cancel(); });
-  } else if (g_strcmp0(m, "ffprobeSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFprobe())
-          return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
-                                                   "type.");
-      auto ffprobe_session = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
-      return enqueue_call(
-          self, call,
-          [ffprobe_session]() {
-              ffmpegkit::FFmpegKitConfig::ffprobeExecute(ffprobe_session);
-              return resp_null();
-          },
-          [ffprobe_session] { ffprobe_session->cancel(); });
-  } else if (g_strcmp0(m, "mediaInformationSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isMediaInformation())
-          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
-                                                             "type.");
-      auto media_information_session = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-      int timeout = resolve_timeout(args);
-      return enqueue_call(
-          self, call,
-          [media_information_session, timeout]() {
-              ffmpegkit::FFmpegKitConfig::getMediaInformationExecute(media_information_session, timeout);
-              return resp_null();
-          },
-          [media_information_session] { media_information_session->cancel(); });
-
-      // -- Asynchronous execution (returns immediately) -------------------------
-  } else if (g_strcmp0(m, "asyncFFmpegSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFmpeg())
-          return resp_error("NOT_FFMPEG_SESSION", "A session is found but it does not have the correct "
-                                                  "type.");
-      auto typed = std::static_pointer_cast<ffmpegkit::FFmpegSession>(session);
-      return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFmpegExecute(typed); });
-  } else if (g_strcmp0(m, "asyncFFprobeSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isFFprobe())
-          return resp_error("NOT_FFPROBE_SESSION", "A session is found but it does not have the correct "
-                                                   "type.");
-      auto typed = std::static_pointer_cast<ffmpegkit::FFprobeSession>(session);
-      return enqueue_async_execution(self, typed, [typed] { ffmpegkit::FFmpegKitConfig::asyncFFprobeExecute(typed); });
-  } else if (g_strcmp0(m, "asyncMediaInformationSessionExecute") == 0) {
-      auto session = get_session(self, args);
-      if (session == nullptr)
-          return resp_session_not_found();
-      if (!session->isMediaInformation())
-          return resp_error("NOT_MEDIA_INFORMATION_SESSION", "A session is found but it does not have the correct "
-                                                             "type.");
-      auto typed = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-      const int timeout = resolve_timeout(args);
-      return enqueue_async_execution(self, typed, [typed, timeout] { ffmpegkit::FFmpegKitConfig::asyncGetMediaInformationExecute(typed, timeout); });
-
-      // -- Log level / history / redirection strategy --------------------------
-  } else if (g_strcmp0(m, "getLogLevel") == 0) {
-      return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogLevel()));
-  } else if (g_strcmp0(m, "setLogLevel") == 0) {
-      gboolean found = FALSE;
-      int64_t level = get_int_argument(args, "level", &found);
-      if (found)
-          ffmpegkit::FFmpegKitConfig::setLogLevel(static_cast<ffmpegkit::Level>(level));
-      return resp_null();
-  } else if (g_strcmp0(m, "getSessionHistorySize") == 0) {
-      return resp_int(ffmpegkit::FFmpegKitConfig::getSessionHistorySize());
-  } else if (g_strcmp0(m, "setSessionHistorySize") == 0) {
-      gboolean found = FALSE;
-      int64_t size = get_int_argument(args, "sessionHistorySize", &found);
-      if (found)
-          ffmpegkit::FFmpegKitConfig::setSessionHistorySize(static_cast<int>(size));
-      return resp_null();
-  } else if (g_strcmp0(m, "getLogRedirectionStrategy") == 0) {
-      return resp_int(static_cast<int>(ffmpegkit::FFmpegKitConfig::getLogRedirectionStrategy()));
-  } else if (g_strcmp0(m, "setLogRedirectionStrategy") == 0) {
-      gboolean found = FALSE;
-      int64_t strategy = get_int_argument(args, "strategy", &found);
-      if (!found || strategy < 0 || strategy > 4)
-          return resp_error("INVALID_LOG_REDIRECTION_STRATEGY", "Log redirection strategy value not supported.");
-      ffmpegkit::FFmpegKitConfig::setLogRedirectionStrategy(static_cast<ffmpegkit::LogRedirectionStrategy>(strategy));
-      return resp_null();
-  } else if (g_strcmp0(m, "messagesInTransmit") == 0) {
-      gboolean found = FALSE;
-      int64_t id = get_int_argument(args, "sessionId", &found);
-      return resp_int(ffmpegkit::FFmpegKitConfig::messagesInTransmit(static_cast<long>(id)));
-  } else if (g_strcmp0(m, "printLoadConfirmation") == 0) {
-      static gboolean logged = FALSE;
-      if (!logged) {
-          logged = TRUE;
-          const std::string packageName = ffmpegkit::Packages::getPackageName();
-          const std::string packageNamePart = packageName.empty() ? "" : packageName + "-";
-          g_message("Loaded ffmpeg-kit-next-flutter-%s%s-%s-%s.", packageNamePart.c_str(), FFMPEG_KIT_PLATFORM_NAME, ffmpegkit::ArchDetect::getArch().c_str(), FFMPEG_KIT_LIBRARY_VERSION);
-      }
-      return resp_null();
-
-      // -- Session registry queries --------------------------------------------
-  } else if (g_strcmp0(m, "getSession") == 0) {
-      gboolean found = FALSE;
-      auto id = get_int_argument(args, "sessionId", &found);
-      auto session = found ? ffmpegkit::FFmpegKitConfig::getSession(static_cast<long>(id)) : nullptr;
-      return resp_take_value(to_session_map(session));
-  } else if (g_strcmp0(m, "getLastSession") == 0) {
-      return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastSession()));
-  } else if (g_strcmp0(m, "getLastCompletedSession") == 0) {
-      return resp_take_value(to_session_map(ffmpegkit::FFmpegKitConfig::getLastCompletedSession()));
-  } else if (g_strcmp0(m, "getSessions") == 0) {
-      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessions()));
-  } else if (g_strcmp0(m, "clearSessions") == 0) {
-      ffmpegkit::FFmpegKitConfig::clearSessions();
-      self->shutdown_sessions->clear();
-      return resp_null();
-  } else if (g_strcmp0(m, "deleteSession") == 0) {
-      gboolean found = FALSE;
-      int64_t id = get_int_argument(args, "sessionId", &found);
-      if (found) {
-          ffmpegkit::FFmpegKitConfig::deleteSession(static_cast<long>(id));
-          self->shutdown_sessions->erase(static_cast<long>(id));
-      }
-      return resp_null();
-  } else if (g_strcmp0(m, "getSessionsByState") == 0) {
-      gboolean found = FALSE;
-      int64_t state = get_int_argument(args, "state", &found);
-      if (!found || state < 0 || state > 3)
-          return resp_error("INVALID_SESSION_STATE", "Session state value not supported.");
-      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKitConfig::getSessionsByState(static_cast<ffmpegkit::SessionState>(state))));
-  } else if (g_strcmp0(m, "getFFmpegSessions") == 0) {
-      return resp_take_value(to_session_list_value(ffmpegkit::FFmpegKit::listSessions()));
-  } else if (g_strcmp0(m, "getFFprobeSessions") == 0) {
-      return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listFFprobeSessions()));
-  } else if (g_strcmp0(m, "getMediaInformationSessions") == 0) {
-      return resp_take_value(to_session_list_value(ffmpegkit::FFprobeKit::listMediaInformationSessions()));
-
-      // -- Cancellation ---------------------------------------------------------
-  } else if (g_strcmp0(m, "cancel") == 0) {
-      ffmpegkit::FFmpegKit::cancel();
-      return resp_null();
-  } else if (g_strcmp0(m, "cancelSession") == 0) {
-      gboolean found = FALSE;
-      int64_t id = get_int_argument(args, "sessionId", &found);
-      if (found)
-          ffmpegkit::FFmpegKit::cancel(static_cast<long>(id));
-      return resp_null();
-
-      // -- Packages -------------------------------------------------------------
-      // (getPackageName / getExternalLibraries handled above.)
-
-      // -- writeToPipe (background file copy) -----------------------------------
-  } else if (g_strcmp0(m, "writeToPipe") == 0) {
-      const gchar *input = get_string_argument(args, "input");
-      const gchar *pipe = get_string_argument(args, "pipe");
-      if (input == nullptr || pipe == nullptr)
-          return resp_error("INVALID_ARGUMENTS", "input and pipe are required.");
-      std::string input_path(input);
-      std::string pipe_path(pipe);
-      auto state = *self->state;
-      return enqueue_call(self, call, [state, input_path, pipe_path]() {
-          std::unique_ptr<FILE, decltype(&fclose)> input(fopen(input_path.c_str(), "rb"), fclose);
-          if (!input)
-              return resp_error("COPY_FAILED", "Failed to open file.");
-          int output = -1;
-          while (!state->executions->IsStopping()) {
-              output = open(pipe_path.c_str(), O_WRONLY | O_NONBLOCK | O_CREAT | O_TRUNC, 0666);
-              if (output >= 0)
-                  break;
-              if (errno != ENXIO && errno != EINTR)
-                  return resp_error("COPY_FAILED", "Failed to open pipe.");
-              std::this_thread::sleep_for(std::chrono::milliseconds(10));
-          }
-          if (output < 0)
-              return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
-          // An abandoned FIFO must fail this worker rather than terminate the
-          // process. Block SIGPIPE only here; preserve the process signal policy.
-          sigset_t blocked, previous, pending;
-          sigemptyset(&blocked);
-          sigaddset(&blocked, SIGPIPE);
-          sigpending(&pending);
-          const bool already_pending = sigismember(&pending, SIGPIPE);
-          pthread_sigmask(SIG_BLOCK, &blocked, &previous);
-          char buffer[4096];
-          bool ok = true;
-          size_t count;
-          while (!state->executions->IsStopping() && (count = fread(buffer, 1, sizeof(buffer), input.get())) > 0) {
-              size_t offset = 0;
-              while (offset < count && !state->executions->IsStopping()) {
-                  ssize_t written = write(output, buffer + offset, count - offset);
-                  if (written > 0)
-                      offset += static_cast<size_t>(written);
-                  else if (written < 0 && (errno == EAGAIN || errno == EINTR))
-                      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                  else {
-                      ok = false;
-                      break;
-                  }
-              }
-              if (!ok)
-                  break;
-          }
-          ok = ok && !ferror(input.get());
-          close(output);
-          sigpending(&pending);
-          if (!already_pending && sigismember(&pending, SIGPIPE)) {
-              int signal_number;
-              sigwait(&blocked, &signal_number);
-          }
-          pthread_sigmask(SIG_SETMASK, &previous, nullptr);
-          if (state->executions->IsStopping())
-              return resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
-          return ok ? resp_int(0) : resp_error("COPY_FAILED", "Copy failed.");
-      });
-
-      // -- Android-only methods -> NOT_SUPPORTED --------------------------------
-  } else if (g_strcmp0(m, "selectDocument") == 0 || g_strcmp0(m, "getSafParameter") == 0 || g_strcmp0(m, "unregisterSafProtocolUrl") == 0 || g_strcmp0(m, "getSupportedCameraIds") == 0) {
-      return resp_not_supported();
-
-      // -- ffkit input buffer ---------------------------------------------------
-  } else if (g_strcmp0(m, "inputBufferFromByteArray") == 0) {
-      const gchar *extension = get_string_argument(args, "extension");
-      auto input_buffer = ffmpegkit::FFmpegKitInputBuffer::fromByteArray(fl_to_uint8_vector(lookup(args, "data")), extension ? extension : "");
-      std::string url = input_buffer->getUrl();
-      (*self->input_buffers)[url] = input_buffer;
-      return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "inputBufferClose") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      if (url != nullptr) {
-          auto it = self->input_buffers->find(url);
-          if (it != self->input_buffers->end()) {
-              it->second->close();
-              self->input_buffers->erase(it);
-          }
-      }
-      return resp_null();
-
-      // -- ffkit output buffer --------------------------------------------------
-  } else if (g_strcmp0(m, "outputBufferCreate") == 0) {
-      const gchar *extension = get_string_argument(args, "extension");
-      gboolean has_initial = FALSE, has_max = FALSE;
-      int64_t initial = get_int_argument(args, "initialCapacity", &has_initial);
-      int64_t max = get_int_argument(args, "maxCapacity", &has_max);
-      std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer> output_buffer;
-      if (has_initial && has_max) {
-          output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension ? extension : "", static_cast<long>(initial), static_cast<long>(max));
-      } else {
-          output_buffer = ffmpegkit::FFmpegKitOutputBuffer::create(extension ? extension : "");
-      }
-      std::string url = output_buffer->getUrl();
-      (*self->output_buffers)[url] = output_buffer;
-      return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "outputBufferGetSize") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      auto it = url ? self->output_buffers->find(url) : self->output_buffers->end();
-      if (it == self->output_buffers->end())
-          return resp_error("NOT_FOUND", "Output buffer not found.");
-      return resp_int(it->second->getSize());
-  } else if (g_strcmp0(m, "outputBufferToByteArray") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      auto it = url ? self->output_buffers->find(url) : self->output_buffers->end();
-      if (it == self->output_buffers->end())
-          return resp_error("NOT_FOUND", "Output buffer not found.");
-      auto data = it->second->toByteArray();
-      if (data == nullptr)
-          return resp_take_value(fl_value_new_uint8_list(nullptr, 0));
-      return resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
-  } else if (g_strcmp0(m, "outputBufferClose") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      if (url != nullptr) {
-          auto it = self->output_buffers->find(url);
-          if (it != self->output_buffers->end()) {
-              it->second->close();
-              self->output_buffers->erase(it);
-          }
-      }
-      return resp_null();
-
-      // -- ffkit stream input ---------------------------------------------------
-  } else if (g_strcmp0(m, "streamInputCreate") == 0) {
-      const gchar *extension = get_string_argument(args, "extension");
-      gboolean has_capacity = FALSE;
-      int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
-      std::shared_ptr<ffmpegkit::FFmpegKitStreamInput> stream_input;
-      if (has_capacity) {
-          stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension ? extension : "", static_cast<long>(capacity));
-      } else {
-          stream_input = ffmpegkit::FFmpegKitStreamInput::create(extension ? extension : "");
-      }
-      std::string url = stream_input->getUrl();
-      (*self->stream_inputs)[url] = stream_input;
-      return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "streamInputWrite") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      auto it = url ? self->stream_inputs->find(url) : self->stream_inputs->end();
-      if (it == self->stream_inputs->end())
-          return resp_error("NOT_FOUND", "Stream input not found.");
-      auto stream_input = it->second;
-      const long stream = stream_id(it->first);
-      std::vector<uint8_t> data = fl_to_uint8_vector(lookup(args, "data"));
-      gboolean has_timeout = FALSE;
-      int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-      return enqueue_call(
-          self, call,
-          [stream_input, data, has_timeout, timeout]() {
-              try {
-                  int written = has_timeout ? stream_input->write(data, static_cast<int>(timeout)) : stream_input->write(data);
-                  return resp_int(written);
-              } catch (const std::exception &error) {
-                  return resp_error("STREAM_INPUT_WRITE_FAILED", error.what());
-              }
-          },
-          [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
-  } else if (g_strcmp0(m, "streamInputCloseInput") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      if (url != nullptr) {
-          auto it = self->stream_inputs->find(url);
-          if (it != self->stream_inputs->end())
-              it->second->closeInput();
-      }
-      return resp_null();
-  } else if (g_strcmp0(m, "streamInputClose") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      if (url != nullptr) {
-          auto it = self->stream_inputs->find(url);
-          if (it != self->stream_inputs->end()) {
-              it->second->close();
-              self->stream_inputs->erase(it);
-          }
-      }
-      return resp_null();
-
-      // -- ffkit stream output --------------------------------------------------
-  } else if (g_strcmp0(m, "streamOutputCreate") == 0) {
-      const gchar *extension = get_string_argument(args, "extension");
-      gboolean has_capacity = FALSE;
-      int64_t capacity = get_int_argument(args, "capacity", &has_capacity);
-      std::shared_ptr<ffmpegkit::FFmpegKitStreamOutput> stream_output;
-      if (has_capacity) {
-          stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension ? extension : "", static_cast<long>(capacity));
-      } else {
-          stream_output = ffmpegkit::FFmpegKitStreamOutput::create(extension ? extension : "");
-      }
-      std::string url = stream_output->getUrl();
-      (*self->stream_outputs)[url] = stream_output;
-      return resp_string(url.c_str());
-  } else if (g_strcmp0(m, "streamOutputRead") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      auto it = url ? self->stream_outputs->find(url) : self->stream_outputs->end();
-      if (it == self->stream_outputs->end())
-          return resp_error("NOT_FOUND", "Stream output not found.");
-      auto stream_output = it->second;
-      const long stream = stream_id(it->first);
-      gboolean has_max = FALSE, has_timeout = FALSE;
-      int64_t max_bytes = get_int_argument(args, "maxBytes", &has_max);
-      int64_t timeout = get_int_argument(args, "timeoutMs", &has_timeout);
-      return enqueue_call(
-          self, call,
-          [stream_output, max_bytes, has_timeout, timeout]() {
-              auto data = has_timeout ? stream_output->read(static_cast<int>(max_bytes), static_cast<int>(timeout)) : stream_output->read(static_cast<int>(max_bytes));
-              return data == nullptr ? resp_null() : resp_take_value(fl_value_new_uint8_list(data->data(), data->size()));
-          },
-          [stream] { ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream); });
-  } else if (g_strcmp0(m, "streamOutputClose") == 0) {
-      const gchar *url = get_string_argument(args, "url");
-      if (url != nullptr) {
-          auto it = self->stream_outputs->find(url);
-          if (it != self->stream_outputs->end()) {
-              it->second->close();
-              self->stream_outputs->erase(it);
-          }
-      }
-      return resp_null();
-  }
 
   return FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
 }
@@ -1319,7 +1306,17 @@ static FlMethodResponse* handle_method_call(FfmpegKitNextFlutterPlugin* self,
 static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
                            gpointer user_data) {
   FfmpegKitNextFlutterPlugin* self = FFMPEG_KIT_NEXT_FLUTTER_PLUGIN(user_data);
-  FlMethodResponse* response = handle_method_call(self, method_call);
+  FlMethodResponse *response;
+  // An exception must not unwind through this GLib callback.
+  try {
+      response = handle_method_call(self, method_call);
+  } catch (const ArgumentError &error) {
+      response = resp_error(error.code.c_str(), error.what());
+  } catch (const std::exception &error) {
+      response = resp_error("NATIVE_ERROR", error.what());
+  } catch (...) {
+      response = resp_error("NATIVE_ERROR", "Unknown native error.");
+  }
   if (response != nullptr) {
     fl_method_call_respond(method_call, response, nullptr);
     g_object_unref(response);
@@ -1358,18 +1355,17 @@ static void detach_plugin(FfmpegKitNextFlutterPlugin *self) {
     // Channel destroy notification runs independently of worker references. It
     // is the earliest public Linux embedding hook for engine detachment. Attempt
     // replies now; engine destruction may already have made delivery unavailable.
-    for (const auto &pending : state->pending)
-        pending->Complete(resp_error("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down."));
-    state->pending.clear();
-    state->CancelAsync();
+    state->executions->CompletePendingResponses("PLUGIN_SHUTDOWN", "The Flutter plugin is shutting down.");
+    state->executions->CancelAsync();
     if (self->delete_listener && *self->delete_listener)
         ffmpegkit::FFmpegKitConfig::removeSessionDeleteListener(*self->delete_listener);
     const auto inputs = *self->input_buffers;
     const auto outputs = *self->output_buffers;
     const auto stream_inputs = *self->stream_inputs;
     const auto stream_outputs = *self->stream_outputs;
-    // Unblock native I/O through its locked registry. Facade closed flags are
-    // platform-thread fields, so do not mutate them concurrently with a worker.
+    // Wake blocked stream I/O now by unregistering through the locked native
+    // registry. Stream closed flags are atomic; the objects still close after
+    // workers drain, together with the buffers.
     for (const auto &resource : stream_inputs)
         ffmpegkit::FFmpegKitConfig::unregisterFFmpegKitStream(stream_id(resource.first));
     for (const auto &resource : stream_outputs)
@@ -1430,8 +1426,6 @@ static void ffmpeg_kit_next_flutter_plugin_init(
     self->shutdown_sessions = new std::map<long, std::shared_ptr<ffmpegkit::Session>>();
     self->event_channel = nullptr;
     self->listening = FALSE;
-    self->logs_enabled = FALSE;
-    self->statistics_enabled = FALSE;
     self->input_buffers = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitInputBuffer>>();
     self->output_buffers = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitOutputBuffer>>();
     self->stream_inputs = new std::map<std::string, std::shared_ptr<ffmpegkit::FFmpegKitStreamInput>>();

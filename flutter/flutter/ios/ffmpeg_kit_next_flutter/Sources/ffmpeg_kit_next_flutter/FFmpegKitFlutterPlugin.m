@@ -1048,7 +1048,7 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
               result(nil);
           }
       } @catch (NSException *exception) {
-          result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+          result([FlutterError errorWithCode:@"EXECUTION_FAILED" message:exception.reason details:nil]);
       } @finally {
           [state finishWork:work];
       }
@@ -1130,7 +1130,7 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
                 result(nil);
             } @catch (NSException *exception) {
                 [state finishAsyncSession:[session getSessionId]];
-                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+                result([FlutterError errorWithCode:@"EXECUTION_FAILED" message:exception.reason details:nil]);
             }
         } else {
             result([FlutterError errorWithCode:@"NOT_FFMPEG_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
@@ -1156,7 +1156,7 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
                 result(nil);
             } @catch (NSException *exception) {
                 [state finishAsyncSession:[session getSessionId]];
-                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+                result([FlutterError errorWithCode:@"EXECUTION_FAILED" message:exception.reason details:nil]);
             }
         } else {
             result([FlutterError errorWithCode:@"NOT_FFPROBE_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
@@ -1188,7 +1188,7 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
                 result(nil);
             } @catch (NSException *exception) {
                 [state finishAsyncSession:[session getSessionId]];
-                result([FlutterError errorWithCode:@"NATIVE_ERROR" message:exception.reason details:nil]);
+                result([FlutterError errorWithCode:@"EXECUTION_FAILED" message:exception.reason details:nil]);
             }
         } else {
             result([FlutterError errorWithCode:@"NOT_MEDIA_INFORMATION_SESSION" message:@"A session is found but it does not have the correct type." details:nil]);
