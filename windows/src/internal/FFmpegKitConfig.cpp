@@ -281,6 +281,7 @@ typedef struct FFKitStreamResource {
 typedef struct FFKitStreamHandle {
     FFKitStreamResource *resource;
     int flags;
+    long sessionId;
 } FFKitStreamHandle;
 
 static pthread_mutex_t ffkitMemoryRegistryMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -714,6 +715,8 @@ static CallbackData *callbackDataRemove() {
     return newData;
 }
 
+static void ffkit_stream_wake_sessions();
+
 /**
  * Registers a session id to the session map.
  *
@@ -743,6 +746,7 @@ extern "C" {
  */
 void cancelSession(long sessionId) {
     std::atomic_store(&sessionMap[sessionId % SESSION_MAP_SIZE], (short)2);
+    ffkit_stream_wake_sessions();
 }
 
 /**
@@ -756,6 +760,7 @@ void cancelAllSessions(void) {
         short running = 1;
         std::atomic_compare_exchange_strong(&sessionMap[i], &running, (short)2);
     }
+    ffkit_stream_wake_sessions();
 }
 
 /**
@@ -1194,11 +1199,19 @@ static int ffkit_stream_open(int64_t id, int flags, void **opaque) {
 
     handle->resource = resource;
     handle->flags = flags;
+    handle->sessionId = globalSessionId;
     *opaque = handle;
     return 0;
 }
 
-static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t *buf, int size, int timeoutMs) {
+/**
+ * Checks whether the session that waits on a stream was cancelled. A session
+ * id of 0 means the app itself waits, through the read and write methods, and
+ * cancel never stops it.
+ */
+static int ffkit_stream_cancelled(long sessionId) { return sessionId != 0 && cancelRequested(sessionId); }
+
+static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t *buf, int size, int timeoutMs, long sessionId) {
     int written = 0;
 
     if (resource == NULL || (buf == NULL && size > 0) || size < 0) {
@@ -1207,7 +1220,7 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t
 
     pthread_mutex_lock(&resource->mutex);
     while (written < size) {
-        while (resource->size == resource->capacity && !resource->closed && !resource->writeClosed) {
+        while (resource->size == resource->capacity && !resource->closed && !resource->writeClosed && !ffkit_stream_cancelled(sessionId)) {
             int waitRc = ffkit_cond_wait(&resource->canWrite, &resource->mutex, timeoutMs);
             if (waitRc == ETIMEDOUT) {
                 pthread_mutex_unlock(&resource->mutex);
@@ -1218,6 +1231,11 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t
         if (resource->closed || resource->writeClosed) {
             pthread_mutex_unlock(&resource->mutex);
             return written > 0 ? written : AVERROR(EPIPE);
+        }
+
+        if (resource->size == resource->capacity) {
+            pthread_mutex_unlock(&resource->mutex);
+            return written > 0 ? written : AVERROR_EXIT;
         }
 
         int64_t freeSize = resource->capacity - resource->size;
@@ -1235,7 +1253,7 @@ static int ffkit_stream_write_bytes(FFKitStreamResource *resource, const uint8_t
     return written;
 }
 
-static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, int size, int timeoutMs, int *timedOut, int *eof) {
+static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, int size, int timeoutMs, long sessionId, int *timedOut, int *eof) {
     int bytesRead = 0;
 
     if (timedOut != NULL) {
@@ -1250,7 +1268,7 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, 
     }
 
     pthread_mutex_lock(&resource->mutex);
-    while (resource->size == 0 && !resource->writeClosed && !resource->closed) {
+    while (resource->size == 0 && !resource->writeClosed && !resource->closed && !ffkit_stream_cancelled(sessionId)) {
         int waitRc = ffkit_cond_wait(&resource->canRead, &resource->mutex, timeoutMs);
         if (waitRc == ETIMEDOUT) {
             if (timedOut != NULL) {
@@ -1272,6 +1290,11 @@ static int ffkit_stream_read_bytes(FFKitStreamResource *resource, uint8_t *buf, 
     if (resource->size == 0 && resource->closed) {
         pthread_mutex_unlock(&resource->mutex);
         return AVERROR(EPIPE);
+    }
+
+    if (resource->size == 0) {
+        pthread_mutex_unlock(&resource->mutex);
+        return AVERROR_EXIT;
     }
 
     while (bytesRead < size && resource->size > 0) {
@@ -1298,7 +1321,7 @@ static int ffkit_stream_read(void *opaque, unsigned char *buf, int size) {
         return AVERROR(EINVAL);
     }
 
-    ret = ffkit_stream_read_bytes(handle->resource, buf, size, -1, NULL, &eof);
+    ret = ffkit_stream_read_bytes(handle->resource, buf, size, -1, handle->sessionId, NULL, &eof);
     return eof ? AVERROR_EOF : ret;
 }
 
@@ -1309,7 +1332,7 @@ static int ffkit_stream_write(void *opaque, const unsigned char *buf, int size) 
         return AVERROR(EINVAL);
     }
 
-    return ffkit_stream_write_bytes(handle->resource, buf, size, -1);
+    return ffkit_stream_write_bytes(handle->resource, buf, size, -1, handle->sessionId);
 }
 
 static int64_t ffkit_stream_seek(void *opaque, int64_t pos, int whence) {
@@ -1350,11 +1373,33 @@ static int ffkit_stream_close(void *opaque) {
 }
 
 /**
+ * Wakes the sessions that wait on a stream, so that one cancelled while blocked
+ * reading an input or writing an output sees the request and fails with
+ * AVERROR_EXIT. Nothing is closed: the sessions that were not cancelled go back
+ * to waiting. Only the condition a session waits on is signalled, an input's
+ * canRead and an output's canWrite, so the app's timed reads and writes, which
+ * wait on the other one, never restart their timeout.
+ */
+static void ffkit_stream_wake_sessions() {
+    pthread_mutex_lock(&ffkitStreamRegistryMutex);
+    for (FFKitStreamResource *resource = ffkitStreamResources; resource != NULL; resource = resource->next) {
+        pthread_mutex_lock(&resource->mutex);
+        if (resource->type == FFKIT_RESOURCE_OUTPUT) {
+            pthread_cond_broadcast(&resource->canWrite);
+        } else {
+            pthread_cond_broadcast(&resource->canRead);
+        }
+        pthread_mutex_unlock(&resource->mutex);
+    }
+    pthread_mutex_unlock(&ffkitStreamRegistryMutex);
+}
+
+/**
  * Closes every registered stream and wakes the threads that wait on one.
- * Shutdown uses it to stop sessions blocked reading or writing a stream, which
- * cancel cannot interrupt. An output stream is also ended for writing, as when
- * ffmpeg closes it, so its reader drains what is buffered and then gets the end
- * of the stream. Closed alone, it would get no chunk, which reads as a timeout.
+ * Shutdown uses it so that neither a session nor the app stays blocked on a
+ * stream after it. An output stream is also ended for writing, as when ffmpeg
+ * closes it, so its reader drains what is buffered and then gets the end of the
+ * stream. Closed alone, it would get no chunk, which reads as a timeout.
  */
 static void ffkit_stream_close_all() {
     pthread_mutex_lock(&ffkitStreamRegistryMutex);
@@ -2217,7 +2262,7 @@ int ffmpegkit::internal::FFmpegKitConfig::writeFFmpegKitStream(const long stream
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_write_bytes(resource, data, (int)length, timeoutMs);
+        ret = ffkit_stream_write_bytes(resource, data, (int)length, timeoutMs, 0);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -2265,7 +2310,7 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::internal::FFmpegKitConfig::read
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, &timedOut, &eof);
+        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, 0, &timedOut, &eof);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
