@@ -55,7 +55,7 @@ enum Signal {
 class FFmpegKitConfig {
   public:
     /** Global library version */
-    static constexpr const char *FFmpegKitVersion = "9.0.0";
+    static constexpr const char *FFmpegKitVersion = "9.0.1";
 
     /**
      * Prefix of named pipes created by ffmpeg-kit.

@@ -254,6 +254,7 @@ update_windows_configure_ac() {
 
 update_android() {
   update_doxyfile "${BASEDIR}/android/ffmpeg-kit-next-android-lib/Doxyfile"
+  replace_in_file "${BASEDIR}/android/README.md" "Android README versions" 'BEGIN { $count = 0 } $count += s{(com/arthenica/ffmpeg-kit-next/|ffmpeg-kit-next-|com\.arthenica:ffmpeg-kit-next:)[0-9]+\.[0-9]+\.[0-9]+}{${1}$ENV{NEW_VERSION}}g; END { exit($count >= 4 ? 0 : 3) }'
   replace_in_file "${BASEDIR}/android/ffmpeg-kit-next-android-lib/build.gradle" "Android Gradle version" 'BEGIN { $count = 0 } $count += s/(versionCode[ \t]+)[0-9]+/${1}$ENV{ANDROID_VERSION_CODE}/g; $count += s/(versionName[ \t]+")[^"]+(")/${1}$ENV{NEW_VERSION}${2}/g; END { exit($count >= 2 ? 0 : 3) }'
   replace_in_file "${BASEDIR}/android/ffmpeg-kit-next-android-lib/src/main/cpp/ffmpegkit.h" "Android native version" 'BEGIN { $count = 0 } $count += s/(#define[ \t]+FFMPEG_KIT_VERSION[ \t]+")[^"]+(")/${1}$ENV{NEW_VERSION}${2}/g; END { exit($count ? 0 : 3) }'
   replace_in_file "${BASEDIR}/android/ffmpeg-kit-next-android-lib/src/main/kotlin/com/arthenica/ffmpegkit/NativeLoader.kt" "Android test loader version" 'BEGIN { $count = 0 } $count += s/(val[ \t]+version[ \t]*=[ \t]*")[^"]+(")/${1}$ENV{NEW_VERSION}${2}/g; END { exit($count ? 0 : 3) }'
