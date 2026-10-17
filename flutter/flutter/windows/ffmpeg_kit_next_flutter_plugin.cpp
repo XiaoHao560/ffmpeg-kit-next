@@ -196,9 +196,9 @@ Value SessionValue(const std::shared_ptr<ffmpegkit::Session> &session) {
   }
   result[Value("arguments")] = Value(arguments);
   if (session->isMediaInformation()) {
-    result[Value("mediaInformation")] = MediaValue(
-        std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session)
-            ->getMediaInformation());
+      auto media_information = std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session)->getMediaInformation();
+      if (media_information)
+          result[Value("mediaInformation")] = MediaValue(media_information);
   }
   return Value(result);
 }

@@ -295,10 +295,10 @@ static FlValue* to_session_map(
   } else if (session->isMediaInformation()) {
     auto media_information_session =
         std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session);
-    fl_value_set_string_take(
-        m, KEY_SESSION_MEDIA_INFORMATION,
-        to_media_information_map(
-            media_information_session->getMediaInformation()));
+    auto media_information = media_information_session->getMediaInformation();
+    if (media_information != nullptr) {
+        fl_value_set_string_take(m, KEY_SESSION_MEDIA_INFORMATION, to_media_information_map(media_information));
+    }
     fl_value_set_string_take(m, KEY_SESSION_TYPE,
                              fl_value_new_int(SESSION_TYPE_MEDIA_INFORMATION));
   }
