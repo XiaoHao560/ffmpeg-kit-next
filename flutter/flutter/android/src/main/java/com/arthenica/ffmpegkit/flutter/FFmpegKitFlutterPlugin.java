@@ -115,6 +115,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
     public static final String KEY_SESSION_CREATE_TIME = "createTime";
     public static final String KEY_SESSION_START_TIME = "startTime";
     public static final String KEY_SESSION_COMMAND = "command";
+    public static final String KEY_SESSION_ARGUMENTS = "arguments";
     public static final String KEY_SESSION_TYPE = "type";
     public static final String KEY_SESSION_MEDIA_INFORMATION = "mediaInformation";
 
@@ -1865,6 +1866,7 @@ public class FFmpegKitFlutterPlugin implements FlutterPlugin, ActivityAware, Met
         sessionMap.put(KEY_SESSION_CREATE_TIME, toLong(session.getCreateTime()));
         sessionMap.put(KEY_SESSION_START_TIME, toLong(session.getStartTime()));
         sessionMap.put(KEY_SESSION_COMMAND, session.getCommand());
+        sessionMap.put(KEY_SESSION_ARGUMENTS, Arrays.asList(session.getArguments()));
 
         if (session.isFFmpeg()) {
             sessionMap.put(KEY_SESSION_TYPE, SESSION_TYPE_FFMPEG);

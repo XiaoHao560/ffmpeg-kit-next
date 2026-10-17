@@ -55,6 +55,7 @@ static NSString *const KEY_SESSION_ID = @"sessionId";
 static NSString *const KEY_SESSION_CREATE_TIME = @"createTime";
 static NSString *const KEY_SESSION_START_TIME = @"startTime";
 static NSString *const KEY_SESSION_COMMAND = @"command";
+static NSString *const KEY_SESSION_ARGUMENTS = @"arguments";
 static NSString *const KEY_SESSION_TYPE = @"type";
 static NSString *const KEY_SESSION_MEDIA_INFORMATION = @"mediaInformation";
 
@@ -1457,6 +1458,7 @@ static void UnregisterPluginStream(NSString *url) { [FFmpegKitConfig unregisterF
     dictionary[KEY_SESSION_CREATE_TIME] = [NSNumber numberWithLong:[[session getCreateTime] timeIntervalSince1970]*1000];
     dictionary[KEY_SESSION_START_TIME] = [NSNumber numberWithLong:[[session getStartTime] timeIntervalSince1970]*1000];
     dictionary[KEY_SESSION_COMMAND] = [session getCommand];
+    dictionary[KEY_SESSION_ARGUMENTS] = [session getArguments];
 
     if ([session isFFmpeg]) {
       dictionary[KEY_SESSION_TYPE] = [NSNumber numberWithInt:SESSION_TYPE_FFMPEG];

@@ -188,6 +188,13 @@ Value SessionValue(const std::shared_ptr<ffmpegkit::Session> &session) {
       {Value("type"), Value(session->isFFmpeg()    ? 1
                             : session->isFFprobe() ? 2
                                                    : 3)}};
+  List arguments;
+  auto native_arguments = session->getArguments();
+  if (native_arguments) {
+    for (const auto &argument : *native_arguments)
+      arguments.emplace_back(Utf8(argument));
+  }
+  result[Value("arguments")] = Value(arguments);
   if (session->isMediaInformation()) {
     result[Value("mediaInformation")] = MediaValue(
         std::static_pointer_cast<ffmpegkit::MediaInformationSession>(session)

@@ -94,6 +94,7 @@ static const char* KEY_SESSION_ID = "sessionId";
 static const char* KEY_SESSION_CREATE_TIME = "createTime";
 static const char* KEY_SESSION_START_TIME = "startTime";
 static const char* KEY_SESSION_COMMAND = "command";
+static const char* KEY_SESSION_ARGUMENTS = "arguments";
 static const char* KEY_SESSION_TYPE = "type";
 static const char* KEY_SESSION_MEDIA_INFORMATION = "mediaInformation";
 static const int SESSION_TYPE_FFMPEG = 1;
@@ -278,6 +279,13 @@ static FlValue* to_session_map(
       fl_value_new_int(to_epoch_millis(session->getStartTime())));
   fl_value_set_string_take(m, KEY_SESSION_COMMAND,
                            new_utf8_value(session->getCommand()));
+  FlValue* arguments = fl_value_new_list();
+  auto native_arguments = session->getArguments();
+  if (native_arguments) {
+    for (const auto& argument : *native_arguments)
+      fl_value_append_take(arguments, new_utf8_value(argument));
+  }
+  fl_value_set_string_take(m, KEY_SESSION_ARGUMENTS, arguments);
   if (session->isFFmpeg()) {
     fl_value_set_string_take(m, KEY_SESSION_TYPE,
                              fl_value_new_int(SESSION_TYPE_FFMPEG));
