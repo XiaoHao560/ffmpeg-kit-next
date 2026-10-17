@@ -266,10 +266,10 @@ public:
   int Int(const char *key, const Check &check = {}) const {
       const auto *value = Find(key);
       int64_t number = 0;
-      if (const auto *small = value ? std::get_if<int32_t>(value) : nullptr)
-          number = *small;
-      else if (const auto *large = value ? std::get_if<int64_t>(value) : nullptr)
-          number = *large;
+      if (const auto *int32_value = value ? std::get_if<int32_t>(value) : nullptr)
+          number = *int32_value;
+      else if (const auto *int64_value = value ? std::get_if<int64_t>(value) : nullptr)
+          number = *int64_value;
       else
           Reject(check, std::string("Expected integer: ") + key);
       if (number < (std::numeric_limits<int>::min)() || number > (std::numeric_limits<int>::max)()) {
