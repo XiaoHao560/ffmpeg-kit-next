@@ -162,6 +162,7 @@
 #include <stdint.h>
 
 #define FFK_API __attribute__((visibility("default")))
+#define FFMPEGKIT_DEPRECATED(message) __attribute__((deprecated(message)))
 
 #ifdef __cplusplus
 extern "C" {
@@ -584,14 +585,14 @@ FFK_API void ffk_config_set_font_directory_list(const char *const *font_director
  *
  * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
  */
-FFK_API char *ffk_config_register_new_ffmpeg_pipe(void);
+FFK_API FFMPEGKIT_DEPRECATED("Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.") char *ffk_config_register_new_ffmpeg_pipe(void);
 /**
  * Closes a named pipe created by ffk_config_register_new_ffmpeg_pipe() by
  * removing it from the file system.
  *
  * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
  */
-FFK_API void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path);
+FFK_API FFMPEGKIT_DEPRECATED("Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.") void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path);
 
 FFK_API long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data, size_t size);
 FFK_API long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity, long max_capacity);

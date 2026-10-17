@@ -42,16 +42,6 @@
 #include <utility>
 #include <vector>
 
-/*
- * [[deprecated]] is C++14, and these headers still have to compile as C++11,
- * so deprecation goes through the compiler specific spelling instead.
- */
-#if defined(_MSC_VER) && !defined(__clang__)
-#define FFMPEGKIT_DEPRECATED(message) __declspec(deprecated(message))
-#else
-#define FFMPEGKIT_DEPRECATED(message) __attribute__((deprecated(message)))
-#endif
-
 namespace ffmpegkit {
 
 class Session;

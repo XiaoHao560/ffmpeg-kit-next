@@ -170,6 +170,17 @@
 #define FFK_API __attribute__((visibility("default")))
 #endif
 
+/*
+ * [[deprecated]] needs C23 or C++14, and this header still has to compile as
+ * C99 and C++11, so deprecation goes through the compiler specific spelling
+ * instead. The C++ headers use this macro too.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define FFMPEGKIT_DEPRECATED(message) __declspec(deprecated(message))
+#else
+#define FFMPEGKIT_DEPRECATED(message) __attribute__((deprecated(message)))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -589,13 +600,13 @@ FFK_API void ffk_config_set_font_directory_list(const char *const *font_director
  *
  * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
  */
-FFK_API char *ffk_config_register_new_ffmpeg_pipe(void);
+FFK_API FFMPEGKIT_DEPRECATED("Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.") char *ffk_config_register_new_ffmpeg_pipe(void);
 /**
  * Named pipes are not supported on Windows. No-op.
  *
  * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
  */
-FFK_API void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path);
+FFK_API FFMPEGKIT_DEPRECATED("Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.") void ffk_config_close_ffmpeg_pipe(const char *ffmpeg_pipe_path);
 
 FFK_API long ffk_config_register_ffmpegkit_input_buffer(const uint8_t *data, size_t size);
 FFK_API long ffk_config_register_ffmpegkit_output_buffer(long initial_capacity, long max_capacity);

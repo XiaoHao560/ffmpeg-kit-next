@@ -268,6 +268,17 @@ class FFmpegKitConfig {
         ffmpegkit::detail::checkError();
     }
 
+    // The C functions behind these two wrappers are deprecated as well. The
+    // bodies are compiled in every file that includes this header, so their
+    // calls are kept from warning there
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#else
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
     /**
      * <p>Named pipes are not supported on Windows. Always returns nullptr.
      *
@@ -287,6 +298,12 @@ class FFmpegKitConfig {
     static void closeFFmpegPipe(const std::string &ffmpegPipePath) {
         ffk_config_close_ffmpeg_pipe(ffmpegPipePath.c_str());
     }
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma warning(pop)
+#else
+#pragma GCC diagnostic pop
+#endif
 
     /**
      * <p>Registers an input buffer that can be read with the
