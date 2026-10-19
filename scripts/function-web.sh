@@ -222,6 +222,9 @@ get_cxxflags() {
   opencore-amr)
     echo "$(get_arch_specific_cflags) -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
+  zimg)
+    echo "$(get_arch_specific_cflags) -std=c++17 -fwasm-exceptions -include exception -sWASM_LEGACY_EXCEPTIONS=0 ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
+    ;;
   *)
     echo "$(get_arch_specific_cflags) -std=c++17 -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;

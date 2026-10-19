@@ -440,8 +440,14 @@ get_cxxflags() {
   libjxl)
     echo "-stdlib=libstdc++ -std=c++17 ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS} ${BUILD_DATE} $(get_arch_specific_cflags) -fcxx-exceptions -fPIC"
     ;;
-  libsvtav1 | srt | tesseract | vvenc | zimg)
+  libsvtav1 | srt | vvenc)
     echo "${COMMON_FLAGS} -fcxx-exceptions -fPIC"
+    ;;
+  tesseract)
+    echo "${COMMON_FLAGS} -fcxx-exceptions -include cstdlib -fPIC"
+    ;;
+  zimg)
+    echo "${COMMON_FLAGS} -fcxx-exceptions -include exception -fPIC"
     ;;
   *)
     echo "${COMMON_FLAGS} -fno-exceptions -fno-rtti"

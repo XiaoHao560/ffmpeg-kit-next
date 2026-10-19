@@ -384,8 +384,14 @@ get_cxxflags() {
   x265)
     echo "${COMMON_FLAGS} -std=c++11 -fno-exceptions ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
-  rubberband | srt | tesseract | zimg)
+  rubberband | srt)
     echo "${COMMON_FLAGS} -std=c++11 ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
+    ;;
+  tesseract)
+    echo "${COMMON_FLAGS} -std=c++11 -include cstdlib ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
+    ;;
+  zimg)
+    echo "${COMMON_FLAGS} -std=c++11 -include exception ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
   *)
     echo "${COMMON_FLAGS} -std=c++11 -fno-exceptions -fno-rtti ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
