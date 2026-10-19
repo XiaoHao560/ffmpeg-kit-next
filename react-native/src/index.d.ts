@@ -163,8 +163,14 @@ declare module 'ffmpeg-kit-next-react-native' {
 
       static setFontDirectoryList(fontDirectoryList: string[], mapping?: {[key: string]: string}): Promise<void>;
 
+      /**
+       * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
+       */
       static registerNewFFmpegPipe(): Promise<string>;
 
+      /**
+       * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
+       */
       static closeFFmpegPipe(ffmpegPipePath: string): Promise<void>;
 
       static getFFmpegVersion(): Promise<string>;
@@ -270,6 +276,9 @@ declare module 'ffmpeg-kit-next-react-native' {
 
       static getPlatform(): Promise<string>;
 
+      /**
+       * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
+       */
       static writeToPipe(inputPath: string, pipePath: string): Promise<number>;
 
       static selectDocumentForRead(type?: string, extraTypes?: string[]): Promise<string>;
