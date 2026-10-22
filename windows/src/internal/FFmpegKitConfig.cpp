@@ -54,8 +54,10 @@ extern "C" {
 #include <future>
 #include <limits>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 // INCLUDED LAST SO ITS MACROS DO NOT REACH THE HEADERS ABOVE. NOMINMAX KEEPS
 // THE min/max MACROS FROM BREAKING std::min AND std::max
@@ -176,7 +178,7 @@ static auto &callbackMonitor = *new std::condition_variable();
  */
 static auto &redirectionMutex = *new std::mutex();
 class CallbackData;
-static auto &callbackDataList = *new std::list<CallbackData *>();
+static auto &callbackDataList = *new std::list<std::unique_ptr<CallbackData>>();
 
 /** Lifecycle and admissions share executionMutex. Synchronization outlives workers. */
 enum LibraryState { LibraryRunning, LibraryTerminating, LibraryTerminated };
@@ -547,6 +549,12 @@ class CallbackData {
     CallbackData(const long sessionId, const int videoFrameNumber, const float videoFps, const float videoQuality, const int64_t size, const double time, const double bitrate, const double speed)
         : _type{StatisticsType}, _sessionId{sessionId}, _statisticsFrameNumber{videoFrameNumber}, _statisticsFps{videoFps}, _statisticsQuality{videoQuality}, _statisticsSize{size}, _statisticsTime{time}, _statisticsBitrate{bitrate}, _statisticsSpeed{speed} {}
 
+    ~CallbackData() {
+        if (_type == LogType) {
+            av_bprint_finalize(&_logData, nullptr);
+        }
+    }
+
     CallbackType getType() { return _type; }
 
     long getSessionId() { return _sessionId; }
@@ -668,18 +676,15 @@ static void avutil_log_sanitize(char *line) {
  * discard at shutdown cannot reset it before it is raised. After shutdown the
  * message is dropped.
  */
-static void enqueueCallbackData(CallbackData *callbackData) {
+static void enqueueCallbackData(std::unique_ptr<CallbackData> callbackData) {
     std::unique_lock<std::recursive_mutex> lock(callbackDataMutex);
     if (shutdownState != LibraryRunning) {
         lock.unlock();
-        if (callbackData->getType() == LogType) {
-            av_bprint_finalize(callbackData->getLogData(), NULL);
-        }
-        delete callbackData;
         return;
     }
-    callbackDataList.push_back(callbackData);
-    std::atomic_fetch_add(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
+    const long sessionId = callbackData->getSessionId();
+    callbackDataList.push_back(std::move(callbackData));
+    std::atomic_fetch_add(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 1);
     lock.unlock();
 
     callbackNotify();
@@ -691,23 +696,23 @@ static void enqueueCallbackData(CallbackData *callbackData) {
  * @param level log level
  * @param data log data
  */
-static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(new CallbackData(globalSessionId, level, data)); }
+static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(std::unique_ptr<CallbackData>(new CallbackData(globalSessionId, level, data))); }
 
 /**
  * Adds statistics data to the end of callback data list.
  */
-static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, int time, double bitrate, double speed) { enqueueCallbackData(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed)); }
+static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, int time, double bitrate, double speed) { enqueueCallbackData(std::unique_ptr<CallbackData>(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed))); }
 
 /**
  * Removes head of callback data list.
  */
-static CallbackData *callbackDataRemove() {
+static std::unique_ptr<CallbackData> callbackDataRemove() {
     std::unique_lock<std::recursive_mutex> lock(callbackDataMutex, std::defer_lock);
-    CallbackData *newData = nullptr;
+    std::unique_ptr<CallbackData> newData;
 
     lock.lock();
     if (callbackDataList.size() > 0) {
-        newData = callbackDataList.front();
+        newData = std::move(callbackDataList.front());
         callbackDataList.pop_front();
     }
     lock.unlock();
@@ -850,12 +855,6 @@ static void discardQueuedMessagesWhenIdle(const bool threadExited) {
     }
     if (shutdownState != LibraryRunning && activeDeliveryLoops == 0 && !queuedMessagesDiscarded) {
         queuedMessagesDiscarded = true;
-        for (CallbackData *callbackData : callbackDataList) {
-            if (callbackData->getType() == LogType) {
-                av_bprint_finalize(callbackData->getLogData(), NULL);
-            }
-            delete callbackData;
-        }
         callbackDataList.clear();
         for (int i = 0; i < SESSION_MAP_SIZE; i++) {
             std::atomic_store(&sessionInTransitMessageCountMap[i], 0);
@@ -1654,13 +1653,12 @@ void *callbackThreadFunction(void *pointer) {
 
     while (redirectionEnabled && generationId == std::atomic_load(&redirectionGenerationId)) {
         try {
-            CallbackData *callbackData = callbackDataRemove();
+            std::unique_ptr<CallbackData> callbackData = callbackDataRemove();
 
             if (callbackData != nullptr) {
 
                 if (callbackData->getType() == LogType) {
                     process_log(callbackData->getSessionId(), callbackData->getLogLevel(), callbackData->getLogData());
-                    av_bprint_finalize(callbackData->getLogData(), NULL);
                 } else {
                     process_statistics(callbackData->getSessionId(), callbackData->getStatisticsFrameNumber(), callbackData->getStatisticsFps(), callbackData->getStatisticsQuality(), callbackData->getStatisticsSize(), callbackData->getStatisticsTime(), callbackData->getStatisticsBitrate(),
                                        callbackData->getStatisticsSpeed());
