@@ -2265,7 +2265,6 @@ int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(const long streamId, const 
 
 std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId, const int maxBytes, const int timeoutMs) {
     FFKitStreamResource *resource;
-    uint8_t *buffer;
     int ret = AVERROR(ENOENT);
     int timedOut = 0;
     int eof = 0;
@@ -2276,8 +2275,9 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
         return nullptr;
     }
 
-    buffer = (uint8_t *)av_malloc(maxBytes > 0 ? maxBytes : 1);
-    if (buffer == NULL) {
+    // FREED ON EVERY PATH, ALSO WHEN COPYING THE RESULT THROWS
+    std::unique_ptr<uint8_t, decltype(&av_free)> buffer((uint8_t *)av_malloc(maxBytes > 0 ? maxBytes : 1), &av_free);
+    if (buffer == nullptr) {
         return nullptr;
     }
 
@@ -2294,7 +2294,7 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, 0, &timedOut, &eof);
+        ret = ffkit_stream_read_bytes(resource, buffer.get(), maxBytes, timeoutMs, 0, &timedOut, &eof);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -2309,12 +2309,11 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
     }
 
     if (ret > 0 || eof) {
-        result = std::make_shared<std::vector<uint8_t>>(buffer, buffer + ret);
+        result = std::make_shared<std::vector<uint8_t>>(buffer.get(), buffer.get() + ret);
     } else if (timedOut) {
         result = nullptr;
     }
 
-    av_free(buffer);
     return result;
 }
 
