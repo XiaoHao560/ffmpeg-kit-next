@@ -649,7 +649,7 @@ static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(
 /**
  * Adds statistics data to the end of callback data list.
  */
-static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, int time, double bitrate, double speed) { enqueueCallbackData(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed)); }
+static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) { enqueueCallbackData(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed)); }
 
 /**
  * Removes head of callback data list.
@@ -1556,7 +1556,7 @@ static void process_log(long sessionId, int levelValueInt, AVBPrint *logMessage)
     }
 }
 
-void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, long size, double time, double bitrate, double speed) {
+void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, int64_t size, double time, double bitrate, double speed) {
     std::shared_ptr<ffmpegkit::Statistics> statistics = std::make_shared<ffmpegkit::Statistics>(sessionId, videoFrameNumber, videoFps, videoQuality, size, time, bitrate, speed);
 
     auto session = ffmpegkit::FFmpegKitConfig::getSession(sessionId);
