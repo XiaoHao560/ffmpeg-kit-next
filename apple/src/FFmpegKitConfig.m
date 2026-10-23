@@ -44,7 +44,7 @@
 #import <sys/types.h>
 
 /** Global library version */
-NSString *const FFmpegKitVersion = @"9.0.1";
+NSString *const FFmpegKitVersion = @"9.0.2";
 
 /**
  * Prefix of named pipes created by ffmpeg-kit.

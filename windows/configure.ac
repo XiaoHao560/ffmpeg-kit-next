@@ -1,6 +1,6 @@
-# ffmpeg-kit-next 9.0.1 configure.ac (windows)
+# ffmpeg-kit-next 9.0.2 configure.ac (windows)
 
-AC_INIT([ffmpeg-kit-next], [9.0.1], [https://github.com/arthenica/ffmpeg-kit-next/issues/new])
+AC_INIT([ffmpeg-kit-next], [9.0.2], [https://github.com/arthenica/ffmpeg-kit-next/issues/new])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src/ffmpegkit_c.cpp])
 

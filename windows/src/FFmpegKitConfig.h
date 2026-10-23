@@ -163,7 +163,7 @@ class StringMapArray {
  */
 class FFmpegKitConfig {
   public:
-    static constexpr const char *FFmpegKitVersion = "9.0.1";
+    static constexpr const char *FFmpegKitVersion = "9.0.2";
     FFMPEGKIT_DEPRECATED("Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.")
     static constexpr const char *FFmpegKitNamedPipePrefix = "fk_pipe_";
 
