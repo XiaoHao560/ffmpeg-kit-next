@@ -549,6 +549,14 @@ class CallbackData {
     CallbackData(const long sessionId, const int videoFrameNumber, const float videoFps, const float videoQuality, const int64_t size, const double time, const double bitrate, const double speed)
         : _type{StatisticsType}, _sessionId{sessionId}, _statisticsFrameNumber{videoFrameNumber}, _statisticsFps{videoFps}, _statisticsQuality{videoQuality}, _statisticsSize{size}, _statisticsTime{time}, _statisticsBitrate{bitrate}, _statisticsSpeed{speed} {}
 
+    // DISABLE COPYING. THE COPY THE COMPILER WOULD GENERATE DUPLICATES THE
+    // POINTER INSIDE _logData, NOT THE LOG LINE: FOR A SHORT LINE THE COPY
+    // POINTS INTO THE ORIGINAL OBJECT, FOR A LONG ONE BOTH DESTRUCTORS FREE THE
+    // SAME BUFFER. DELETING THE COPY CONSTRUCTOR AND COPY ASSIGNMENT MAKES ANY
+    // COPY A BUILD ERROR
+    CallbackData(const CallbackData &) = delete;
+    CallbackData &operator=(const CallbackData &) = delete;
+
     ~CallbackData() {
         if (_type == LogType) {
             av_bprint_finalize(&_logData, nullptr);
@@ -788,11 +796,14 @@ int cancelRequested(long sessionId) {
 #endif
 
 /**
- * Resets the number of messages in transmit for this session.
- *
- * @param sessionId session id
+ * Lowers the in-transit count of a message taken from the queue when it goes
+ * out of scope, so a delivery that throws does not leave its session waiting
+ * for a message that will never arrive.
  */
-static void resetMessagesInTransmit(long sessionId) { std::atomic_store(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 0); }
+struct MessageInTransit {
+    const long sessionId;
+    ~MessageInTransit() { std::atomic_fetch_sub(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 1); }
+};
 
 /**
  * Counts an execution unless shutdown was requested.
@@ -1656,6 +1667,7 @@ void *callbackThreadFunction(void *pointer) {
             std::unique_ptr<CallbackData> callbackData = callbackDataRemove();
 
             if (callbackData != nullptr) {
+                MessageInTransit inTransit{callbackData->getSessionId()};
 
                 if (callbackData->getType() == LogType) {
                     process_log(callbackData->getSessionId(), callbackData->getLogLevel(), callbackData->getLogData());
@@ -1663,8 +1675,6 @@ void *callbackThreadFunction(void *pointer) {
                     process_statistics(callbackData->getSessionId(), callbackData->getStatisticsFrameNumber(), callbackData->getStatisticsFps(), callbackData->getStatisticsQuality(), callbackData->getStatisticsSize(), callbackData->getStatisticsTime(), callbackData->getStatisticsBitrate(),
                                        callbackData->getStatisticsSpeed());
                 }
-
-                std::atomic_fetch_sub(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
 
             } else {
                 callbackWait(100);
@@ -1724,8 +1734,6 @@ static int executeFFmpeg(const long sessionId, const std::shared_ptr<std::list<s
         cancelSession(sessionId);
     }
 
-    resetMessagesInTransmit(sessionId);
-
     // RUN
     int returnCode = ffmpeg_execute((arguments->size() + 1), commandCharPArray);
 
@@ -1764,8 +1772,6 @@ int executeFFprobeToBuffer(const long sessionId, const std::shared_ptr<std::list
     // REGISTER THE ID BEFORE STARTING THE SESSION
     globalSessionId = sessionId;
     registerSessionId(sessionId);
-
-    resetMessagesInTransmit(sessionId);
 
     // WHEN A BUFFER IS PROVIDED, ffprobe WRITES ITS FORMATTED OUTPUT THERE
     // INSTEAD OF THE av_log/stdout PATH. THE POINTER IS THREAD-LOCAL INSIDE
