@@ -1186,6 +1186,7 @@ export class FFmpegKitConfig {
    * <p>Please note that creator is responsible of closing created pipes.
    *
    * @return the full path of the named pipe
+   * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
    */
   static async registerNewFFmpegPipe() {
     await FFmpegKitConfig.init();
@@ -1197,6 +1198,7 @@ export class FFmpegKitConfig {
    * <p>Closes a previously created <code>FFmpeg</code> pipe.
    *
    * @param ffmpegPipePath full path of the FFmpeg pipe
+   * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
    */
   static async closeFFmpegPipe(ffmpegPipePath) {
     await FFmpegKitConfig.init();
@@ -1868,6 +1870,7 @@ export class FFmpegKitConfig {
    * @param inputPath input file path
    * @param pipePath pipe path
    * @returns zero on success, non-zero on error
+   * @deprecated Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.
    */
   static async writeToPipe(inputPath, pipePath) {
     await FFmpegKitConfig.init();

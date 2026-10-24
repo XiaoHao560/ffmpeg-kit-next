@@ -53,8 +53,10 @@ extern "C" {
 #include <limits>
 #include <cstdio>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <emscripten/threading.h>
 
 extern "C" {
@@ -165,7 +167,7 @@ static std::recursive_mutex callbackDataMutex;
 static std::mutex callbackMutex;
 static std::condition_variable callbackMonitor;
 class CallbackData;
-static std::list<CallbackData *> callbackDataList;
+static std::list<std::unique_ptr<CallbackData>> callbackDataList;
 
 /** Lifecycle and admissions share executionMutex. Synchronization outlives workers. */
 enum LibraryState { LibraryRunning, LibraryTerminating, LibraryTerminated };
@@ -495,6 +497,20 @@ class CallbackData {
     CallbackData(const long sessionId, const int videoFrameNumber, const float videoFps, const float videoQuality, const int64_t size, const double time, const double bitrate, const double speed)
         : _type{StatisticsType}, _sessionId{sessionId}, _statisticsFrameNumber{videoFrameNumber}, _statisticsFps{videoFps}, _statisticsQuality{videoQuality}, _statisticsSize{size}, _statisticsTime{time}, _statisticsBitrate{bitrate}, _statisticsSpeed{speed} {}
 
+    // DISABLE COPYING. THE COPY THE COMPILER WOULD GENERATE DUPLICATES THE
+    // POINTER INSIDE _logData, NOT THE LOG LINE: FOR A SHORT LINE THE COPY
+    // POINTS INTO THE ORIGINAL OBJECT, FOR A LONG ONE BOTH DESTRUCTORS FREE THE
+    // SAME BUFFER. DELETING THE COPY CONSTRUCTOR AND COPY ASSIGNMENT MAKES ANY
+    // COPY A BUILD ERROR
+    CallbackData(const CallbackData &) = delete;
+    CallbackData &operator=(const CallbackData &) = delete;
+
+    ~CallbackData() {
+        if (_type == LogType) {
+            av_bprint_finalize(&_logData, nullptr);
+        }
+    }
+
     CallbackType getType() { return _type; }
 
     long getSessionId() { return _sessionId; }
@@ -616,18 +632,15 @@ static void avutil_log_sanitize(char *line) {
  * discard at shutdown cannot reset it before it is raised. After shutdown the
  * message is dropped.
  */
-static void enqueueCallbackData(CallbackData *callbackData) {
+static void enqueueCallbackData(std::unique_ptr<CallbackData> callbackData) {
     std::unique_lock<std::recursive_mutex> lock(callbackDataMutex);
     if (shutdownState != LibraryRunning) {
         lock.unlock();
-        if (callbackData->getType() == LogType) {
-            av_bprint_finalize(callbackData->getLogData(), NULL);
-        }
-        delete callbackData;
         return;
     }
-    callbackDataList.push_back(callbackData);
-    std::atomic_fetch_add(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
+    const long sessionId = callbackData->getSessionId();
+    callbackDataList.push_back(std::move(callbackData));
+    std::atomic_fetch_add(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 1);
     lock.unlock();
 
     callbackNotify();
@@ -639,23 +652,23 @@ static void enqueueCallbackData(CallbackData *callbackData) {
  * @param level log level
  * @param data log data
  */
-static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(new CallbackData(globalSessionId, level, data)); }
+static void logCallbackDataAdd(int level, AVBPrint *data) { enqueueCallbackData(std::unique_ptr<CallbackData>(new CallbackData(globalSessionId, level, data))); }
 
 /**
  * Adds statistics data to the end of callback data list.
  */
-static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, int time, double bitrate, double speed) { enqueueCallbackData(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed)); }
+static void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_t size, double time, double bitrate, double speed) { enqueueCallbackData(std::unique_ptr<CallbackData>(new CallbackData(globalSessionId, frameNumber, fps, quality, size, time, bitrate, speed))); }
 
 /**
  * Removes head of callback data list.
  */
-static CallbackData *callbackDataRemove() {
+static std::unique_ptr<CallbackData> callbackDataRemove() {
     std::unique_lock<std::recursive_mutex> lock(callbackDataMutex, std::defer_lock);
-    CallbackData *newData = nullptr;
+    std::unique_ptr<CallbackData> newData;
 
     lock.lock();
     if (callbackDataList.size() > 0) {
-        newData = callbackDataList.front();
+        newData = std::move(callbackDataList.front());
         callbackDataList.pop_front();
     }
     lock.unlock();
@@ -731,11 +744,14 @@ int cancelRequested(long sessionId) {
 #endif
 
 /**
- * Resets the number of messages in transmit for this session.
- *
- * @param sessionId session id
+ * Lowers the in-transit count of a message taken from the queue when it goes
+ * out of scope, so a delivery that throws does not leave its session waiting
+ * for a message that will never arrive.
  */
-static void resetMessagesInTransmit(long sessionId) { std::atomic_store(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 0); }
+struct MessageInTransit {
+    const long sessionId;
+    ~MessageInTransit() { std::atomic_fetch_sub(&sessionInTransitMessageCountMap[sessionId % SESSION_MAP_SIZE], 1); }
+};
 
 /**
  * Counts an execution unless shutdown was requested.
@@ -798,12 +814,6 @@ static void discardQueuedMessagesWhenIdle(const bool threadExited) {
     }
     if (shutdownState != LibraryRunning && activeDeliveryLoops == 0 && !queuedMessagesDiscarded) {
         queuedMessagesDiscarded = true;
-        for (CallbackData *callbackData : callbackDataList) {
-            if (callbackData->getType() == LogType) {
-                av_bprint_finalize(callbackData->getLogData(), NULL);
-            }
-            delete callbackData;
-        }
         callbackDataList.clear();
         for (int i = 0; i < SESSION_MAP_SIZE; i++) {
             std::atomic_store(&sessionInTransitMessageCountMap[i], 0);
@@ -1551,7 +1561,7 @@ static void process_log(long sessionId, int levelValueInt, AVBPrint *logMessage)
     }
 }
 
-void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, long size, double time, double bitrate, double speed) {
+void process_statistics(long sessionId, int videoFrameNumber, float videoFps, float videoQuality, int64_t size, double time, double bitrate, double speed) {
     std::shared_ptr<ffmpegkit::Statistics> statistics = std::make_shared<ffmpegkit::Statistics>(sessionId, videoFrameNumber, videoFps, videoQuality, size, time, bitrate, speed);
 
     auto session = ffmpegkit::FFmpegKitConfig::getSession(sessionId);
@@ -1606,19 +1616,17 @@ void *callbackThreadFunction(void *pointer) {
 
     while (redirectionEnabled && generationId == std::atomic_load(&redirectionGenerationId)) {
         try {
-            CallbackData *callbackData = callbackDataRemove();
+            std::unique_ptr<CallbackData> callbackData = callbackDataRemove();
 
             if (callbackData != nullptr) {
+                MessageInTransit inTransit{callbackData->getSessionId()};
 
                 if (callbackData->getType() == LogType) {
                     process_log(callbackData->getSessionId(), callbackData->getLogLevel(), callbackData->getLogData());
-                    av_bprint_finalize(callbackData->getLogData(), NULL);
                 } else {
                     process_statistics(callbackData->getSessionId(), callbackData->getStatisticsFrameNumber(), callbackData->getStatisticsFps(), callbackData->getStatisticsQuality(), callbackData->getStatisticsSize(), callbackData->getStatisticsTime(), callbackData->getStatisticsBitrate(),
                                        callbackData->getStatisticsSpeed());
                 }
-
-                std::atomic_fetch_sub(&sessionInTransitMessageCountMap[callbackData->getSessionId() % SESSION_MAP_SIZE], 1);
 
             } else {
                 callbackWait(100);
@@ -1678,8 +1686,6 @@ static int executeFFmpeg(const long sessionId, const std::shared_ptr<std::list<s
         cancelSession(sessionId);
     }
 
-    resetMessagesInTransmit(sessionId);
-
     // RUN
     int returnCode = ffmpeg_execute((arguments->size() + 1), commandCharPArray);
 
@@ -1718,8 +1724,6 @@ int executeFFprobeToBuffer(const long sessionId, const std::shared_ptr<std::list
     // REGISTER THE ID BEFORE STARTING THE SESSION
     globalSessionId = sessionId;
     registerSessionId(sessionId);
-
-    resetMessagesInTransmit(sessionId);
 
     // WHEN A BUFFER IS PROVIDED, ffprobe WRITES ITS FORMATTED OUTPUT THERE
     // INSTEAD OF THE av_log/stdout PATH. THE POINTER IS THREAD-LOCAL INSIDE
@@ -2236,7 +2240,6 @@ int ffmpegkit::FFmpegKitConfig::writeFFmpegKitStream(const long streamId, const 
 
 std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitStream(const long streamId, const int maxBytes, const int timeoutMs) {
     FFKitStreamResource *resource;
-    uint8_t *buffer;
     int ret = AVERROR(ENOENT);
     int timedOut = 0;
     int eof = 0;
@@ -2247,8 +2250,9 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
         return nullptr;
     }
 
-    buffer = (uint8_t *)av_malloc(maxBytes > 0 ? maxBytes : 1);
-    if (buffer == NULL) {
+    // FREED ON EVERY PATH, ALSO WHEN COPYING THE RESULT THROWS
+    std::unique_ptr<uint8_t, decltype(&av_free)> buffer((uint8_t *)av_malloc(maxBytes > 0 ? maxBytes : 1), &av_free);
+    if (buffer == nullptr) {
         return nullptr;
     }
 
@@ -2265,7 +2269,7 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
     pthread_mutex_unlock(&ffkitStreamRegistryMutex);
 
     if (ret == 0) {
-        ret = ffkit_stream_read_bytes(resource, buffer, maxBytes, timeoutMs, 0, &timedOut, &eof);
+        ret = ffkit_stream_read_bytes(resource, buffer.get(), maxBytes, timeoutMs, 0, &timedOut, &eof);
 
         pthread_mutex_lock(&resource->mutex);
         if (resource->openCount > 0) {
@@ -2280,12 +2284,11 @@ std::shared_ptr<std::vector<uint8_t>> ffmpegkit::FFmpegKitConfig::readFFmpegKitS
     }
 
     if (ret > 0 || eof) {
-        result = std::make_shared<std::vector<uint8_t>>(buffer, buffer + ret);
+        result = std::make_shared<std::vector<uint8_t>>(buffer.get(), buffer.get() + ret);
     } else if (timedOut) {
         result = nullptr;
     }
 
-    av_free(buffer);
     return result;
 }
 

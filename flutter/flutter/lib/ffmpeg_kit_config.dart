@@ -173,6 +173,8 @@ class FFmpegKitConfig {
   /// Creates a new named pipe to use in "FFmpeg" operations.
   ///
   /// Please note that creator is responsible of closing created pipes.
+  @Deprecated(
+      'Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.')
   static Future<String?> registerNewFFmpegPipe() async {
     try {
       await init();
@@ -184,6 +186,8 @@ class FFmpegKitConfig {
   }
 
   /// Closes a previously created "FFmpeg" pipe.
+  @Deprecated(
+      'Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.')
   static Future<void> closeFFmpegPipe(String ffmpegPipePath) async {
     try {
       await init();
@@ -881,6 +885,8 @@ class FFmpegKitConfig {
   }
 
   /// Writes [inputPath] to [pipePath].
+  @Deprecated(
+      'Named pipes are deprecated. Use FFmpegKit input/output buffers and streams instead.')
   static Future<int?> writeToPipe(String inputPath, String pipePath) async {
     try {
       await init();

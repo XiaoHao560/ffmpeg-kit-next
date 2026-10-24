@@ -1,3 +1,8 @@
+## 9.0.2
+- Bugfix release based on native 9.0.2 (FFmpeg 9.0.2)
+- Deprecates named pipes in favour of FFmpegKit input/output buffers and streams
+- Fixes [#85](https://github.com/arthenica/ffmpeg-kit-next/issues/85)
+
 ## 9.0.1
 - Bugfix release based on native 9.0.1 (FFmpeg 9.0.2)
 - Introduces Windows platform support (`x86_64`, `arm64`)

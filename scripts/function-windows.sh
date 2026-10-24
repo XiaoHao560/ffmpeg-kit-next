@@ -290,8 +290,14 @@ get_cxxflags() {
   x265)
     echo "-std=c++11 ${COMMON_FLAGS} -fno-exceptions"
     ;;
-  libsvtav1 | rubberband | srt | tesseract | zimg)
+  libsvtav1 | rubberband | srt)
     echo "-std=c++11 ${COMMON_FLAGS}"
+    ;;
+  tesseract)
+    echo "-std=c++11 -include cstdlib ${COMMON_FLAGS}"
+    ;;
+  zimg)
+    echo "-std=c++11 -include exception ${COMMON_FLAGS}"
     ;;
   *)
     echo "-std=c++11 ${COMMON_FLAGS} -fno-exceptions -fno-rtti"

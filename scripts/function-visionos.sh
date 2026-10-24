@@ -215,14 +215,20 @@ get_cxxflags() {
   libsvtav1)
     echo "-std=c++11 ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
-  srt | tesseract | zimg)
+  srt)
     echo "-std=c++11 ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
+    ;;
+  tesseract)
+    echo "-std=c++11 -include cstdlib ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
   vvenc)
     echo "-std=c++14 ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
   x265)
     echo "-std=c++11 -fno-exceptions ${COMMON_CFLAGS} ${EXTRA_CXXFLAGS}"
+    ;;
+  zimg)
+    echo "-std=c++11 -include exception ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
     ;;
   *)
     echo "-std=c++11 -fno-exceptions -fno-rtti ${COMMON_CFLAGS} ${OPTIMIZATION_FLAGS} ${EXTRA_CXXFLAGS}"
