@@ -154,6 +154,9 @@ A more detailed documentation is available under [Wiki](https://github.com/arthe
 
 - [Video tutorials](https://github.com/arthenica/ffmpeg-kit-next/wiki/Video-Tutorials) are available for selected build workflows and project features.
 
+All development takes place on the [`development`](https://github.com/arthenica/ffmpeg-kit-next/tree/development)
+branch. Open all pull requests against `development`; see the [contributing guidelines](CONTRIBUTING.md).
+
 ### 14. Test Applications
 
 You can see how `FFmpegKitNext` is used inside an application by running test applications created under
